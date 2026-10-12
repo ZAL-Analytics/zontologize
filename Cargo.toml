@@ -1,0 +1,16 @@
+[package]
+name = "zontologize"
+version = "0.0.1"
+edition = "2024"
+authors = ["Arsalan Anwari"]
+description = "Point zontologize at a folder and get an ontology back. A pure-Rust CLI that crawls mixed data sources, extracts concepts and relationships, and builds a structured ontology."
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/ZAL-Analytics/zontologize"
+homepage = "https://github.com/ZAL-Analytics/zontologize"
+documentation = "https://docs.rs/zontologize"
+keywords = ["ontology", "knowledge-graph", "extraction", "documents", "cli"]
+categories = ["command-line-utilities", "text-processing"]
+include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
+
+[dependencies]
