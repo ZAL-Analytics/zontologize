@@ -1,0 +1,13 @@
+[database]
+schema = "zontologize"
+
+[extract]
+threads = 8
+timeout_secs = 120
+
+[ocr]
+backend = "paddleocr"
+languages = ["nl", "en"]
+# backend = "tesseract"
+# languages = ["nld", "eng"]
+model_tier = "small"
