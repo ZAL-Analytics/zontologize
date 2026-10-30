@@ -1,11 +1,70 @@
 [database]
 schema = "zontologize"
+max_connections = 8
 
 [extract]
 threads = 0
 timeout_secs = 300
+format = "markdown"
+embedded_depth = 0
+max_embedded_mb = 10
+ocr_embedded_images = false
+max_memory_mb = 0
 
 [ocr]
-backend = "paddleocr"
 languages = ["en"]
 model_tier = "small"
+
+[ontology]
+files = []
+languages = ["en"]
+include = []
+exclude = []
+document_class = ""
+
+[scan]
+batch_size = 1000
+hash_threads = 0
+ignore = [
+    "**/~$*",
+    "**/.~lock.*#",
+    "**/~*.tmp",
+    "**/Thumbs.db",
+    "**/desktop.ini",
+    "**/.DS_Store",
+    "**/._*",
+    "**/.git/**",
+]
+
+[scan.kinds.pdf]
+extensions = ["pdf"]
+max_mb = 0
+
+[scan.kinds.word]
+extensions = ["doc", "docx", "docm", "odt", "rtf"]
+max_mb = 0
+
+[scan.kinds.sheet]
+extensions = ["xls", "xlsx", "xlsm", "xlsb", "ods", "csv", "tsv"]
+max_mb = 0
+
+[scan.kinds.slides]
+extensions = ["ppt", "pptx", "pptm", "odp"]
+max_mb = 0
+
+[scan.kinds.mail]
+extensions = ["eml", "msg"]
+max_mb = 0
+
+[scan.kinds.text]
+extensions = ["txt", "md", "html", "htm", "json"]
+max_mb = 0
+
+[scan.kinds.image]
+extensions = ["png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp"]
+max_mb = 0
+
+[chunk]
+max_chars = 2000
+overlap = 200
+text_search = "simple"

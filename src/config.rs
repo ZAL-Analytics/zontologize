@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -7,6 +8,7 @@ use toml::{Table, Value};
 const DEFAULTS: &str = include_str!("../defaults/zontologize.toml");
 const CONFIG_FILE: &str = "zontologize.toml";
 const ENV_PREFIX: &str = "ZONTOLOGIZE_";
+const REPLACED_TABLES: [&str; 1] = ["scan.kinds"];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -14,12 +16,87 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub extract: ExtractConfig,
     pub ocr: OcrConfig,
+    pub ontology: OntologyConfig,
+    pub scan: ScanConfig,
+    pub chunk: ChunkConfig,
+    #[serde(default)]
+    pub sources: Vec<SourceConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub schema: String,
+    pub max_connections: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OntologyConfig {
+    pub files: Vec<String>,
+    pub languages: Vec<String>,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub document_class: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanConfig {
+    pub batch_size: usize,
+    pub hash_threads: usize,
+    pub ignore: Vec<String>,
+    pub kinds: BTreeMap<String, KindConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KindConfig {
+    pub extensions: Vec<String>,
+    pub max_mb: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChunkConfig {
+    pub max_chars: usize,
+    pub overlap: usize,
+    pub text_search: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    Folder,
+    Table,
+}
+
+impl SourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceKind::Folder => "folder",
+            SourceKind::Table => "table",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceConfig {
+    pub name: String,
+    #[serde(default = "default_source_kind")]
+    pub kind: SourceKind,
+    pub root: String,
+    #[serde(default)]
+    pub view: String,
+    #[serde(default)]
+    pub dataset: String,
+    #[serde(default)]
+    pub ignore: Vec<String>,
+}
+
+fn default_source_kind() -> SourceKind {
+    SourceKind::Folder
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,21 +104,34 @@ pub struct DatabaseConfig {
 pub struct ExtractConfig {
     pub threads: usize,
     pub timeout_secs: u64,
+    pub format: TextFormat,
+    pub embedded_depth: usize,
+    pub max_embedded_mb: u64,
+    pub ocr_embedded_images: bool,
+    pub max_memory_mb: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextFormat {
+    Markdown,
+    Plain,
+}
+
+impl TextFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TextFormat::Markdown => "markdown",
+            TextFormat::Plain => "plain",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OcrConfig {
-    pub backend: OcrBackend,
     pub languages: Vec<String>,
     pub model_tier: ModelTier,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum OcrBackend {
-    Paddleocr,
-    Tesseract,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum)]
@@ -69,11 +159,18 @@ fn load_from(
         .context("built-in defaults/zontologize.toml is not valid TOML")?;
     let mut config = build("built-in defaults", &merged)?;
     for layer in layers(config_dir, vars)? {
-        merge(&mut merged, layer.table);
+        merge(&mut merged, layer.table, "");
         config = build(&layer.source, &merged)?;
     }
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     if config.extract.threads == 0 {
-        config.extract.threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        config.extract.threads = cores;
+    }
+    if config.extract.max_memory_mb == 0 {
+        config.extract.max_memory_mb = crate::scan::memory::default_limit_mb();
+    }
+    if config.scan.hash_threads == 0 {
+        config.scan.hash_threads = cores;
     }
     Ok(config)
 }
@@ -137,11 +234,18 @@ fn env_value(raw: &str) -> Value {
         .unwrap_or_else(|| Value::String(raw.to_string()))
 }
 
-fn merge(base: &mut Table, overlay: Table) {
+fn merge(base: &mut Table, overlay: Table, path: &str) {
     for (key, value) in overlay {
+        let child = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
         match (base.get_mut(&key), value) {
-            (Some(Value::Table(base_table)), Value::Table(overlay_table)) => {
-                merge(base_table, overlay_table)
+            (Some(Value::Table(base_table)), Value::Table(overlay_table))
+                if !REPLACED_TABLES.contains(&child.as_str()) =>
+            {
+                merge(base_table, overlay_table, &child)
             }
             (_, value) => {
                 base.insert(key, value);
@@ -174,7 +278,83 @@ fn check(config: &Config) -> Result<(), String> {
     if config.ocr.languages.is_empty() {
         return Err("ocr.languages must list at least one language".to_string());
     }
+    if config.database.max_connections == 0 {
+        return Err("database.max_connections must be greater than 0".to_string());
+    }
+    if config.ontology.languages.is_empty() {
+        return Err("ontology.languages must list at least one language".to_string());
+    }
+    if config.scan.batch_size == 0 {
+        return Err("scan.batch_size must be greater than 0".to_string());
+    }
+    if config.chunk.max_chars == 0 || config.chunk.overlap >= config.chunk.max_chars {
+        return Err(
+            "chunk.max_chars must be greater than 0 and greater than chunk.overlap".to_string(),
+        );
+    }
+    if !is_identifier(&config.chunk.text_search) {
+        return Err(format!(
+            "chunk.text_search {:?} must match ^[a-z_][a-z0-9_]*$",
+            config.chunk.text_search
+        ));
+    }
+    check_globs("scan.ignore", &config.scan.ignore)?;
+    let mut extensions = BTreeMap::new();
+    for (kind, settings) in &config.scan.kinds {
+        for extension in &settings.extensions {
+            let extension = extension.trim_start_matches('.').to_lowercase();
+            if let Some(other) = extensions.insert(extension.clone(), kind) {
+                return Err(format!(
+                    "scan.kinds: extension {extension:?} is in both {other} and {kind}"
+                ));
+            }
+        }
+    }
+    let mut names = BTreeSet::new();
+    for source in &config.sources {
+        if !is_identifier(&source.name) {
+            return Err(format!(
+                "sources.name {:?} must match ^[a-z_][a-z0-9_]*$",
+                source.name
+            ));
+        }
+        if !names.insert(&source.name) {
+            return Err(format!("sources: name {:?} is used twice", source.name));
+        }
+        check_globs(&format!("sources.{}.ignore", source.name), &source.ignore)?;
+        match source.kind {
+            SourceKind::Folder if !source.view.is_empty() => {
+                return Err(format!(
+                    "sources.{}: view is only allowed with kind = \"table\"",
+                    source.name
+                ));
+            }
+            SourceKind::Table if !is_qualified_identifier(&source.view) => {
+                return Err(format!(
+                    "sources.{}.view {:?} must be schema.view, each part matching ^[a-z_][a-z0-9_]*$",
+                    source.name, source.view
+                ));
+            }
+            _ => {}
+        }
+    }
     Ok(())
+}
+
+fn check_globs(key: &str, globs: &[String]) -> Result<(), String> {
+    for glob in globs {
+        if let Err(error) = globset::Glob::new(glob) {
+            return Err(format!("{key}: {glob:?} is not a valid glob: {error}"));
+        }
+    }
+    Ok(())
+}
+
+pub fn is_qualified_identifier(name: &str) -> bool {
+    match name.split_once('.') {
+        Some((schema, view)) => is_identifier(schema) && is_identifier(view),
+        None => false,
+    }
 }
 
 pub fn is_identifier(name: &str) -> bool {
@@ -210,7 +390,7 @@ mod tests {
     fn defaults_load() {
         let config = load_from(None, vars(&[])).unwrap();
         assert_eq!(config.database.schema, "zontologize");
-        assert_eq!(config.ocr.backend, OcrBackend::Paddleocr);
+        assert_eq!(config.ocr.model_tier, ModelTier::Small);
         assert!(config.extract.threads >= 1);
     }
 
@@ -228,13 +408,13 @@ mod tests {
         let dir = dir_with("[extract]\nthreads = 3\n");
         let env = vars(&[
             ("ZONTOLOGIZE_EXTRACT__THREADS", "5"),
-            ("ZONTOLOGIZE_OCR__BACKEND", "tesseract"),
+            ("ZONTOLOGIZE_OCR__MODEL_TIER", "medium"),
             ("ZONTOLOGIZE_OCR__LANGUAGES", "[\"nld\", \"eng\"]"),
             ("ZONTOLOGIZE_CONFIG", "ignored"),
         ]);
         let config = load_from(Some(dir.path()), env).unwrap();
         assert_eq!(config.extract.threads, 5);
-        assert_eq!(config.ocr.backend, OcrBackend::Tesseract);
+        assert_eq!(config.ocr.model_tier, ModelTier::Medium);
         assert_eq!(config.ocr.languages, ["nld", "eng"]);
     }
 
@@ -274,12 +454,19 @@ mod tests {
     }
 
     #[test]
-    fn invalid_backend_names_file_and_key() {
-        let dir = dir_with("[ocr]\nbackend = \"easyocr\"\n");
+    fn invalid_model_tier_names_file_and_key() {
+        let dir = dir_with("[ocr]\nmodel_tier = \"huge\"\n");
         let message = error(load_from(Some(dir.path()), vars(&[])));
         assert!(message.contains(CONFIG_FILE), "{message}");
-        assert!(message.contains("ocr.backend"), "{message}");
-        assert!(message.contains("paddleocr"), "{message}");
+        assert!(message.contains("ocr.model_tier"), "{message}");
+        assert!(message.contains("small"), "{message}");
+    }
+
+    #[test]
+    fn ocr_backend_key_is_rejected() {
+        let dir = dir_with("[ocr]\nbackend = \"paddleocr\"\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("backend"), "{message}");
     }
 
     #[test]

@@ -1,0 +1,105 @@
+[doc_types]
+correspondence = "acme:Correspondence"
+quotation = "acme:Quotation"
+drawing = "acme:Drawing"
+report = "acme:Report"
+inspection_report = "acme:InspectionReport"
+invoice = "acme:Invoice"
+manual = "acme:Manual"
+work_order = "acme:WorkOrder"
+
+[[path_rules]]
+pattern = '^(?:Projects|Projecten)/(?P<year>\d{4})/(?P<project>P-\d{4}-\d{4}) (?P<customer>[^/]+?) - (?P<site>[^/]+)/'
+props = { year = "{year}" }
+
+[[path_rules.entities]]
+id = "project"
+class = "acme:Project"
+key = "{project}"
+name = "{project} {customer}"
+key_case = "upper"
+
+[[path_rules.entities]]
+id = "customer"
+class = "acme:Customer"
+key = "{customer}"
+name = "{customer}"
+key_case = "lower"
+
+[[path_rules.entities]]
+id = "site"
+class = "acme:Site"
+key = "{site}"
+name = "{site}"
+key_case = "lower"
+
+[[path_rules.relations]]
+from = "document"
+property = "acme:describes"
+to = "project"
+
+[[path_rules.relations]]
+from = "project"
+property = "acme:forCustomer"
+to = "customer"
+
+[[path_rules.relations]]
+from = "project"
+property = "acme:atSite"
+to = "site"
+
+[[path_rules]]
+pattern = '/\d{2} (?:Correspondence|Correspondentie)/'
+doc_type = "correspondence"
+
+[[path_rules]]
+pattern = '/\d{2} (?:Quotations|Offertes)/'
+doc_type = "quotation"
+
+[[path_rules]]
+pattern = '/\d{2} (?:Drawings|Tekeningen)/'
+doc_type = "drawing"
+
+[[path_rules]]
+pattern = '/\d{2} (?:Reports|Rapporten)/'
+doc_type = "report"
+
+[[path_rules]]
+pattern = '/\d{2} (?:Invoices|Facturen)/'
+doc_type = "invoice"
+
+[[path_rules]]
+pattern = '/\d{2} (?:Documentation|Documentatie)/'
+doc_type = "manual"
+
+[[path_rules]]
+pattern = '/(?:Inspection report|Inspectierapport) [^/]*$'
+doc_type = "inspection_report"
+
+[[path_rules]]
+pattern = '^Archief/Scans/(?P<year>\d{4})/(?:Work order|Werkbon) (?P<project>P-\d{4}-\d{4})'
+doc_type = "work_order"
+props = { year = "{year}" }
+
+[[path_rules.entities]]
+id = "project"
+class = "acme:Project"
+key = "{project}"
+key_case = "upper"
+
+[[path_rules.relations]]
+from = "document"
+property = "acme:describes"
+to = "project"
+
+[[id_patterns]]
+class = "acme:Project"
+pattern = '\bP-\d{4}-\d{4}\b'
+key_case = "upper"
+on = "text"
+
+[[id_patterns]]
+class = "acme:Drawing"
+pattern = '\bDWG-\d{3}-[A-Z]\d\b'
+key_case = "upper"
+on = "both"

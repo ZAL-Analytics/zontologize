@@ -1,0 +1,6 @@
+@prefix ex: <https://example.org/broken/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+
+ex:Widget a owl:Class .
+ex:Gadget a owl:Class ;
+    ex:madeBy "workshop .

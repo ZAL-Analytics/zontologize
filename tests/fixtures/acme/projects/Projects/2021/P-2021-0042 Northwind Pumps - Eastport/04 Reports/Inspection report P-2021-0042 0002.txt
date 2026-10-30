@@ -1,0 +1,5 @@
+Inspection report P-2021-0042 Northwind Pumps
+
+The heat exchanger of project P-2021-0042 shows light wear and will be replaced within 12 weeks.
+The pressure sensor was tested and meets the requirements. NW Pumps asked for a quotation.
+According to drawing DWG-310-A2 the pipe section must be placed on the north side.

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use zontologize::config::{self, ModelTier, OcrBackend};
+use zontologize::config::{self, ModelTier};
 use zontologize::scan::extract::{self, ExtractSettings, Method, Page};
 
 const TRUTH_SUFFIX: &str = ".truth.txt";
@@ -23,8 +23,6 @@ struct Args {
     folder: PathBuf,
     #[arg(long, env = "ZONTOLOGIZE_CONFIG", value_name = "DIR")]
     config: Option<PathBuf>,
-    #[arg(long, value_enum)]
-    backend: Option<OcrBackend>,
     #[arg(long, value_enum)]
     tier: Option<ModelTier>,
     #[arg(long)]
@@ -63,9 +61,6 @@ struct KindStats {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let mut config = config::load(args.config.as_deref())?;
-    if let Some(backend) = args.backend {
-        config.ocr.backend = backend;
-    }
     if let Some(tier) = args.tier {
         config.ocr.model_tier = tier;
     }
@@ -80,7 +75,7 @@ async fn main() -> Result<()> {
         "folder {}: {} files, backend {}, tier {}, languages {}, threads {}, timeout {}s",
         args.folder.display(),
         files.len(),
-        extract::backend_name(config.ocr.backend),
+        extract::OCR_BACKEND,
         extract::tier_name(config.ocr.model_tier),
         config.ocr.languages.join("+"),
         config.extract.threads,

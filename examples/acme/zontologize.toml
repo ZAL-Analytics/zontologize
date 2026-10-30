@@ -1,13 +1,71 @@
 [database]
 schema = "zontologize"
+max_connections = 8
 
 [extract]
 threads = 8
 timeout_secs = 120
+format = "markdown"
+embedded_depth = 0
+max_embedded_mb = 10
+ocr_embedded_images = false
+max_memory_mb = 8000
 
 [ocr]
-backend = "paddleocr"
 languages = ["nl", "en"]
-# backend = "tesseract"
-# languages = ["nld", "eng"]
 model_tier = "small"
+
+[ontology]
+files = ["ontology/acme.ttl"]
+languages = ["en", "nl"]
+include = ["acme:Organisation", "acme:Site", "acme:Project", "acme:Procedure", "acme:Equipment", "acme:Document"]
+exclude = []
+document_class = "acme:Document"
+
+[scan]
+batch_size = 1000
+hash_threads = 0
+ignore = ["**/~$*", "**/.~lock.*#", "**/Thumbs.db", "**/.DS_Store"]
+
+[scan.kinds.pdf]
+extensions = ["pdf"]
+max_mb = 200
+
+[scan.kinds.word]
+extensions = ["doc", "docx", "rtf"]
+max_mb = 50
+
+[scan.kinds.sheet]
+extensions = ["xls", "xlsx", "csv"]
+max_mb = 50
+
+[scan.kinds.mail]
+extensions = ["eml", "msg"]
+max_mb = 25
+
+[scan.kinds.text]
+extensions = ["txt", "html", "htm"]
+max_mb = 10
+
+[scan.kinds.image]
+extensions = ["png", "jpg", "jpeg", "tif", "tiff"]
+max_mb = 50
+
+[chunk]
+max_chars = 2000
+overlap = 200
+text_search = "simple"
+
+[[sources]]
+name = "projects"
+kind = "folder"
+root = "../../tests/fixtures/acme/projects"
+dataset = "current"
+ignore = []
+
+[[sources]]
+name = "archive"
+kind = "folder"
+root = "../../tests/fixtures/acme/archive"
+dataset = "legacy"
+ignore = ["**/*.bak"]

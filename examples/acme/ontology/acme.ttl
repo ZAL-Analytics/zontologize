@@ -1,0 +1,109 @@
+@prefix acme: <https://example.org/acme#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+
+<https://example.org/acme> a owl:Ontology ;
+    rdfs:label "Acme example ontology"@en .
+
+acme:Organisation a owl:Class ;
+    skos:prefLabel "organisation"@en, "organisatie"@nl ;
+    skos:altLabel "company"@en, "bedrijf"@nl ;
+    skos:definition "A company or other body that takes part in projects."@en .
+
+acme:Customer a owl:Class ;
+    rdfs:subClassOf acme:Organisation ;
+    skos:prefLabel "customer"@en, "klant"@nl ;
+    skos:altLabel "client"@en, "opdrachtgever"@nl .
+
+acme:Site a owl:Class ;
+    skos:prefLabel "site"@en, "locatie"@nl ;
+    skos:definition "A place where equipment is installed."@en .
+
+acme:Project a owl:Class ;
+    skos:prefLabel "project"@en, "project"@nl ;
+    skos:definition "A piece of work for a customer, with a project number."@en .
+
+acme:Procedure a owl:Class ;
+    skos:prefLabel "procedure"@en, "procedure"@nl .
+
+acme:Equipment a owl:Class ;
+    skos:prefLabel "equipment"@en, "apparatuur"@nl ;
+    skos:altLabel "installation"@en, "installatie"@nl .
+
+acme:Pump a owl:Class ;
+    rdfs:subClassOf acme:Equipment ;
+    skos:prefLabel "pump"@en, "pomp"@nl .
+
+acme:Compressor a owl:Class ;
+    rdfs:subClassOf acme:Equipment ;
+    skos:prefLabel "compressor"@en, "compressor"@nl .
+
+acme:HeatExchanger a owl:Class ;
+    rdfs:subClassOf acme:Equipment ;
+    skos:prefLabel "heat exchanger"@en, "warmtewisselaar"@nl .
+
+acme:Valve a owl:Class ;
+    rdfs:subClassOf acme:Equipment ;
+    skos:prefLabel "valve"@en, "klep"@nl ;
+    skos:altLabel "afsluiter"@nl .
+
+acme:PressureSensor a owl:Class ;
+    rdfs:subClassOf acme:Equipment ;
+    skos:prefLabel "pressure sensor"@en, "druksensor"@nl .
+
+acme:PipeSection a owl:Class ;
+    rdfs:subClassOf acme:Equipment ;
+    skos:prefLabel "pipe section"@en, "leidingdeel"@nl .
+
+acme:Document a owl:Class ;
+    skos:prefLabel "document"@en, "document"@nl .
+
+acme:Correspondence a owl:Class ;
+    rdfs:subClassOf acme:Document ;
+    skos:prefLabel "correspondence"@en, "correspondentie"@nl ;
+    skos:altLabel "letter"@en, "brief"@nl .
+
+acme:Quotation a owl:Class ;
+    rdfs:subClassOf acme:Document ;
+    skos:prefLabel "quotation"@en, "offerte"@nl .
+
+acme:Drawing a owl:Class ;
+    rdfs:subClassOf acme:Document ;
+    skos:prefLabel "drawing"@en, "tekening"@nl .
+
+acme:Report a owl:Class ;
+    rdfs:subClassOf acme:Document ;
+    skos:prefLabel "report"@en, "rapport"@nl .
+
+acme:InspectionReport a owl:Class ;
+    rdfs:subClassOf acme:Report ;
+    skos:prefLabel "inspection report"@en, "inspectierapport"@nl .
+
+acme:Invoice a owl:Class ;
+    rdfs:subClassOf acme:Document ;
+    skos:prefLabel "invoice"@en, "factuur"@nl .
+
+acme:Manual a owl:Class ;
+    rdfs:subClassOf acme:Document ;
+    skos:prefLabel "manual"@en, "handleiding"@nl ;
+    skos:altLabel "documentation"@en, "documentatie"@nl .
+
+acme:WorkOrder a owl:Class ;
+    rdfs:subClassOf acme:Document ;
+    skos:prefLabel "work order"@en, "werkbon"@nl .
+
+acme:describes a owl:ObjectProperty ;
+    rdfs:domain acme:Document ;
+    rdfs:range acme:Project ;
+    skos:prefLabel "describes"@en, "beschrijft"@nl .
+
+acme:forCustomer a owl:ObjectProperty ;
+    rdfs:domain acme:Project ;
+    rdfs:range acme:Organisation ;
+    skos:prefLabel "for customer"@en, "voor klant"@nl .
+
+acme:atSite a owl:ObjectProperty ;
+    rdfs:domain acme:Project ;
+    rdfs:range acme:Site ;
+    skos:prefLabel "at site"@en, "op locatie"@nl .

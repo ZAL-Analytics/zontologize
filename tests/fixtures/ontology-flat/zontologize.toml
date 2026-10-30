@@ -1,0 +1,3 @@
+[ontology]
+files = ["../ontology/flat.ttl"]
+include = ["ex:EquipmentClass"]

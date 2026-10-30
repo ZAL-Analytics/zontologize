@@ -8,7 +8,7 @@ chunk, method, confidence), and mirrors entities and relations into an Apache AG
 read the database for search, RAG and agents.
 
 It is built for large folders that are re-indexed on a schedule. Each run is an incremental
-snapshot: only files and stages that changed are processed, on CPU, with all cores busy.
+snapshot: only files and stages that changed are processed. For now CPU only with GPU planned for LLM extraction and embeddings.
 
 ## Status
 
@@ -22,7 +22,7 @@ Early development.
 - **Scan.** Walk, hash (sha256), extract text per page with `xberg`, OCR scans, chunk, and full-text index.
 - **Rules first.** Path rules, ID patterns and gazetteers create entities and relations without a
   model.
-- **LLM extraction.** Anthropic API, Claude Code, OpenRouter or Ollama, with a JSON schema built
+- **LLM extraction.** Claude Code, OpenRouter or Ollama, with a JSON schema built
   from the ontology. Output is validated against domain and range rules; responses are cached
   and runs have budget caps.
 - **Embeddings and resolution.** pgvector embeddings for chunks, entities and class labels;
@@ -87,8 +87,6 @@ zontologize --config my-config resolve
 zontologize --config my-config graph sync
 zontologize --config my-config status
 ```
-
-Only `db migrate` and `db check` exist today; the other commands arrive with their phases.
 
 ## License
 

@@ -1,0 +1,28 @@
+@prefix ex: <https://example.org/flat/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+
+ex:EquipmentClass a rdfs:Class ;
+    rdfs:label "equipment class" .
+
+ex:DocumentClass a rdfs:Class ;
+    rdfs:label "document class" .
+
+ex:F-0001 a rdfs:Class, ex:EquipmentClass ;
+    rdfs:label "screw blower" ;
+    skos:altLabel "rotary blower" .
+
+ex:F-0002 a rdfs:Class, ex:EquipmentClass ;
+    rdfs:label "cooling tower" .
+
+ex:F-0003 a rdfs:Class, ex:EquipmentClass ;
+    rdfs:label "dosing skid" .
+
+ex:F-0004 a rdfs:Class, ex:DocumentClass ;
+    rdfs:label "test certificate" .
+
+ex:F-0005 a rdfs:Class, ex:DocumentClass ;
+    rdfs:label "data sheet" .
+
+ex:F-0006 a rdfs:Class ;
+    rdfs:label "unused entity" .
