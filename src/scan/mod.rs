@@ -1,5 +1,6 @@
 pub mod chunk;
 pub mod extract;
+pub mod memory;
 pub mod table;
 pub mod walk;
 
@@ -26,6 +27,9 @@ use extract::ExtractSettings;
 use walk::{Decision, FileEntry, Kinds, WalkItem};
 
 const EXTRACT_BATCH: i64 = 200;
+const MAX_EXTRACT_ATTEMPTS: i32 = 2;
+const UNFINISHED: &str = "extraction did not finish in two runs: the scan stopped or was \
+                          killed while reading this file, most likely because of memory use";
 const CHUNK_BATCH: i64 = 200;
 const TEXT_RULES_BATCH: i64 = 100;
 
@@ -163,8 +167,10 @@ pub async fn run(config_dir: Option<&Path>, only: &[String], url: Option<&str>) 
         println!("marked {aborted} earlier run(s) that did not finish as aborted");
     }
     println!("run {run_id}");
+    let watchdog = memory::watch(config.extract.max_memory_mb);
     let mut stats = RunStats::default();
     let result = stages(&pool, prepared.clone(), run_id, &mut stats).await;
+    watchdog.abort();
     let status = if result.is_ok() { "finished" } else { "failed" };
     let json = serde_json::to_value(&stats)?;
     db::runs::finish(&pool, run_id, status, &json).await?;
@@ -502,17 +508,51 @@ async fn extract_stage(
 ) -> Result<StageStats> {
     let started = Instant::now();
     let key = prepared.extract.key.clone();
+    let (failed, retried) =
+        contents::recover_unfinished(pool, &key, MAX_EXTRACT_ATTEMPTS, UNFINISHED).await?;
+    if failed + retried > 0 {
+        println!(
+            "extract: an earlier run stopped while reading files: {retried} retried one at a time, \
+             {failed} marked as errors after {MAX_EXTRACT_ATTEMPTS} attempts"
+        );
+    }
     let todo = contents::count_to_extract(pool, &key, source_ids).await?;
     println!("extract: {todo} to extract");
     let mut stats = StageStats::default();
     if todo == 0 {
         return Ok(stats);
     }
-    let semaphore = Arc::new(Semaphore::new(prepared.config.extract.threads));
+    extract_pass(pool, prepared, source_ids, roots, true, 1, &mut stats).await?;
+    let threads = prepared.config.extract.threads;
+    extract_pass(
+        pool, prepared, source_ids, roots, false, threads, &mut stats,
+    )
+    .await?;
+    stats.seconds = started.elapsed().as_secs_f64();
+    println!(
+        "extract: {} done, {} errors, {:.1} s",
+        stats.items, stats.errors, stats.seconds
+    );
+    Ok(stats)
+}
+
+async fn extract_pass(
+    pool: &PgPool,
+    prepared: &Arc<Prepared>,
+    source_ids: &[i64],
+    roots: &HashMap<i64, PathBuf>,
+    retries: bool,
+    threads: usize,
+    stats: &mut StageStats,
+) -> Result<()> {
+    let key = prepared.extract.key.clone();
+    let semaphore = Arc::new(Semaphore::new(threads));
     let mut tasks: JoinSet<Result<bool>> = JoinSet::new();
     let mut after = 0;
     loop {
-        let batch = contents::next_to_extract(pool, &key, source_ids, after, EXTRACT_BATCH).await?;
+        let batch =
+            contents::next_to_extract(pool, &key, source_ids, retries, after, EXTRACT_BATCH)
+                .await?;
         let Some(last) = batch.last() else {
             break;
         };
@@ -524,6 +564,7 @@ async fn extract_stage(
             let pool = pool.clone();
             let prepared = prepared.clone();
             let key = key.clone();
+            contents::start_attempt(&pool, item.id).await?;
             tasks.spawn(async move {
                 let _permit = permit;
                 let started = Instant::now();
@@ -543,19 +584,14 @@ async fn extract_stage(
                 }
             });
             while let Some(done) = tasks.try_join_next() {
-                tally(&mut stats, done??);
+                tally(stats, done??);
             }
         }
     }
     while let Some(done) = tasks.join_next().await {
-        tally(&mut stats, done??);
+        tally(stats, done??);
     }
-    stats.seconds = started.elapsed().as_secs_f64();
-    println!(
-        "extract: {} done, {} errors, {:.1} s",
-        stats.items, stats.errors, stats.seconds
-    );
-    Ok(stats)
+    Ok(())
 }
 
 fn tally(stats: &mut StageStats, ok: bool) {

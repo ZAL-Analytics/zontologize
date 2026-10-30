@@ -6,9 +6,12 @@ max_connections = 8
 threads = 0
 timeout_secs = 300
 format = "markdown"
+embedded_depth = 0
+max_embedded_mb = 10
+ocr_embedded_images = false
+max_memory_mb = 0
 
 [ocr]
-backend = "paddleocr"
 languages = ["en"]
 model_tier = "small"
 

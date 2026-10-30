@@ -8,7 +8,7 @@ chunk, method, confidence), and mirrors entities and relations into an Apache AG
 read the database for search, RAG and agents.
 
 It is built for large folders that are re-indexed on a schedule. Each run is an incremental
-snapshot: only files and stages that changed are processed, on CPU, with all cores busy.
+snapshot: only files and stages that changed are processed. For now CPU only with GPU planned for LLM extraction and embeddings.
 
 ## Status
 
@@ -87,8 +87,6 @@ zontologize --config my-config resolve
 zontologize --config my-config graph sync
 zontologize --config my-config status
 ```
-
-Only `db migrate` and `db check` exist today; the other commands arrive with their phases.
 
 ## License
 

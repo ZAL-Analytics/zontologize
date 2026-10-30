@@ -32,6 +32,7 @@ pub async fn next_to_extract(
     pool: &PgPool,
     key: &str,
     sources: &[i64],
+    retries: bool,
     after: i64,
     limit: i64,
 ) -> Result<Vec<Pending>> {
@@ -39,15 +40,48 @@ pub async fn next_to_extract(
         "select c.id, d.path, d.file, d.source_id from contents c \
          join lateral (select path, file, source_id from documents d where d.content_id = c.id \
          and d.status = 'present' and d.source_id = any($2) order by d.id limit 1) d on true \
-         where c.extract_key is distinct from $1 and c.id > $3 order by c.id limit $4",
+         where c.extract_key is distinct from $1 and (c.attempts > 0) = $3 and c.id > $4 \
+         order by c.id limit $5",
     )
     .bind(key)
     .bind(sources)
+    .bind(retries)
     .bind(after)
     .bind(limit)
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+pub async fn recover_unfinished(
+    pool: &PgPool,
+    key: &str,
+    max_attempts: i32,
+    message: &str,
+) -> Result<(u64, u64)> {
+    let failed = sqlx::query(
+        "update contents set status = 'error', error = $3, extract_key = $1 \
+         where status = 'running' and attempts >= $2",
+    )
+    .bind(key)
+    .bind(max_attempts)
+    .bind(message)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    let retried = sqlx::query("update contents set status = 'pending' where status = 'running'")
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok((failed, retried))
+}
+
+pub async fn start_attempt(pool: &PgPool, content_id: i64) -> Result<()> {
+    sqlx::query("update contents set status = 'running', attempts = attempts + 1 where id = $1")
+        .bind(content_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn write_pages(
@@ -92,7 +126,7 @@ pub async fn write_pages(
         copy.finish().await?;
     }
     sqlx::query(
-        "update contents set status = 'done', error = null, extract_key = $2, \
+        "update contents set status = 'done', error = null, extract_key = $2, attempts = 0, \
          extract_seconds = $3, chunk_key = null, rules_key = null where id = $1",
     )
     .bind(content_id)

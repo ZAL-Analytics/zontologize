@@ -283,3 +283,48 @@ async fn ontology_error_stops_scan_before_any_write() {
     assert_eq!(env.count("select count(*) from runs").await, 0);
     env.finish().await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn file_read_when_a_run_died_is_retried_once_then_marked_error() {
+    let env = env_with_folder("killed").await;
+    env.file("a/innocent.txt", "was running next to the bad file");
+    env.file("a/culprit.txt", "kills the process every time");
+    env.scan().await;
+    sqlx::query(
+        "update contents set status = 'running', attempts = 1, extract_key = null \
+         where id = (select content_id from documents where path = 'a/innocent.txt')",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "update contents set status = 'running', attempts = 2, extract_key = null \
+         where id = (select content_id from documents where path = 'a/culprit.txt')",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    let stats = env.scan().await;
+    assert_eq!(stage(&stats, "extract"), 1);
+    let innocent: (String, i32) = sqlx::query_as(
+        "select c.status, c.attempts from contents c join documents d on d.content_id = c.id \
+         where d.path = 'a/innocent.txt'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(innocent, ("done".to_string(), 0));
+    let culprit: (String, String) = sqlx::query_as(
+        "select c.status, c.error from contents c join documents d on d.content_id = c.id \
+         where d.path = 'a/culprit.txt'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(culprit.0, "error");
+    assert!(culprit.1.contains("memory"), "{}", culprit.1);
+    let stats = env.scan().await;
+    assert_eq!(stage(&stats, "extract"), 0);
+    env.finish().await;
+}

@@ -105,6 +105,10 @@ pub struct ExtractConfig {
     pub threads: usize,
     pub timeout_secs: u64,
     pub format: TextFormat,
+    pub embedded_depth: usize,
+    pub max_embedded_mb: u64,
+    pub ocr_embedded_images: bool,
+    pub max_memory_mb: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -126,16 +130,8 @@ impl TextFormat {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OcrConfig {
-    pub backend: OcrBackend,
     pub languages: Vec<String>,
     pub model_tier: ModelTier,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum OcrBackend {
-    Paddleocr,
-    Tesseract,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum)]
@@ -169,6 +165,9 @@ fn load_from(
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     if config.extract.threads == 0 {
         config.extract.threads = cores;
+    }
+    if config.extract.max_memory_mb == 0 {
+        config.extract.max_memory_mb = crate::scan::memory::default_limit_mb();
     }
     if config.scan.hash_threads == 0 {
         config.scan.hash_threads = cores;
@@ -391,7 +390,7 @@ mod tests {
     fn defaults_load() {
         let config = load_from(None, vars(&[])).unwrap();
         assert_eq!(config.database.schema, "zontologize");
-        assert_eq!(config.ocr.backend, OcrBackend::Paddleocr);
+        assert_eq!(config.ocr.model_tier, ModelTier::Small);
         assert!(config.extract.threads >= 1);
     }
 
@@ -409,13 +408,13 @@ mod tests {
         let dir = dir_with("[extract]\nthreads = 3\n");
         let env = vars(&[
             ("ZONTOLOGIZE_EXTRACT__THREADS", "5"),
-            ("ZONTOLOGIZE_OCR__BACKEND", "tesseract"),
+            ("ZONTOLOGIZE_OCR__MODEL_TIER", "medium"),
             ("ZONTOLOGIZE_OCR__LANGUAGES", "[\"nld\", \"eng\"]"),
             ("ZONTOLOGIZE_CONFIG", "ignored"),
         ]);
         let config = load_from(Some(dir.path()), env).unwrap();
         assert_eq!(config.extract.threads, 5);
-        assert_eq!(config.ocr.backend, OcrBackend::Tesseract);
+        assert_eq!(config.ocr.model_tier, ModelTier::Medium);
         assert_eq!(config.ocr.languages, ["nld", "eng"]);
     }
 
@@ -455,12 +454,19 @@ mod tests {
     }
 
     #[test]
-    fn invalid_backend_names_file_and_key() {
-        let dir = dir_with("[ocr]\nbackend = \"easyocr\"\n");
+    fn invalid_model_tier_names_file_and_key() {
+        let dir = dir_with("[ocr]\nmodel_tier = \"huge\"\n");
         let message = error(load_from(Some(dir.path()), vars(&[])));
         assert!(message.contains(CONFIG_FILE), "{message}");
-        assert!(message.contains("ocr.backend"), "{message}");
-        assert!(message.contains("paddleocr"), "{message}");
+        assert!(message.contains("ocr.model_tier"), "{message}");
+        assert!(message.contains("small"), "{message}");
+    }
+
+    #[test]
+    fn ocr_backend_key_is_rejected() {
+        let dir = dir_with("[ocr]\nbackend = \"paddleocr\"\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("backend"), "{message}");
     }
 
     #[test]

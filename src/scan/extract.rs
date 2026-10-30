@@ -7,10 +7,11 @@ use xberg::{
     OcrElementConfig, OutputFormat, PaddleOcrConfig, PageConfig, PageContent,
 };
 
-use crate::config::{self, ModelTier, OcrBackend, TextFormat};
+use crate::config::{self, ModelTier, TextFormat};
 
 pub const STAGE_VERSION: u32 = 1;
 const XBERG_VERSION: &str = "1.3.10";
+pub const OCR_BACKEND: &str = "paddleocr";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -44,17 +45,14 @@ pub struct ExtractSettings {
 
 impl ExtractSettings {
     pub fn new(extract: &config::ExtractConfig, ocr: &config::OcrConfig) -> Self {
-        let paddle_ocr_settings = match ocr.backend {
-            OcrBackend::Paddleocr => Some(PaddleOcrConfig {
-                model_tier: tier_name(ocr.model_tier).to_string(),
-                ..PaddleOcrConfig::default()
-            }),
-            OcrBackend::Tesseract => None,
-        };
+        let paddle_ocr_settings = Some(PaddleOcrConfig {
+            model_tier: tier_name(ocr.model_tier).to_string(),
+            ..PaddleOcrConfig::default()
+        });
         let xberg = ExtractionConfig {
             use_cache: false,
             ocr: Some(OcrConfig {
-                backend: backend_name(ocr.backend).to_string(),
+                backend: OCR_BACKEND.to_string(),
                 language: ocr.languages.clone(),
                 paddle_ocr_settings,
                 element_config: Some(OcrElementConfig {
@@ -71,6 +69,9 @@ impl ExtractSettings {
                 max_threads: Some(extract.threads),
                 ..ConcurrencyConfig::default()
             }),
+            max_archive_depth: extract.embedded_depth,
+            max_embedded_file_bytes: Some(extract.max_embedded_mb * 1024 * 1024),
+            ocr_embedded_images: Some(extract.ocr_embedded_images),
             output_format: match extract.format {
                 TextFormat::Markdown => OutputFormat::Markdown,
                 TextFormat::Plain => OutputFormat::Plain,
@@ -87,19 +88,14 @@ impl ExtractSettings {
 
 pub fn extract_key(extract: &config::ExtractConfig, ocr: &config::OcrConfig) -> String {
     format!(
-        "extract-v{STAGE_VERSION} xberg-{XBERG_VERSION} {} {} {} {}",
-        backend_name(ocr.backend),
+        "extract-v{STAGE_VERSION} xberg-{XBERG_VERSION} {OCR_BACKEND} {} {} {} embedded-{}-{}mb-ocr-{}",
         tier_name(ocr.model_tier),
         ocr.languages.join("+"),
-        extract.format.as_str()
+        extract.format.as_str(),
+        extract.embedded_depth,
+        extract.max_embedded_mb,
+        extract.ocr_embedded_images
     )
-}
-
-pub fn backend_name(backend: OcrBackend) -> &'static str {
-    match backend {
-        OcrBackend::Paddleocr => "paddleocr",
-        OcrBackend::Tesseract => "tesseract",
-    }
 }
 
 pub fn tier_name(tier: ModelTier) -> &'static str {
@@ -281,6 +277,15 @@ mod tests {
         extract.format = TextFormat::Plain;
         assert_ne!(base, extract_key(&extract, &config.ocr));
         let mut extract = config.extract.clone();
+        extract.embedded_depth = 1;
+        assert_ne!(base, extract_key(&extract, &config.ocr));
+        let mut extract = config.extract.clone();
+        extract.ocr_embedded_images = true;
+        assert_ne!(base, extract_key(&extract, &config.ocr));
+        let mut extract = config.extract.clone();
+        extract.max_memory_mb += 1;
+        assert_eq!(base, extract_key(&extract, &config.ocr));
+        let mut extract = config.extract.clone();
         extract.threads += 1;
         assert_eq!(base, extract_key(&extract, &config.ocr));
     }
@@ -306,7 +311,7 @@ mod tests {
         let ocr = Some(PageOcrConfidence {
             score: Some(0.42),
             word_count: 10,
-            backend: "tesseract".to_string(),
+            backend: "paddle-ocr".to_string(),
         });
         let page = to_page(page_content(1, ocr), &[element(1, 0.9)]);
         assert_eq!(page.ocr_confidence, Some(0.42));
