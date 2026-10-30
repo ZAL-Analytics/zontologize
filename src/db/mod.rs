@@ -1,4 +1,11 @@
+pub mod contents;
+pub mod documents;
+pub mod entities;
 pub mod migrate;
+pub mod ontology;
+pub mod pool;
+pub mod runs;
+pub mod status;
 
 use std::str::FromStr;
 
@@ -47,6 +54,33 @@ pub fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+pub fn copy_field(out: &mut String, value: Option<&str>) {
+    let Some(value) = value else {
+        out.push_str("\\N");
+        return;
+    };
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\0' => {}
+            c => out.push(c),
+        }
+    }
+}
+
+pub fn copy_row(out: &mut String, fields: &[Option<&str>]) {
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push('\t');
+        }
+        copy_field(out, *field);
+    }
+    out.push('\n');
+}
+
 pub async fn close(conn: PgConnection) {
     let _ = conn.close().await;
 }
@@ -54,6 +88,13 @@ pub async fn close(conn: PgConnection) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_rows_escape_text_format() {
+        let mut out = String::new();
+        copy_row(&mut out, &[Some("a\tb\\c\nd\0"), None, Some("")]);
+        assert_eq!(out, "a\\tb\\\\c\\nd\t\\N\t\n");
+    }
 
     #[test]
     fn quotes_identifiers() {

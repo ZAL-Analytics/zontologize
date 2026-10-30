@@ -4,10 +4,13 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use xberg::{
     ConcurrencyConfig, ExtractInput, ExtractionConfig, ExtractionMethod, OcrConfig, OcrElement,
-    OcrElementConfig, PaddleOcrConfig, PageConfig, PageContent,
+    OcrElementConfig, OutputFormat, PaddleOcrConfig, PageConfig, PageContent,
 };
 
-use crate::config::{self, ModelTier, OcrBackend};
+use crate::config::{self, ModelTier, OcrBackend, TextFormat};
+
+pub const STAGE_VERSION: u32 = 1;
+const XBERG_VERSION: &str = "1.3.10";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -36,6 +39,7 @@ pub struct Page {
 pub struct ExtractSettings {
     xberg: ExtractionConfig,
     timeout: Duration,
+    pub key: String,
 }
 
 impl ExtractSettings {
@@ -67,13 +71,28 @@ impl ExtractSettings {
                 max_threads: Some(extract.threads),
                 ..ConcurrencyConfig::default()
             }),
+            output_format: match extract.format {
+                TextFormat::Markdown => OutputFormat::Markdown,
+                TextFormat::Plain => OutputFormat::Plain,
+            },
             ..ExtractionConfig::default()
         };
         ExtractSettings {
             xberg,
             timeout: Duration::from_secs(extract.timeout_secs),
+            key: extract_key(extract, ocr),
         }
     }
+}
+
+pub fn extract_key(extract: &config::ExtractConfig, ocr: &config::OcrConfig) -> String {
+    format!(
+        "extract-v{STAGE_VERSION} xberg-{XBERG_VERSION} {} {} {} {}",
+        backend_name(ocr.backend),
+        tier_name(ocr.model_tier),
+        ocr.languages.join("+"),
+        extract.format.as_str()
+    )
 }
 
 pub fn backend_name(backend: OcrBackend) -> &'static str {
@@ -246,6 +265,24 @@ mod tests {
             word_count: 0,
             backend: "paddle-ocr".to_string(),
         })
+    }
+
+    #[test]
+    fn extract_key_changes_with_ocr_settings() {
+        let config = config::load(None).unwrap();
+        let base = extract_key(&config.extract, &config.ocr);
+        let mut ocr = config.ocr.clone();
+        ocr.model_tier = ModelTier::Medium;
+        assert_ne!(base, extract_key(&config.extract, &ocr));
+        let mut ocr = config.ocr.clone();
+        ocr.languages.push("nl".to_string());
+        assert_ne!(base, extract_key(&config.extract, &ocr));
+        let mut extract = config.extract.clone();
+        extract.format = TextFormat::Plain;
+        assert_ne!(base, extract_key(&extract, &config.ocr));
+        let mut extract = config.extract.clone();
+        extract.threads += 1;
+        assert_eq!(base, extract_key(&extract, &config.ocr));
     }
 
     #[test]

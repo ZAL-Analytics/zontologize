@@ -6,6 +6,27 @@ use zontologize::db;
 
 const TEST_URL: &str = "ZONTOLOGIZE_TEST_DATABASE_URL";
 const SCHEMA_PREFIX: &str = "zontologize_test_";
+const TABLES: [&str; 15] = [
+    "_sqlx_migrations",
+    "aliases",
+    "chunks",
+    "class_mentions",
+    "classes",
+    "contents",
+    "documents",
+    "entities",
+    "mentions",
+    "ontology_versions",
+    "pages",
+    "properties",
+    "relations",
+    "runs",
+    "sources",
+];
+
+fn all_versions() -> Vec<i64> {
+    db::migrate::MIGRATOR.iter().map(|m| m.version).collect()
+}
 
 fn test_url() -> String {
     std::env::var(TEST_URL).unwrap_or_else(|_| panic!("{TEST_URL} is not set"))
@@ -73,12 +94,9 @@ async fn first_run_creates_schema_and_tables() {
     let schema = schema_name("first");
     drop_schema(&schema).await;
     let applied = migrate(&schema).await.unwrap();
-    assert_eq!(applied, [1]);
+    assert_eq!(applied, all_versions());
     let mut conn = admin().await;
-    assert_eq!(
-        tables_in(&mut conn, &schema).await,
-        ["_sqlx_migrations", "runs"]
-    );
+    assert_eq!(tables_in(&mut conn, &schema).await, TABLES);
     conn.close().await.unwrap();
     drop_schema(&schema).await;
 }
@@ -113,11 +131,11 @@ async fn pre_created_schema_is_used() {
         .execute(&mut conn)
         .await
         .unwrap();
-    assert_eq!(migrate(&schema).await.unwrap(), [1]);
-    assert_eq!(
-        tables_in(&mut conn, &schema).await,
-        ["_sqlx_migrations", "marker", "runs"]
-    );
+    assert_eq!(migrate(&schema).await.unwrap(), all_versions());
+    let mut tables = TABLES.to_vec();
+    tables.push("marker");
+    tables.sort();
+    assert_eq!(tables_in(&mut conn, &schema).await, tables);
     conn.close().await.unwrap();
     drop_schema(&schema).await;
 }

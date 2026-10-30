@@ -17,10 +17,19 @@ include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive", "env"] }
 serde = { version = "1.0.229", features = ["derive"] }
-sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "migrate", "macros"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "migrate", "macros", "chrono", "json"] }
 tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "time", "sync"] }
 toml = "1.1"
-xberg = { version = "=1.3.10", default-features = false, features = ["tokio-runtime", "pdf", "office", "excel", "email", "html", "paddle-ocr"] }
+xberg = { version = "=1.3.10", default-features = false, features = ["tokio-runtime", "pdf", "office", "excel", "email", "html", "paddle-ocr", "chunking"] }
+oxttl = "0.2.5"
+oxrdf = "0.3.5"
+csv = "1.4"
+regex = "1.13"
+aho-corasick = "1.1"
+walkdir = "2.5"
+globset = "0.4"
+sha2 = "0.11"
+serde_json = "1.0"
 whoami = { version = "2", default-features = false, features = ["std"] }
 
 [lib]

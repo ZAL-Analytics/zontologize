@@ -1,0 +1,3 @@
+class,key,name,aliases,lang
+acme:Customer,northwind pumps,Northwind Pumps,NW Pumps|Northwind,en
+acme:Customer,zuidwal techniek,Zuidwal Techniek,Zuidwal,nl

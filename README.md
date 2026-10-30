@@ -22,7 +22,7 @@ Early development.
 - **Scan.** Walk, hash (sha256), extract text per page with `xberg`, OCR scans, chunk, and full-text index.
 - **Rules first.** Path rules, ID patterns and gazetteers create entities and relations without a
   model.
-- **LLM extraction.** Anthropic API, Claude Code, OpenRouter or Ollama, with a JSON schema built
+- **LLM extraction.** Claude Code, OpenRouter or Ollama, with a JSON schema built
   from the ontology. Output is validated against domain and range rules; responses are cached
   and runs have budget caps.
 - **Embeddings and resolution.** pgvector embeddings for chunks, entities and class labels;
