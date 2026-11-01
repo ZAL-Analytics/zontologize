@@ -32,6 +32,10 @@ async fn acme_example_end_to_end() {
         .replace(
             "../../tests/fixtures/acme",
             &env.data().display().to_string(),
+        )
+        .replace(
+            "out = \"fit\"",
+            &format!("out = \"{}\"", env.dir.join("fit").display()),
         );
     std::fs::write(env.config().join("zontologize.toml"), text).unwrap();
 
@@ -149,5 +153,21 @@ async fn acme_example_end_to_end() {
     assert_eq!(stage(&stats, "extract"), 0);
     assert_eq!(stage(&stats, "chunk"), 0);
     assert_eq!(stage(&stats, "rules"), 0);
+
+    let facts = "select (select count(*) from entities) + (select count(*) from mentions) \
+        + (select count(*) from class_mentions) + (select count(*) from relations)";
+    let before = env.count(facts).await;
+    let mut options =
+        zontologize::fit::run::Options::new(repo("tests/fixtures/llm/claude-code/fake-claude.sh"));
+    options.no_wait = true;
+    let outcome =
+        zontologize::fit::run::run(Some(&env.config()), Some(&common::test_url()), &options)
+            .await
+            .unwrap();
+    assert_eq!(outcome, zontologize::fit::run::Outcome::Finished);
+    let report = std::fs::read_to_string(env.dir.join("fit/fit-report.md")).unwrap();
+    assert!(report.contains("https://example.org/acme#"), "{report}");
+    assert!(env.dir.join("fit/proposals.ttl").exists());
+    assert_eq!(env.count(facts).await, before);
     env.finish().await;
 }

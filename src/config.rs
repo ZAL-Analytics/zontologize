@@ -20,8 +20,75 @@ pub struct Config {
     pub ontology: OntologyConfig,
     pub scan: ScanConfig,
     pub chunk: ChunkConfig,
+    pub models: ModelsConfig,
+    pub providers: ProvidersConfig,
+    pub budget: BudgetConfig,
+    pub fit: FitConfig,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelsConfig {
+    pub fit: String,
+    pub chars_per_token: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvidersConfig {
+    #[serde(rename = "claude-code")]
+    pub claude_code: ClaudeCodeConfig,
+    pub openrouter: OpenRouterConfig,
+    pub ollama: OllamaConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeCodeConfig {
+    pub concurrency: usize,
+    pub timeout_secs: u64,
+    pub max_window_use: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenRouterConfig {
+    pub base_url: String,
+    pub concurrency: usize,
+    pub timeout_secs: u64,
+    pub poll_minutes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OllamaConfig {
+    pub concurrency: usize,
+    pub timeout_secs: u64,
+    pub think: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetConfig {
+    pub max_usd: f64,
+    pub max_requests: u64,
+    pub calibration_calls: i64,
+    pub default_output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FitConfig {
+    pub sample: usize,
+    pub seed: String,
+    pub unmatched_share: f64,
+    pub min_chars: usize,
+    pub max_shortlist: usize,
+    pub min_evidence: usize,
+    pub proposal_namespace: String,
+    pub out: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -305,6 +372,7 @@ fn check(config: &Config) -> Result<(), String> {
             config.chunk.text_search
         ));
     }
+    check_models(config)?;
     check_globs("scan.ignore", &config.scan.ignore)?;
     let mut extensions = BTreeMap::new();
     for (kind, settings) in &config.scan.kinds {
@@ -344,6 +412,51 @@ fn check(config: &Config) -> Result<(), String> {
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+fn check_models(config: &Config) -> Result<(), String> {
+    if !config.models.fit.is_empty() {
+        crate::llm::ModelName::parse(&config.models.fit)
+            .map_err(|error| format!("models.fit: {error}"))?;
+    }
+    if config.models.chars_per_token <= 0.0 {
+        return Err("models.chars_per_token must be greater than 0".to_string());
+    }
+    let providers = &config.providers;
+    let concurrency = [
+        ("claude-code", providers.claude_code.concurrency),
+        ("openrouter", providers.openrouter.concurrency),
+        ("ollama", providers.ollama.concurrency),
+    ];
+    for (name, value) in concurrency {
+        if value == 0 {
+            return Err(format!(
+                "providers.{name}.concurrency must be greater than 0"
+            ));
+        }
+    }
+    let use_limit = providers.claude_code.max_window_use;
+    if !(use_limit > 0.0 && use_limit <= 1.0) {
+        return Err(
+            "providers.claude-code.max_window_use must be greater than 0 and at most 1".to_string(),
+        );
+    }
+    if !(0.0..=1.0).contains(&config.fit.unmatched_share) {
+        return Err("fit.unmatched_share must be between 0 and 1".to_string());
+    }
+    if config.fit.sample == 0 || config.fit.max_shortlist == 0 {
+        return Err("fit.sample and fit.max_shortlist must be greater than 0".to_string());
+    }
+    if config.fit.proposal_namespace.is_empty() {
+        return Err("fit.proposal_namespace must be an IRI namespace".to_string());
+    }
+    if config.budget.max_usd < 0.0 || config.budget.calibration_calls <= 0 {
+        return Err(
+            "budget.max_usd must be 0 or more and budget.calibration_calls greater than 0"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -409,6 +522,26 @@ mod tests {
         let env = vars(&[("ZONTOLOGIZE_EXTRACT__WORKERS", "3")]);
         let config = load_from(None, env).unwrap();
         assert_eq!(config.extract.workers, 3);
+    }
+
+    #[test]
+    fn model_names_and_provider_keys_are_checked() {
+        let dir = dir_with("[models]\nfit = \"openai:gpt\"\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("models.fit"), "{message}");
+        assert!(message.contains("unknown provider"), "{message}");
+        let dir = dir_with("[providers.openrouter]\napi_key = \"x\"\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("api_key"), "{message}");
+        let dir = dir_with("[providers.claude-code]\nmax_window_use = 1.5\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("max_window_use"), "{message}");
+        let dir =
+            dir_with("[models]\nfit = \"ollama:qwen3.5:4b\"\n[providers.ollama]\nthink = true\n");
+        let config = load_from(Some(dir.path()), vars(&[])).unwrap();
+        assert_eq!(config.models.fit, "ollama:qwen3.5:4b");
+        assert!(config.providers.ollama.think);
+        assert_eq!(config.providers.ollama.concurrency, 1);
     }
 
     #[test]

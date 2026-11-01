@@ -24,6 +24,8 @@ enum Command {
     Db(DbCommand),
     #[command(subcommand, about = "Ontology commands")]
     Ontology(OntologyCommand),
+    #[command(subcommand, about = "Model commands")]
+    Models(ModelsCommand),
     #[command(about = "Walk the sources and update documents, text, chunks and rule facts")]
     Scan {
         #[arg(
@@ -51,6 +53,47 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum OntologyCommand {
     #[command(about = "Load the ontology files and report errors, warnings and the selection")]
+    Check,
+    #[command(about = "Ask the fit model which shortlisted classes a sample of chunks is about")]
+    Fit(FitArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct FitArgs {
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Chunks to sample (default [fit] sample)"
+    )]
+    sample: Option<usize>,
+    #[arg(
+        long,
+        value_name = "SEED",
+        help = "Seed of the sample (default [fit] seed)"
+    )]
+    seed: Option<String>,
+    #[arg(
+        long,
+        value_name = "USD",
+        help = "Stop the job when it has spent this much"
+    )]
+    max_usd: Option<f64>,
+    #[arg(long, value_name = "N", help = "Stop the job after this many requests")]
+    max_requests: Option<u64>,
+    #[arg(long, help = "Print the estimate and send nothing")]
+    dry_run: bool,
+    #[arg(
+        long,
+        help = "Exit on a usage window or credit pause instead of waiting"
+    )]
+    no_wait: bool,
+    #[arg(long, help = "Abandon the unfinished fit job and start a new one")]
+    new: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelsCommand {
+    #[command(about = "Check each configured model and show what is left to use")]
     Check,
 }
 
@@ -83,6 +126,21 @@ fn main() -> ExitCode {
             Command::Db(DbCommand::Migrate) => zontologize::db_migrate(config).await,
             Command::Db(DbCommand::Check) => zontologize::db_check(config).await,
             Command::Ontology(OntologyCommand::Check) => zontologize::ontology_check(config),
+            Command::Ontology(OntologyCommand::Fit(args)) => {
+                let mut options =
+                    zontologize::fit::run::Options::new(zontologize::llm::claude_program());
+                options.sample = args.sample;
+                options.seed = args.seed;
+                options.max_usd = args.max_usd;
+                options.max_requests = args.max_requests;
+                options.dry_run = args.dry_run;
+                options.no_wait = args.no_wait;
+                options.new = args.new;
+                zontologize::ontology_fit(config, &options).await
+            }
+            Command::Models(ModelsCommand::Check) => {
+                zontologize::models_check(config, zontologize::llm::claude_program()).await
+            }
             Command::Scan {
                 sources,
                 extract_minutes,
@@ -159,6 +217,30 @@ mod tests {
         assert!(matches!(cli.command, Command::ExtractWorker));
         let help = Cli::command().render_help().to_string();
         assert!(!help.contains("extract-worker"), "{help}");
+    }
+
+    #[test]
+    fn parses_ontology_fit_and_models_check() {
+        let cli = Cli::try_parse_from([
+            "zontologize",
+            "ontology",
+            "fit",
+            "--sample",
+            "50",
+            "--max-usd",
+            "0.5",
+            "--dry-run",
+            "--no-wait",
+        ])
+        .unwrap();
+        let Command::Ontology(OntologyCommand::Fit(args)) = cli.command else {
+            panic!("not fit");
+        };
+        assert_eq!(args.sample, Some(50));
+        assert_eq!(args.max_usd, Some(0.5));
+        assert!(args.dry_run && args.no_wait && !args.new);
+        let cli = Cli::try_parse_from(["zontologize", "models", "check"]).unwrap();
+        assert!(matches!(cli.command, Command::Models(ModelsCommand::Check)));
     }
 
     #[test]

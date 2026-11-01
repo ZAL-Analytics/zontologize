@@ -58,6 +58,45 @@ max_chars = 2000
 overlap = 200
 text_search = "simple"
 
+[models]
+fit = "claude-code:sonnet"
+# fit = "claude-code:haiku"
+# fit = "openrouter:anthropic/claude-haiku-5.5"
+# fit = "ollama:qwen3.5:4b"
+chars_per_token = 2.0
+
+[providers.claude-code]
+concurrency = 2
+timeout_secs = 300
+max_window_use = 0.8
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+concurrency = 8
+timeout_secs = 120
+poll_minutes = 30
+
+[providers.ollama]
+concurrency = 1
+timeout_secs = 900
+think = false
+
+[budget]
+max_usd = 1.0
+max_requests = 0
+calibration_calls = 200
+default_output_tokens = 300
+
+[fit]
+sample = 200
+seed = "acme"
+unmatched_share = 0.3
+min_chars = 100
+max_shortlist = 30
+min_evidence = 2
+proposal_namespace = "https://example.org/acme/proposal#"
+out = "fit"
+
 [[sources]]
 name = "projects"
 kind = "folder"
