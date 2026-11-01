@@ -147,6 +147,23 @@ async fn deleted_document_loses_its_facts() {
     );
     assert_eq!(
         env.count(
+            "select count(*) from mentions m join chunks k on k.id = m.chunk_id \
+             where not exists (select 1 from documents d where d.content_id = k.content_id \
+             and d.status = 'present')"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        env.count(
+            "select count(*) from contents c where c.rules_key is not null and not exists \
+             (select 1 from documents d where d.content_id = c.id and d.status = 'present')"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        env.count(
             "select count(*) from entities where class_iri = 'https://example.org/acme#WorkOrder'"
         )
         .await,

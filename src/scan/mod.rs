@@ -694,6 +694,7 @@ impl Pass<'_> {
                 return Ok(());
             }
             Done::Error(message) => message,
+            Done::Panic(message) => format!("the extractor panicked on {path}: {message}"),
             Done::Timeout if !alone => {
                 eprintln!(
                     "warning: {path} timed out after {:?} next to other workers; \
@@ -924,6 +925,10 @@ async fn rules_stage(
             version_id,
         )
         .await?;
+    }
+    let unlisted = entities::clear_unlisted_contents(pool).await?;
+    if unlisted > 0 {
+        println!("rules: facts cleared for {unlisted} contents that no present file uses");
     }
     let orphans = entities::delete_orphans(pool).await?;
     entities::sync_aliases(pool, &rules.lexicon.entries).await?;

@@ -154,7 +154,7 @@ const STAGES: [&str; 4] = ["walk", "extract", "chunk", "rules"];
 fn run_details(stats: &serde_json::Value) -> Vec<String> {
     let number = |path: [&str; 2]| stats[path[0]][path[1]].as_u64().unwrap_or(0);
     let mut details = Vec::new();
-    let restarts: Vec<String> = ["timeout", "memory", "crash", "files"]
+    let restarts: Vec<String> = ["timeout", "memory", "crash", "panic", "files"]
         .iter()
         .map(|reason| (reason, number(["workers", reason])))
         .filter(|(_, count)| *count > 0)

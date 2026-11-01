@@ -40,6 +40,7 @@ pub enum Lost {
 pub enum Done {
     Pages(Vec<Page>),
     Error(String),
+    Panic(String),
     Timeout,
     Lost(Lost),
 }
@@ -63,6 +64,7 @@ pub struct Restarts {
     pub timeout: u64,
     pub memory: u64,
     pub crash: u64,
+    pub panic: u64,
     pub files: u64,
 }
 
@@ -71,6 +73,7 @@ impl Restarts {
         self.timeout += other.timeout;
         self.memory += other.memory;
         self.crash += other.crash;
+        self.panic += other.panic;
         self.files += other.files;
     }
 }
@@ -164,6 +167,7 @@ async fn work(
             Done::Timeout => Some(&mut restarts.timeout),
             Done::Lost(Lost::Memory) => Some(&mut restarts.memory),
             Done::Lost(Lost::Crash) => Some(&mut restarts.crash),
+            Done::Panic(_) => Some(&mut restarts.panic),
             Done::Pages(_) | Done::Error(_) => None,
         };
         if let Some(counter) = killed {
@@ -254,6 +258,7 @@ impl Process {
                             return match result {
                                 Outcome::Pages(pages) => Done::Pages(pages),
                                 Outcome::Error(message) => Done::Error(message),
+                                Outcome::Panic(message) => Done::Panic(message),
                             };
                         }
                         _ => eprintln!("extract worker: {text}"),
@@ -374,6 +379,19 @@ mod tests {
         let done = run_all(&mut pool, &[1]).await;
         assert_eq!(done[0].done, Done::Lost(Lost::Memory));
         assert_eq!(pool.join().await.unwrap().memory, 1);
+    }
+
+    #[tokio::test]
+    async fn panic_answer_is_an_error_and_replaces_the_worker() {
+        const PANICS: &str = r#"read setup; read line; id=$(echo "$line" | sed 's/.*"id":\([0-9]*\).*/\1/'); echo "{\"id\":$id,\"result\":{\"panic\":\"bad sheet\"}}""#;
+        let mut pool = Pool::start(&shell(PANICS), "{}".to_string(), 1, limits(5000, 100));
+        let done = run_all(&mut pool, &[1, 2]).await;
+        assert!(
+            done.iter()
+                .all(|f| f.done == Done::Panic("bad sheet".to_string()))
+        );
+        let restarts = pool.join().await.unwrap();
+        assert_eq!((restarts.panic, restarts.crash), (2, 0));
     }
 
     #[tokio::test]

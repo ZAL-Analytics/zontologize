@@ -644,6 +644,39 @@ pub async fn known_keys(pool: &PgPool, method_to_skip: &str) -> Result<Vec<(Stri
     Ok(rows)
 }
 
+pub async fn clear_unlisted_contents(pool: &PgPool) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "select c.id from contents c where c.rules_key is not null and not exists \
+         (select 1 from documents d where d.content_id = c.id and d.status = 'present')",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    for table in ["mentions", "class_mentions", "relations"] {
+        let sql = format!(
+            "delete from {table} where chunk_id in \
+             (select id from chunks where content_id = any($1))"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query("delete from segments where content_id = any($1)")
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("update contents set rules_key = null where id = any($1)")
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(ids.len() as u64)
+}
+
 pub async fn delete_orphans(pool: &PgPool) -> Result<u64> {
     let count = sqlx::query(
         "delete from entities e where not exists (select 1 from mentions m where m.entity_id = e.id)",

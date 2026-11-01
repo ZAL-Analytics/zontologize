@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -26,6 +28,7 @@ pub struct Request {
 pub enum Outcome {
     Pages(Vec<Page>),
     Error(String),
+    Panic(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -45,16 +48,18 @@ where
     };
     let setup: Setup =
         serde_json::from_str(&first).context("extract worker: invalid setup line")?;
-    let settings = ExtractSettings::new(&setup.extract, &setup.ocr);
+    let settings = Arc::new(ExtractSettings::new(&setup.extract, &setup.ocr));
     while let Some(line) = lines.next_line().await? {
         let answer = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => Answer {
-                id: Some(request.id),
-                result: match extract::extract_pages(&request.path, &settings).await {
-                    Ok(pages) => Outcome::Pages(pages),
-                    Err(error) => Outcome::Error(format!("{error:#}")),
-                },
-            },
+            Ok(request) => {
+                let settings = settings.clone();
+                let path = request.path;
+                Answer {
+                    id: Some(request.id),
+                    result: guarded(async move { extract::extract_pages(&path, &settings).await })
+                        .await,
+                }
+            }
             Err(error) => Answer {
                 id: None,
                 result: Outcome::Error(format!("invalid request line: {error}")),
@@ -64,8 +69,31 @@ where
         text.push('\n');
         output.write_all(text.as_bytes()).await?;
         output.flush().await?;
+        if matches!(answer.result, Outcome::Panic(_)) {
+            break;
+        }
     }
     Ok(())
+}
+
+pub async fn guarded<F>(future: F) -> Outcome
+where
+    F: Future<Output = Result<Vec<Page>>> + Send + 'static,
+{
+    match tokio::spawn(future).await {
+        Ok(Ok(pages)) => Outcome::Pages(pages),
+        Ok(Err(error)) => Outcome::Error(format!("{error:#}")),
+        Err(error) if error.is_panic() => {
+            let payload = error.into_panic();
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            Outcome::Panic(message)
+        }
+        Err(error) => Outcome::Error(format!("extraction task failed: {error}")),
+    }
 }
 
 #[cfg(test)]
@@ -102,6 +130,17 @@ mod tests {
         };
         let text = serde_json::to_string(&request).unwrap();
         assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), request);
+    }
+
+    #[tokio::test]
+    async fn panic_in_the_extractor_becomes_an_answer() {
+        let outcome = guarded(async { panic!("range end index 8 out of range") }).await;
+        assert_eq!(
+            outcome,
+            Outcome::Panic("range end index 8 out of range".to_string())
+        );
+        let outcome = guarded(async { Err(anyhow::anyhow!("broken file")) }).await;
+        assert_eq!(outcome, Outcome::Error("broken file".to_string()));
     }
 
     #[tokio::test]
