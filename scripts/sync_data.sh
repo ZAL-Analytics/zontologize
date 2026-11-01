@@ -4,7 +4,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 repo=zal-analytics-core/zontologize-data
 
 usage() {
-    echo "usage: $0 --gen-test [out] [args...] | --fetch-bench [out] [args...] | --download | --upload [message]" >&2
+    echo "usage: $0 --gen-test [out] [args...] | --gen-fixtures | --fetch-bench [out] [args...] | --download | --upload [message]" >&2
     exit 1
 }
 
@@ -23,6 +23,14 @@ case "$cmd" in
         docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
             -v "$tool:/gen:ro" -v "$(dirname "$out"):/work" \
             zontologize-gen-test-data --out "/work/$(basename "$out")" "$@"
+        ;;
+    --gen-fixtures)
+        tool="$root/tools/gen-test-data"
+        out="$root/tests/fixtures/acme/archive/Archief/Scans/2021"
+        docker build -q -t zontologize-gen-test-data "$tool" >/dev/null
+        docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp --entrypoint python3 \
+            -v "$tool:/gen:ro" -v "$out:/out" \
+            zontologize-gen-test-data /gen/fixtures.py --out /out
         ;;
     --fetch-bench)
         python3 -I "$root/tools/fetch-bench-data/fetch.py" --out "${1:-$root/data/benchmarks}" "${@:2}"

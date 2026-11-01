@@ -7,7 +7,7 @@ pub mod scan;
 use std::path::Path;
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 pub async fn db_migrate(config_dir: Option<&Path>) -> Result<ExitCode> {
     let config = config::load(config_dir)?;
@@ -120,8 +120,21 @@ pub fn ontology_check(config_dir: Option<&Path>) -> Result<ExitCode> {
     })
 }
 
-pub async fn scan(config_dir: Option<&Path>, sources: &[String]) -> Result<ExitCode> {
-    scan::run(config_dir, sources, database_url().as_deref()).await?;
+pub async fn scan(
+    config_dir: Option<&Path>,
+    sources: &[String],
+    extract_minutes: Option<u64>,
+) -> Result<ExitCode> {
+    let program = std::env::current_exe().context("cannot find the zontologize binary")?;
+    let mut options = scan::Options::new(program);
+    options.extract_minutes = extract_minutes;
+    scan::run(config_dir, sources, database_url().as_deref(), &options).await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+pub async fn extract_worker() -> Result<ExitCode> {
+    let input = tokio::io::BufReader::new(tokio::io::stdin());
+    scan::worker::serve(input, tokio::io::stdout()).await?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -137,6 +150,32 @@ pub async fn status(config_dir: Option<&Path>, all_errors: bool) -> Result<ExitC
 const STATUS_RUNS: i64 = 5;
 const STATUS_ERRORS: i64 = 20;
 const STAGES: [&str; 4] = ["walk", "extract", "chunk", "rules"];
+
+fn run_details(stats: &serde_json::Value) -> Vec<String> {
+    let number = |path: [&str; 2]| stats[path[0]][path[1]].as_u64().unwrap_or(0);
+    let mut details = Vec::new();
+    let restarts: Vec<String> = ["timeout", "memory", "crash", "files"]
+        .iter()
+        .map(|reason| (reason, number(["workers", reason])))
+        .filter(|(_, count)| *count > 0)
+        .map(|(reason, count)| format!("{count} {reason}"))
+        .collect();
+    if !restarts.is_empty() {
+        details.push(format!("worker restarts: {}", restarts.join(", ")));
+    }
+    let accepted = number(["ocr_ids", "accepted"]);
+    let rejected = number(["ocr_ids", "rejected"]);
+    if accepted + rejected > 0 {
+        details.push(format!(
+            "ids in OCR text: {accepted} matched a known key, {rejected} rejected"
+        ));
+    }
+    let left = stats["extract_left"].as_u64().unwrap_or(0);
+    if left > 0 {
+        details.push(format!("stopped by --extract-minutes with {left} left"));
+    }
+    details
+}
 
 async fn print_status(
     pool: &sqlx::PgPool,
@@ -157,6 +196,21 @@ async fn print_status(
         .map(|(name, count)| format!("{count} {name}"))
         .collect();
     println!("totals: {}", totals.join(", "));
+    for (source, pages, confidence) in db::status::ocr_pages(pool).await? {
+        let mean = confidence.map_or("-".to_string(), |c| format!("{c:.3}"));
+        println!("ocr pages: {source}: {pages}, mean confidence {mean}");
+    }
+    let (segments, split) = db::status::segments(pool).await?;
+    if !segments.is_empty() {
+        let per_type: Vec<String> = segments
+            .iter()
+            .map(|(doc_type, count)| format!("{count} {doc_type}"))
+            .collect();
+        println!(
+            "segments: {}; {split} contents split into several documents",
+            per_type.join(", ")
+        );
+    }
     match scan::prepare(config_dir, &[]) {
         Ok(prepared) => {
             let names: Vec<String> = config.sources.iter().map(|s| s.name.clone()).collect();
@@ -208,6 +262,10 @@ async fn print_status(
             run.status,
             parts.join("; ")
         );
+        let extra = run_details(&run.stats.0);
+        if !extra.is_empty() {
+            println!("    {}", extra.join("; "));
+        }
     }
     let limit = (!all_errors).then_some(STATUS_ERRORS);
     let (total, errors) = db::status::errors(pool, limit).await?;
@@ -225,4 +283,27 @@ async fn print_status(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_details_list_only_what_happened() {
+        assert!(run_details(&serde_json::json!({})).is_empty());
+        let stats = serde_json::json!({
+            "workers": {"timeout": 2, "memory": 0, "crash": 1, "files": 0},
+            "ocr_ids": {"accepted": 3, "rejected": 4},
+            "extract_left": 5
+        });
+        assert_eq!(
+            run_details(&stats),
+            [
+                "worker restarts: 2 timeout, 1 crash",
+                "ids in OCR text: 3 matched a known key, 4 rejected",
+                "stopped by --extract-minutes with 5 left"
+            ]
+        );
+    }
 }

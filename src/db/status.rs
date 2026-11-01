@@ -52,6 +52,32 @@ pub async fn totals(pool: &PgPool) -> Result<Vec<(String, i64)>> {
     Ok(rows)
 }
 
+pub async fn ocr_pages(pool: &PgPool) -> Result<Vec<(String, i64, Option<f64>)>> {
+    let rows = sqlx::query_as(
+        "select s.name, count(*), avg(p.ocr_confidence) from pages p \
+         join lateral (select source_id from documents d where d.content_id = p.content_id \
+         and d.status = 'present' order by d.id limit 1) d on true \
+         join sources s on s.id = d.source_id where p.method = 'ocr' group by 1 order by 1",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn segments(pool: &PgPool) -> Result<(Vec<(String, i64)>, i64)> {
+    let per_type = sqlx::query_as(
+        "select coalesce(doc_type, '-'), count(*) from segments group by 1 order by 1",
+    )
+    .fetch_all(pool)
+    .await?;
+    let split = sqlx::query_scalar(
+        "select count(*) from (select content_id from segments group by 1 having count(*) > 1) s",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok((per_type, split))
+}
+
 pub async fn last_runs(pool: &PgPool, limit: i64) -> Result<Vec<Run>> {
     let rows = sqlx::query_as(
         "select id, started_at, finished_at, status, stats from runs order by id desc limit $1",

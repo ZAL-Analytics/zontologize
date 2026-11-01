@@ -181,9 +181,14 @@ async fn missing_column_names_view_and_column() {
     env.write_config(&format!(
         "[[sources]]\nname = \"store\"\nkind = \"table\"\nview = \"{store}.files\"\nroot = \"/\"\n"
     ));
-    let error = zontologize::scan::run(Some(&env.config()), &[], Some(&common::test_url()))
-        .await
-        .unwrap_err();
+    let error = zontologize::scan::run(
+        Some(&env.config()),
+        &[],
+        Some(&common::test_url()),
+        &common::options(),
+    )
+    .await
+    .unwrap_err();
     let message = format!("{error:#}");
     assert!(message.contains(&format!("{store}.files")), "{message}");
     assert!(message.contains("no column sha256"), "{message}");

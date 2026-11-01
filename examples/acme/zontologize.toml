@@ -9,7 +9,9 @@ format = "markdown"
 embedded_depth = 0
 max_embedded_mb = 10
 ocr_embedded_images = false
-max_memory_mb = 8000
+workers = 2
+worker_memory_mb = 4000
+worker_files = 200
 
 [ocr]
 languages = ["nl", "en"]

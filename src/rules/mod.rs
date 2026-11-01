@@ -1,5 +1,6 @@
 pub mod gazetteer;
 pub mod ids;
+pub mod pages;
 pub mod path;
 
 use std::collections::BTreeMap;
@@ -11,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ontology::{Ontology, hex};
 
-pub const STAGE_VERSION: u32 = 1;
+pub const STAGE_VERSION: u32 = 2;
 const DEFAULT_RULES: &str = include_str!("../../defaults/rules.toml");
 const RULES_FILE: &str = "rules.toml";
 const GAZETTEER_DIR: &str = "gazetteer";
@@ -45,6 +46,10 @@ struct RulesFile {
     path_rules: Vec<path::PathRuleSpec>,
     #[serde(default)]
     id_patterns: Vec<ids::IdPatternSpec>,
+    ocr_confusions: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    page_types: Vec<pages::PageTypeSpec>,
+    pages: Option<pages::PagesSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +68,7 @@ pub struct ClassHit {
     pub class: String,
     pub start: usize,
     pub end: usize,
+    pub confidence: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,6 +97,7 @@ pub struct DocumentFacts {
 pub struct TextFacts {
     pub entities: Vec<EntityHit>,
     pub classes: Vec<ClassHit>,
+    pub rejected: usize,
 }
 
 pub struct Rules {
@@ -99,6 +106,9 @@ pub struct Rules {
     pub doc_types: BTreeMap<String, String>,
     pub path_rules: Vec<path::PathRule>,
     pub ids: ids::IdPatterns,
+    pub confusions: ids::Confusions,
+    pub page_types: pages::PageTypes,
+    pub part_property: Option<String>,
     pub lexicon: gazetteer::Lexicon,
 }
 
@@ -106,6 +116,7 @@ pub fn load(config_dir: Option<&Path>, ontology: &Ontology, document_class: &str
     let mut hasher = Sha256::new();
     hasher.update(STAGE_VERSION.to_le_bytes());
     hasher.update(ontology.version.as_bytes());
+    hasher.update(DEFAULT_RULES.as_bytes());
     let (rules_name, rules_text) = match config_dir.map(|d| d.join(RULES_FILE)) {
         Some(path) if path.exists() => {
             let text = std::fs::read_to_string(&path)
@@ -194,6 +205,33 @@ pub fn compile(
     }
     let ids = ids::IdPatterns::compile(&file.id_patterns, ontology)
         .map_err(|e| anyhow::anyhow!("{rules_name}: {e}"))?;
+    let defaults = defaults()?;
+    let confusions = match &file.ocr_confusions {
+        Some(table) => ids::Confusions::compile(table),
+        None => ids::Confusions::compile(&defaults.ocr_confusions.unwrap_or_default()),
+    }
+    .map_err(|e| anyhow::anyhow!("{rules_name}: {e}"))?;
+    let pages = file.pages.unwrap_or_default();
+    let default_pages = defaults.pages.unwrap_or_default();
+    let head_chars = pages
+        .head_chars
+        .or(default_pages.head_chars)
+        .unwrap_or_default();
+    let page_types = pages::PageTypes::compile(&file.page_types, &doc_types, head_chars)
+        .map_err(|e| anyhow::anyhow!("{rules_name}: {e}"))?;
+    let part_property = pages
+        .part_property
+        .or(default_pages.part_property)
+        .unwrap_or_default();
+    let part_property = part_property_iri(
+        &part_property,
+        &file.page_types,
+        &page_types,
+        ontology,
+        &doc_types,
+        document_class.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("{rules_name}: pages.part_property: {e}"))?;
     let lexicon = gazetteer::Lexicon::build(gazetteer_sources, ontology)?;
     if path_rules.iter().any(|r| r.uses_document())
         && document_class.is_none()
@@ -209,8 +247,59 @@ pub fn compile(
         doc_types,
         path_rules,
         ids,
+        confusions,
+        page_types,
+        part_property,
         lexicon,
     })
+}
+
+fn defaults() -> Result<RulesFile> {
+    toml::from_str(DEFAULT_RULES).context("built-in defaults/rules.toml is not valid")
+}
+
+fn part_property_iri(
+    name: &str,
+    specs: &[pages::PageTypeSpec],
+    page_types: &pages::PageTypes,
+    ontology: &Ontology,
+    doc_types: &BTreeMap<String, String>,
+    document_class: Option<&str>,
+) -> Result<Option<String>, String> {
+    if page_types.is_empty() {
+        return Ok(None);
+    }
+    if name.is_empty() {
+        return Err("must name a property when [[page_types]] are set".to_string());
+    }
+    let property = ontology.property(name)?;
+    let document_classes: Vec<&str> = document_class
+        .into_iter()
+        .chain(doc_types.values().map(String::as_str))
+        .collect();
+    let segment_classes: Vec<&str> = document_class
+        .into_iter()
+        .chain(
+            pages::doc_types_of(specs)
+                .filter_map(|t| doc_types.get(t))
+                .map(String::as_str),
+        )
+        .collect();
+    for (end, classes, allowed) in [
+        ("domain", &segment_classes, &property.domain),
+        ("range", &document_classes, &property.range),
+    ] {
+        for class in classes {
+            if !allowed.is_empty() && !allowed.iter().any(|a| ontology.is_a(class, a)) {
+                return Err(format!(
+                    "{} has class {class} outside its {end} {}",
+                    property.iri,
+                    allowed.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(Some(property.iri.clone()))
 }
 
 impl Rules {
@@ -229,12 +318,28 @@ impl Rules {
         facts
     }
 
-    pub fn text_facts(&self, text: &str) -> TextFacts {
+    pub fn text_facts(&self, text: &str, ocr: Option<f64>, known: &ids::KnownKeys) -> TextFacts {
         let mut entities = self.ids.find(text, ids::On::Text);
+        let mut rejected = 0;
+        if ocr.is_some() {
+            let tolerant = self
+                .ids
+                .find_tolerant(text, &self.confusions, known, &entities);
+            entities.extend(tolerant.hits);
+            rejected = tolerant.rejected;
+        }
         let (gazetteer, mut classes) = self.lexicon.find(text);
         entities.extend(gazetteer);
         char_offsets(text, &mut entities, &mut classes);
-        TextFacts { entities, classes }
+        if let Some(scale) = ocr {
+            entities.iter_mut().for_each(|hit| hit.confidence *= scale);
+            classes.iter_mut().for_each(|hit| hit.confidence *= scale);
+        }
+        TextFacts {
+            entities,
+            classes,
+            rejected,
+        }
     }
 
     pub fn document_class_for(&self, doc_type: Option<&str>) -> Option<&str> {
@@ -276,7 +381,8 @@ pub(crate) mod tests {
         ex:Valve a owl:Class ; skos:prefLabel \"valve\"@en, \"kogelkraan\"@nl .\n\
         ex:Hidden a owl:Class ; skos:prefLabel \"hidden\"@en .\n\
         ex:describes a owl:ObjectProperty ; rdfs:domain ex:Document ; rdfs:range ex:Project .\n\
-        ex:forCustomer a owl:ObjectProperty ; rdfs:domain ex:Project ; rdfs:range ex:Customer .\n";
+        ex:forCustomer a owl:ObjectProperty ; rdfs:domain ex:Project ; rdfs:range ex:Customer .\n\
+        ex:partOf a owl:ObjectProperty ; rdfs:domain ex:Document ; rdfs:range ex:Document .\n";
 
     pub fn ontology() -> Ontology {
         let config = OntologyConfig {
@@ -317,8 +423,87 @@ pub(crate) mod tests {
     #[test]
     fn spans_are_character_offsets() {
         let rules = rules("").unwrap();
-        let facts = rules.text_facts("é pump");
+        let facts = rules.text_facts("é pump", None, &ids::KnownKeys::new());
         assert_eq!((facts.classes[0].start, facts.classes[0].end), (2, 6));
+    }
+
+    #[test]
+    fn ocr_text_scales_confidence() {
+        let rules =
+            rules("[[id_patterns]]\nclass = \"ex:Project\"\npattern = 'P-\\d{4}'\n").unwrap();
+        let known = ids::KnownKeys::new();
+        let facts = rules.text_facts("pump for P-1234", None, &known);
+        assert_eq!(facts.entities[0].confidence, 1.0);
+        assert_eq!(facts.classes[0].confidence, 1.0);
+        let facts = rules.text_facts("pump for P-1234", Some(0.8), &known);
+        assert!((facts.entities[0].confidence - 0.8).abs() < 1e-9);
+        assert!((facts.classes[0].confidence - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tolerant_ids_only_on_ocr_text_with_default_confusions() {
+        let rules =
+            rules("[[id_patterns]]\nclass = \"ex:Project\"\npattern = 'P-\\d{4}'\n").unwrap();
+        let known = ids::KnownKeys::from([(
+            "http://example.org/onto#Project".to_string(),
+            std::collections::HashSet::from(["P-1234".to_string()]),
+        )]);
+        let layer = rules.text_facts("see P-l234", None, &known);
+        assert!(layer.entities.is_empty());
+        let ocr = rules.text_facts("see P-l234", Some(0.9), &known);
+        assert_eq!(ocr.entities.len(), 1);
+        assert_eq!(ocr.entities[0].method, ids::OCR_METHOD);
+        assert!((ocr.entities[0].confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn confusion_table_in_rules_replaces_the_default() {
+        let text = "[ocr_confusions]\n\"7\" = \"T\"\n\n[[id_patterns]]\nclass = \"ex:Project\"\npattern = 'P-\\d{4}'\n";
+        let rules = rules(text).unwrap();
+        let known = ids::KnownKeys::from([(
+            "http://example.org/onto#Project".to_string(),
+            std::collections::HashSet::from(["P-1234".to_string(), "P-7777".to_string()]),
+        )]);
+        assert!(
+            rules
+                .text_facts("P-l234", Some(1.0), &known)
+                .entities
+                .is_empty()
+        );
+        assert_eq!(
+            rules.text_facts("P-TT77", Some(1.0), &known).entities.len(),
+            1
+        );
+    }
+
+    const PAGE_TYPES: &str = "[doc_types]\nreport = \"ex:Report\"\n\n\
+        [[page_types]]\ndoc_type = \"report\"\npattern = 'test report'\n";
+
+    #[test]
+    fn page_types_need_a_part_property_inside_domain_and_range() {
+        let error = rules(PAGE_TYPES).err().unwrap();
+        assert!(
+            format!("{error}").contains("pages.part_property"),
+            "{error}"
+        );
+        let outside = format!("[pages]\npart_property = \"ex:forCustomer\"\n{PAGE_TYPES}");
+        let error = rules(&outside).err().unwrap();
+        assert!(format!("{error}").contains("outside its domain"), "{error}");
+        let rules = rules(&format!(
+            "[pages]\npart_property = \"ex:partOf\"\n{PAGE_TYPES}"
+        ))
+        .unwrap();
+        assert_eq!(
+            rules.part_property.as_deref(),
+            Some("http://example.org/onto#partOf")
+        );
+    }
+
+    #[test]
+    fn no_page_types_means_no_part_property() {
+        let rules = rules("[pages]\npart_property = \"ex:partOf\"\n").unwrap();
+        assert!(rules.page_types.is_empty());
+        assert_eq!(rules.part_property, None);
     }
 
     #[test]

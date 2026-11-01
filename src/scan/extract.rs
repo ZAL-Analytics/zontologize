@@ -2,6 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use xberg::{
     ConcurrencyConfig, ExtractInput, ExtractionConfig, ExtractionMethod, OcrConfig, OcrElement,
     OcrElementConfig, OutputFormat, PaddleOcrConfig, PageConfig, PageContent,
@@ -13,7 +14,8 @@ pub const STAGE_VERSION: u32 = 1;
 const XBERG_VERSION: &str = "1.3.10";
 pub const OCR_BACKEND: &str = "paddleocr";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Method {
     Layer,
     Ocr,
@@ -28,7 +30,7 @@ impl Method {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Page {
     pub page_no: u32,
     pub text: String,
@@ -106,8 +108,7 @@ pub fn tier_name(tier: ModelTier) -> &'static str {
 }
 
 pub async fn extract_file(path: &Path, settings: &ExtractSettings) -> Result<Vec<Page>> {
-    let input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
-    let result = tokio::time::timeout(settings.timeout, xberg::extract(input, &settings.xberg))
+    tokio::time::timeout(settings.timeout, extract_pages(path, settings))
         .await
         .with_context(|| {
             format!(
@@ -116,6 +117,12 @@ pub async fn extract_file(path: &Path, settings: &ExtractSettings) -> Result<Vec
                 path.display()
             )
         })?
+}
+
+pub async fn extract_pages(path: &Path, settings: &ExtractSettings) -> Result<Vec<Page>> {
+    let input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
+    let result = xberg::extract(input, &settings.xberg)
+        .await
         .with_context(|| format!("extraction failed: {}", path.display()))?;
     if result.results.is_empty() {
         let reasons: Vec<String> = result.errors.iter().map(|e| format!("{e:?}")).collect();
@@ -283,7 +290,8 @@ mod tests {
         extract.ocr_embedded_images = true;
         assert_ne!(base, extract_key(&extract, &config.ocr));
         let mut extract = config.extract.clone();
-        extract.max_memory_mb += 1;
+        extract.workers += 1;
+        extract.worker_memory_mb += 1;
         assert_eq!(base, extract_key(&extract, &config.ocr));
         let mut extract = config.extract.clone();
         extract.threads += 1;

@@ -1,9 +1,5 @@
-use std::time::Duration;
-
-const CHECK_EVERY: Duration = Duration::from_millis(250);
 const DEFAULT_SHARE_PERCENT: u64 = 60;
 const FALLBACK_LIMIT_MB: u64 = 8 * 1024;
-pub const EXIT_CODE: i32 = 3;
 
 pub fn field_kb(text: &str, name: &str) -> Option<u64> {
     text.lines()
@@ -12,8 +8,8 @@ pub fn field_kb(text: &str, name: &str) -> Option<u64> {
         .and_then(|value| value.parse().ok())
 }
 
-pub fn process_mb() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+pub fn pid_mb(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let rss = field_kb(&status, "VmRSS")?;
     let swap = field_kb(&status, "VmSwap").unwrap_or(0);
     Some((rss + swap) / 1024)
@@ -26,25 +22,6 @@ pub fn default_limit_mb() -> u64 {
         .map_or(FALLBACK_LIMIT_MB, |kb| {
             kb / 1024 * DEFAULT_SHARE_PERCENT / 100
         })
-}
-
-pub fn watch(limit_mb: u64) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(CHECK_EVERY).await;
-            let Some(used) = process_mb() else {
-                return;
-            };
-            if used > limit_mb {
-                eprintln!(
-                    "error: memory use reached {used} MB, over extract.max_memory_mb = {limit_mb}; \
-                     stopping the scan. Run scan again: the files that were being read are \
-                     retried one at a time, and a file that does this twice is recorded as an error"
-                );
-                std::process::exit(EXIT_CODE);
-            }
-        }
-    })
 }
 
 #[cfg(test)]
@@ -62,7 +39,7 @@ mod tests {
 
     #[test]
     fn own_process_is_measured() {
-        let used = process_mb().unwrap();
+        let used = pid_mb(std::process::id()).unwrap();
         assert!(used > 0 && used < default_limit_mb() * 10);
     }
 }

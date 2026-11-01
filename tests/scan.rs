@@ -276,9 +276,14 @@ async fn ontology_error_stops_scan_before_any_write() {
         text.replace("acme:Site", "acme:Nowhere"),
     )
     .unwrap();
-    let error = zontologize::scan::run(Some(&env.config()), &[], Some(&common::test_url()))
-        .await
-        .unwrap_err();
+    let error = zontologize::scan::run(
+        Some(&env.config()),
+        &[],
+        Some(&common::test_url()),
+        &common::options(),
+    )
+    .await
+    .unwrap_err();
     assert!(format!("{error:#}").contains("acme:Nowhere"), "{error:#}");
     assert_eq!(env.count("select count(*) from runs").await, 0);
     env.finish().await;
@@ -326,5 +331,110 @@ async fn file_read_when_a_run_died_is_retried_once_then_marked_error() {
     assert!(culprit.1.contains("memory"), "{}", culprit.1);
     let stats = env.scan().await;
     assert_eq!(stage(&stats, "extract"), 0);
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn two_workers_give_the_same_pages_as_one() {
+    let mut pages = Vec::new();
+    for workers in [1, 2] {
+        let env = env_with_folder(&format!("workers{workers}")).await;
+        env.add_extract_setting(&format!("workers = {workers}"));
+        for n in 0..6 {
+            env.file(
+                &format!("a/note-{n}.txt"),
+                &format!("made-up note number {n}"),
+            );
+        }
+        let stats = env.scan().await;
+        assert_eq!(stage(&stats, "extract"), 6);
+        let texts: Vec<(String, String)> = sqlx::query_as(
+            "select d.path, p.text from pages p join documents d on d.content_id = p.content_id \
+             order by d.path",
+        )
+        .fetch_all(&env.pool)
+        .await
+        .unwrap();
+        pages.push(texts);
+        env.finish().await;
+    }
+    assert_eq!(pages[0], pages[1]);
+}
+
+#[tokio::test]
+#[ignore]
+async fn file_whose_worker_crashes_is_retried_alone_then_marked_error() {
+    let env = env_with_folder("crash").await;
+    env.file("a/culprit.txt", "the worker dies on this file");
+    let mut options = common::options();
+    options.worker = zontologize::scan::pool::WorkerCommand {
+        program: "sh".into(),
+        args: vec![
+            "-c".to_string(),
+            "read setup; read line; exit 1".to_string(),
+        ],
+    };
+    let stats = env.scan_with(&options).await;
+    assert_eq!(stage(&stats, "extract"), 1);
+    assert_eq!(stats["extract"]["errors"].as_u64().unwrap(), 1);
+    assert_eq!(stats["workers"]["crash"].as_u64().unwrap(), 2);
+    let error: String = sqlx::query_scalar("select error from contents")
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    assert!(error.contains("two attempts"), "{error}");
+    let stats = env.scan().await;
+    assert_eq!(stage(&stats, "extract"), 0);
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn extract_minutes_zero_extracts_nothing_and_the_next_run_goes_on() {
+    let env = env_with_folder("minutes").await;
+    env.file("a/one.txt", "first file");
+    env.file("a/two.txt", "second file");
+    let mut options = common::options();
+    options.extract_minutes = Some(0);
+    let stats = env.scan_with(&options).await;
+    assert_eq!(stage(&stats, "extract"), 0);
+    assert_eq!(stats["extract_left"].as_i64().unwrap(), 2);
+    assert_eq!(
+        env.count("select count(*) from runs where status = 'finished'")
+            .await,
+        1
+    );
+    let stats = env.scan().await;
+    assert_eq!(stage(&stats, "extract"), 2);
+    assert_eq!(stats["extract_left"].as_i64().unwrap(), 0);
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn file_that_times_out_next_to_others_is_retried_alone_once() {
+    let env = env_with_folder("timeout").await;
+    env.add_extract_setting("workers = 2");
+    let path = env.config().join("zontologize.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.replace("timeout_secs = 60", "timeout_secs = 1")).unwrap();
+    env.file("a/slow.txt", "never answered in time");
+    let mut options = common::options();
+    options.worker = zontologize::scan::pool::WorkerCommand {
+        program: "sh".into(),
+        args: vec![
+            "-c".to_string(),
+            "read setup; read line; sleep 30".to_string(),
+        ],
+    };
+    let stats = env.scan_with(&options).await;
+    assert_eq!(stats["workers"]["timeout"].as_u64().unwrap(), 2);
+    assert_eq!(stats["extract"]["errors"].as_u64().unwrap(), 1);
+    let error: String = sqlx::query_scalar("select error from contents")
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    assert!(error.contains("timed out"), "{error}");
     env.finish().await;
 }

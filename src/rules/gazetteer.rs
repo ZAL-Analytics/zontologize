@@ -166,6 +166,7 @@ impl Lexicon {
                         class: self.classes[i].clone(),
                         start,
                         end,
+                        confidence: 1.0,
                     }),
                 }
             }
