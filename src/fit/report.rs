@@ -14,13 +14,13 @@ const EXAMPLES: usize = 5;
 const NEVER_LISTED: usize = 50;
 const REPORT_FILE: &str = "fit-report.md";
 const PROPOSALS_FILE: &str = "proposals.ttl";
-const RDFS_COMMENT: &str = "http://www.w3.org/2000/01/rdf-schema#comment";
+pub(crate) const RDFS_COMMENT: &str = "http://www.w3.org/2000/01/rdf-schema#comment";
 const RDFS_SUBCLASS: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
-const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+pub(crate) const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const OWL_CLASS: &str = "http://www.w3.org/2002/07/owl#Class";
-const SKOS_PREF: &str = "http://www.w3.org/2004/02/skos/core#prefLabel";
+pub(crate) const SKOS_PREF: &str = "http://www.w3.org/2004/02/skos/core#prefLabel";
 const SKOS_ALT: &str = "http://www.w3.org/2004/02/skos/core#altLabel";
-const STANDARD_PREFIXES: [(&str, &str); 4] = [
+pub(crate) const STANDARD_PREFIXES: [(&str, &str); 4] = [
     ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
     ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
     ("owl", "http://www.w3.org/2002/07/owl#"),
@@ -164,7 +164,7 @@ pub fn write(
     Ok(proposals)
 }
 
-fn label(ontology: &Ontology, iri: &str) -> String {
+pub(crate) fn label(ontology: &Ontology, iri: &str) -> String {
     let class = ontology.classes.get(iri);
     let label = class.and_then(|c| {
         ontology
@@ -300,7 +300,7 @@ fn markdown(
     out
 }
 
-fn slug(term: &str) -> String {
+pub(crate) fn slug(term: &str) -> String {
     let mut out = String::new();
     for word in term.split(|c: char| !c.is_alphanumeric()) {
         let mut chars = word.chars();

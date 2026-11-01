@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,8 @@ pub struct Call<'a> {
     pub error: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct JobParams {
     pub sample: usize,
     pub seed: String,
@@ -127,6 +128,21 @@ pub async fn record(
     }
     tx.commit().await?;
     Ok(())
+}
+
+pub async fn known_keys(pool: &PgPool, keys: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+    let cached = sqlx::query_scalar("select key from llm_cache where key = any($1)")
+        .bind(keys)
+        .fetch_all(pool)
+        .await?;
+    let invalid = sqlx::query_scalar(
+        "select distinct cache_key from llm_job_items where status = 'invalid' \
+         and cache_key = any($1)",
+    )
+    .bind(keys)
+    .fetch_all(pool)
+    .await?;
+    Ok((cached, invalid))
 }
 
 pub async fn calibration(
@@ -261,6 +277,72 @@ pub async fn create_job(
     .await?;
     tx.commit().await?;
     Ok(job)
+}
+
+pub async fn replace_items(
+    pool: &PgPool,
+    job: i64,
+    chunk_ids: &[i64],
+    keys: &[String],
+) -> Result<Vec<i32>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("delete from llm_job_items where job_id = $1 and status in ('pending', 'error')")
+        .bind(job)
+        .execute(&mut *tx)
+        .await?;
+    let ords = sqlx::query_scalar(
+        "insert into llm_job_items (job_id, ord, chunk_id, cache_key) \
+         select $1, (select coalesce(max(ord), 0) from llm_job_items where job_id = $1) \
+         + t.n::integer, t.chunk_id, t.key \
+         from unnest($2::bigint[], $3::text[]) with ordinality as t(chunk_id, key, n) \
+         order by t.n returning ord",
+    )
+    .bind(job)
+    .bind(chunk_ids)
+    .bind(keys)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(ords)
+}
+
+pub async fn add_stats(pool: &PgPool, job: i64, stats: &BTreeMap<String, i64>) -> Result<()> {
+    if job == 0 || stats.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<&str> = stats.keys().map(String::as_str).collect();
+    let counts: Vec<i64> = stats.values().copied().collect();
+    sqlx::query(
+        "update llm_jobs set params = params || jsonb_build_object('stats', \
+         coalesce(params -> 'stats', '{}'::jsonb) || (select jsonb_object_agg(t.name, \
+         coalesce((params -> 'stats' ->> t.name)::bigint, 0) + t.count) \
+         from unnest($2::text[], $3::bigint[]) as t(name, count))) where id = $1",
+    )
+    .bind(job)
+    .bind(&names)
+    .bind(&counts)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn task_stats(
+    pool: &PgPool,
+    task: &str,
+    provider: &str,
+    model: &str,
+) -> Result<BTreeMap<String, i64>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "select s.key, sum(s.value::bigint)::bigint from llm_jobs j, \
+         jsonb_each_text(coalesce(j.params -> 'stats', '{}'::jsonb)) as s \
+         where j.task = $1 and j.provider = $2 and j.model = $3 group by 1 order by 1",
+    )
+    .bind(task)
+    .bind(provider)
+    .bind(model)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
 }
 
 pub async fn set_job(

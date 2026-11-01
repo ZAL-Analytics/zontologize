@@ -13,6 +13,9 @@ pub struct DocumentWork {
     pub path: String,
     pub status: String,
     pub dataset: String,
+    pub llm_type: Option<String>,
+    pub llm_method: Option<String>,
+    pub llm_confidence: Option<f64>,
 }
 
 pub struct DocumentOutput {
@@ -20,7 +23,15 @@ pub struct DocumentOutput {
     pub path: String,
     pub dataset: String,
     pub document_class: Option<String>,
+    pub type_method: Option<String>,
+    pub type_confidence: f64,
     pub facts: Option<DocumentFacts>,
+}
+
+pub struct ModelType {
+    pub doc_type: String,
+    pub method: String,
+    pub confidence: f64,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -46,6 +57,7 @@ pub struct PageWork {
 
 pub struct SegmentEntity {
     pub class: String,
+    pub method: String,
     pub key: String,
     pub name: String,
     pub dataset: String,
@@ -72,17 +84,21 @@ pub struct ChunkOutput {
     pub facts: TextFacts,
 }
 
-struct NewEntity {
-    class: String,
-    key: String,
-    name: String,
-    dataset: String,
-    method: String,
-    confidence: f64,
-    document_id: Option<i64>,
+pub(super) struct NewEntity {
+    pub class: String,
+    pub key: String,
+    pub name: String,
+    pub dataset: String,
+    pub method: String,
+    pub confidence: f64,
+    pub document_id: Option<i64>,
 }
 
 const DOCUMENTS_TO_RULE: &str = "from documents d join sources s on s.id = d.source_id \
+    left join lateral (select t.doc_type, t.method, t.confidence from llm_types t \
+    where t.content_id = d.content_id and t.doc_type is not null \
+    and (select count(*) from segments g where g.content_id = d.content_id) <= 1 \
+    order by t.page_from limit 1) t on true \
     where d.source_id = any($2) and ((d.status <> 'deleted' and d.rules_key is distinct from $1) \
     or (d.status = 'deleted' and d.rules_key is not null))";
 
@@ -104,8 +120,9 @@ pub async fn next_documents_to_rule(
     limit: i64,
 ) -> Result<Vec<DocumentWork>> {
     let sql = format!(
-        "select d.id, d.path, d.status, s.dataset {DOCUMENTS_TO_RULE} and d.id > $3 \
-         order by d.id limit $4"
+        "select d.id, d.path, d.status, s.dataset, t.doc_type as llm_type, \
+         t.method as llm_method, t.confidence as llm_confidence {DOCUMENTS_TO_RULE} \
+         and d.id > $3 order by d.id limit $4"
     );
     let rows = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(key)
@@ -175,7 +192,7 @@ pub async fn chunks_of(pool: &PgPool, content_ids: &[i64]) -> Result<Vec<ChunkWo
     Ok(rows)
 }
 
-async fn upsert_entities(
+pub(super) async fn upsert_entities(
     conn: &mut PgConnection,
     entities: Vec<NewEntity>,
     version_id: i64,
@@ -243,12 +260,12 @@ fn new_entity(hit: &EntityHit, dataset: &str) -> NewEntity {
     }
 }
 
-enum Owner {
+pub(super) enum Owner {
     Document(i64),
     Chunk(i64),
 }
 
-fn mention_row(
+pub(super) fn mention_row(
     data: &mut String,
     entity: i64,
     owner: &Owner,
@@ -301,7 +318,7 @@ fn class_row(data: &mut String, hit: &ClassHit, owner: &Owner) {
     );
 }
 
-async fn copy(conn: &mut PgConnection, statement: &str, data: String) -> Result<()> {
+pub(super) async fn copy(conn: &mut PgConnection, statement: &str, data: String) -> Result<()> {
     if data.is_empty() {
         return Ok(());
     }
@@ -342,8 +359,11 @@ pub async fn write_document_rules(
                 key: output.id.to_string(),
                 name: file_name(&output.path).to_string(),
                 dataset: output.dataset.clone(),
-                method: "path".to_string(),
-                confidence: 1.0,
+                method: output
+                    .type_method
+                    .clone()
+                    .unwrap_or_else(|| "path".to_string()),
+                confidence: output.type_confidence,
                 document_id: Some(output.id),
             });
         }
@@ -359,15 +379,18 @@ pub async fn write_document_rules(
     let mut targets = Vec::new();
     let mut relation_documents = Vec::new();
     let mut doc_types = Vec::new();
+    let mut type_methods = Vec::new();
     let mut props = Vec::new();
     for output in outputs {
         let owner = Owner::Document(output.id);
         let Some(facts) = &output.facts else {
             doc_types.push(None);
+            type_methods.push(None);
             props.push(serde_json::Value::Object(Default::default()));
             continue;
         };
         doc_types.push(facts.doc_type.clone());
+        type_methods.push(output.type_method.clone());
         props.push(serde_json::to_value(&facts.props)?);
         let document_entity = output
             .document_class
@@ -444,14 +467,17 @@ pub async fn write_document_rules(
         props.into_iter().map(sqlx::types::Json).collect();
     sqlx::query(
         "update documents d set doc_type = u.doc_type, props = u.props, \
+         type_method = u.type_method, \
          rules_key = case when d.status = 'deleted' then null else $4 end \
-         from unnest($1::bigint[], $2::text[], $3::jsonb[]) as u(id, doc_type, props) \
+         from unnest($1::bigint[], $2::text[], $3::jsonb[], $5::text[]) \
+         as u(id, doc_type, props, type_method) \
          where d.id = u.id",
     )
     .bind(&ids)
     .bind(&doc_types)
     .bind(&props)
     .bind(key)
+    .bind(&type_methods)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -459,6 +485,7 @@ pub async fn write_document_rules(
 }
 
 pub const SEGMENT_METHOD: &str = "page_rule";
+const MODEL_METHODS: &str = "llm:%";
 
 pub async fn write_text_rules(
     pool: &PgPool,
@@ -473,10 +500,11 @@ pub async fn write_text_rules(
     for table in ["mentions", "class_mentions", "relations"] {
         let sql = format!(
             "delete from {table} where chunk_id in \
-             (select id from chunks where content_id = any($1))"
+             (select id from chunks where content_id = any($1)) and method not like $2"
         );
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(content_ids)
+            .bind(MODEL_METHODS)
             .execute(&mut *tx)
             .await?;
     }
@@ -500,7 +528,7 @@ pub async fn write_text_rules(
                 key: entity.key.clone(),
                 name: entity.name.clone(),
                 dataset: entity.dataset.clone(),
-                method: SEGMENT_METHOD.to_string(),
+                method: entity.method.clone(),
                 confidence: entity.confidence,
                 document_id: None,
             });
@@ -623,6 +651,30 @@ async fn write_segments(
     Ok(())
 }
 
+pub async fn model_types(pool: &PgPool, content_ids: &[i64]) -> Result<Vec<(i64, i32, ModelType)>> {
+    let rows: Vec<(i64, i32, String, String, f64)> = sqlx::query_as(
+        "select content_id, page_from, doc_type, method, confidence from llm_types \
+         where content_id = any($1) and doc_type is not null",
+    )
+    .bind(content_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(content, page, doc_type, method, confidence)| {
+            (
+                content,
+                page,
+                ModelType {
+                    doc_type,
+                    method,
+                    confidence,
+                },
+            )
+        })
+        .collect())
+}
+
 pub async fn pages_of(pool: &PgPool, content_ids: &[i64]) -> Result<Vec<PageWork>> {
     let rows = sqlx::query_as(
         "select p.content_id, c.sha256, p.page_no, p.text, \
@@ -655,7 +707,7 @@ pub async fn clear_unlisted_contents(pool: &PgPool) -> Result<u64> {
     if ids.is_empty() {
         return Ok(0);
     }
-    for table in ["mentions", "class_mentions", "relations"] {
+    for table in ["mentions", "class_mentions", "relations", "relation_terms"] {
         let sql = format!(
             "delete from {table} where chunk_id in \
              (select id from chunks where content_id = any($1))"
@@ -666,6 +718,10 @@ pub async fn clear_unlisted_contents(pool: &PgPool) -> Result<u64> {
             .await?;
     }
     sqlx::query("delete from segments where content_id = any($1)")
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("update chunks set llm_key = null where content_id = any($1)")
         .bind(&ids)
         .execute(&mut *tx)
         .await?;

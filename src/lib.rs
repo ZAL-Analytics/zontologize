@@ -1,8 +1,11 @@
+pub mod classify;
 pub mod config;
 pub mod db;
+pub mod facts;
 pub mod fit;
 pub mod llm;
 pub mod ontology;
+pub mod review;
 pub mod rules;
 pub mod scan;
 
@@ -129,10 +132,33 @@ pub async fn ontology_fit(
     options: &fit::run::Options,
 ) -> Result<ExitCode> {
     let outcome = fit::run::run(config_dir, database_url().as_deref(), options).await?;
-    Ok(match outcome {
-        fit::run::Outcome::Paused => ExitCode::from(PAUSED_EXIT_CODE),
+    Ok(exit_code(outcome))
+}
+
+pub async fn extract(config_dir: Option<&Path>, options: &facts::run::Options) -> Result<ExitCode> {
+    let outcome = facts::run::run(config_dir, database_url().as_deref(), options).await?;
+    Ok(exit_code(outcome))
+}
+
+pub async fn classify(config_dir: Option<&Path>, options: &llm::job::Options) -> Result<ExitCode> {
+    let outcome = classify::run(config_dir, database_url().as_deref(), options).await?;
+    Ok(exit_code(outcome))
+}
+
+pub async fn review_sample(
+    config_dir: Option<&Path>,
+    options: &review::Options,
+) -> Result<ExitCode> {
+    let mut input = tokio::io::BufReader::new(tokio::io::stdin());
+    review::sample(config_dir, database_url().as_deref(), options, &mut input).await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn exit_code(outcome: llm::job::Outcome) -> ExitCode {
+    match outcome {
+        llm::job::Outcome::Paused => ExitCode::from(PAUSED_EXIT_CODE),
         _ => ExitCode::SUCCESS,
-    })
+    }
 }
 
 pub async fn models_check(
@@ -478,6 +504,47 @@ async fn print_status(
             ));
         }
         println!("{line}");
+    }
+    print_model_facts(pool, config).await
+}
+
+async fn print_model_facts(pool: &sqlx::PgPool, config: &config::Config) -> Result<()> {
+    let extract = &config.llm_extract;
+    let eligible = db::facts::eligible_count(
+        pool,
+        &extract.sources,
+        &extract.doc_types,
+        extract.min_chars as i32,
+    )
+    .await?;
+    let extracted = db::facts::extracted_chunks(pool).await?;
+    if extracted > 0 {
+        println!("extract: {extracted} chunks extracted, {eligible} eligible");
+    }
+    for (method, mentions, relations) in db::facts::method_counts(pool).await? {
+        println!("model facts: {method}: {mentions} mentions, {relations} relations");
+    }
+    let types: Vec<String> = db::classify::counts(pool)
+        .await?
+        .into_iter()
+        .map(|(doc_type, count)| format!("{count} {}", doc_type.as_deref().unwrap_or("none")))
+        .collect();
+    if !types.is_empty() {
+        println!("classify: {}", types.join(", "));
+    }
+    let precision = db::review::precision(pool).await?;
+    if !precision.is_empty() {
+        println!("review precision:");
+    }
+    for row in precision {
+        println!(
+            "  {} {}: {} of {} right ({:.0}%)",
+            row.method,
+            llm::shortlist::local_name(&row.iri),
+            row.right,
+            row.total,
+            100.0 * row.right as f64 / row.total.max(1) as f64
+        );
     }
     Ok(())
 }

@@ -36,13 +36,17 @@ async fn acme_example_end_to_end() {
         .replace(
             "out = \"fit\"",
             &format!("out = \"{}\"", env.dir.join("fit").display()),
+        )
+        .replace(
+            "out = \"extract\"",
+            &format!("out = \"{}\"", env.dir.join("extract").display()),
         );
     std::fs::write(env.config().join("zontologize.toml"), text).unwrap();
 
     let stats = env.scan().await;
-    assert_eq!(stats["sources"]["projects"]["files"].as_u64(), Some(5));
+    assert_eq!(stats["sources"]["projects"]["files"].as_u64(), Some(6));
     assert_eq!(stats["sources"]["archive"]["files"].as_u64(), Some(3));
-    assert_eq!(stage(&stats, "extract"), 6);
+    assert_eq!(stage(&stats, "extract"), 7);
     assert_eq!(
         env.count(
             "select count(*) from documents where status = 'skipped' and sha256 is null \
@@ -142,7 +146,7 @@ async fn acme_example_end_to_end() {
     assert_eq!(stats["sources"]["projects"]["changed"].as_u64(), Some(1));
     assert_eq!(stage(&stats, "extract"), 1);
     assert_eq!(stage(&stats, "chunk"), 1);
-    assert_eq!(stage(&stats, "rules"), 8 + 6);
+    assert_eq!(stage(&stats, "rules"), 9 + 7);
     assert_eq!(
         env.count("select count(*) from documents where doc_type = 'quotation'")
             .await,
@@ -169,5 +173,50 @@ async fn acme_example_end_to_end() {
     assert!(report.contains("https://example.org/acme#"), "{report}");
     assert!(env.dir.join("fit/proposals.ttl").exists());
     assert_eq!(env.count(facts).await, before);
+
+    let mut options = zontologize::llm::job::Options::new(repo(
+        "tests/fixtures/llm/claude-code/fake-claude-extract.sh",
+    ));
+    options.no_wait = true;
+    let url = common::test_url();
+    let outcome = zontologize::classify::run(Some(&env.config()), Some(&url), &options)
+        .await
+        .unwrap();
+    assert_eq!(outcome, zontologize::llm::job::Outcome::Finished);
+    assert_eq!(
+        env.count(
+            "select count(*) from documents where path like '%Service visit%' \
+             and doc_type = 'work_order' and type_method like 'llm:%'"
+        )
+        .await,
+        1
+    );
+    let outcome = zontologize::facts::run::run(Some(&env.config()), Some(&url), &options)
+        .await
+        .unwrap();
+    assert_eq!(outcome, zontologize::llm::job::Outcome::Finished);
+    assert_eq!(
+        env.count(
+            "select count(*) from relations where method like 'llm:%' \
+             and property_iri = 'https://example.org/acme#atSite'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(env.count("select count(*) from relation_terms").await, 1);
+    assert!(env.dir.join("extract/extract-report.md").exists());
+    assert!(env.dir.join("extract/relation-proposals.ttl").exists());
+    let model_facts = "select (select count(*) from mentions where method like 'llm:%') \
+        + (select count(*) from relations where method like 'llm:%') \
+        + (select count(*) from relation_terms) + (select count(*) from llm_types)";
+    let calls = env.count("select count(*) from llm_calls").await;
+    let kept = env.count(model_facts).await;
+    env.scan().await;
+    let outcome = zontologize::facts::run::run(Some(&env.config()), Some(&url), &options)
+        .await
+        .unwrap();
+    assert_eq!(outcome, zontologize::llm::job::Outcome::Finished);
+    assert_eq!(env.count("select count(*) from llm_calls").await, calls);
+    assert_eq!(env.count(model_facts).await, kept);
     env.finish().await;
 }
