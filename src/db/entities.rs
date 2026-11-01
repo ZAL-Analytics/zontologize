@@ -4,6 +4,7 @@ use anyhow::Result;
 use sqlx::{FromRow, PgConnection, PgPool};
 
 use super::copy_row;
+use crate::rules::pages::Segment;
 use crate::rules::{ClassHit, DocumentFacts, Endpoint, EntityHit, TextFacts};
 
 #[derive(Debug, Clone, FromRow)]
@@ -28,6 +29,41 @@ pub struct ChunkWork {
     pub content_id: i64,
     pub text: String,
     pub dataset: String,
+    pub ocr: bool,
+    pub ocr_confidence: Option<f64>,
+    pub page_from: Option<i32>,
+    pub page_to: Option<i32>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct PageWork {
+    pub content_id: i64,
+    pub sha256: String,
+    pub page_no: i32,
+    pub text: String,
+    pub ocr_confidence: Option<f64>,
+}
+
+pub struct SegmentEntity {
+    pub class: String,
+    pub key: String,
+    pub name: String,
+    pub dataset: String,
+    pub chunk_id: i64,
+    pub span_end: usize,
+    pub confidence: f64,
+}
+
+pub struct ContentSegments {
+    pub content_id: i64,
+    pub segments: Vec<Segment>,
+    pub entities: Vec<SegmentEntity>,
+}
+
+impl ChunkWork {
+    pub fn ocr_scale(&self) -> Option<f64> {
+        self.ocr.then(|| self.ocr_confidence.unwrap_or(1.0))
+    }
 }
 
 pub struct ChunkOutput {
@@ -125,8 +161,13 @@ pub async fn chunks_of(pool: &PgPool, content_ids: &[i64]) -> Result<Vec<ChunkWo
     let rows = sqlx::query_as(
         "select k.id, k.content_id, k.text, \
          coalesce((select min(s.dataset) from documents d join sources s on s.id = d.source_id \
-         where d.content_id = k.content_id and d.status = 'present'), '') as dataset \
-         from chunks k where k.content_id = any($1) order by k.content_id, k.ord",
+         where d.content_id = k.content_id and d.status = 'present'), '') as dataset, \
+         o.ocr, o.ocr_confidence, k.page_from, k.page_to \
+         from chunks k cross join lateral (select count(*) > 0 as ocr, \
+         min(p.ocr_confidence) as ocr_confidence from pages p \
+         where p.content_id = k.content_id and p.method = 'ocr' \
+         and p.page_no between coalesce(k.page_from, 0) and coalesce(k.page_to, 2147483647)) o \
+         where k.content_id = any($1) order by k.content_id, k.ord",
     )
     .bind(content_ids)
     .fetch_all(pool)
@@ -245,6 +286,7 @@ fn class_row(data: &mut String, hit: &ClassHit, owner: &Owner) {
     };
     let start = hit.start.to_string();
     let end = hit.end.to_string();
+    let confidence = hit.confidence.to_string();
     copy_row(
         data,
         &[
@@ -254,6 +296,7 @@ fn class_row(data: &mut String, hit: &ClassHit, owner: &Owner) {
             Some(&start),
             Some(&end),
             Some("label"),
+            Some(&confidence),
         ],
     );
 }
@@ -271,7 +314,7 @@ async fn copy(conn: &mut PgConnection, statement: &str, data: String) -> Result<
 const COPY_MENTIONS: &str = "copy mentions (entity_id, document_id, chunk_id, span_start, \
                              span_end, method, confidence) from stdin";
 const COPY_CLASS_MENTIONS: &str = "copy class_mentions (class_iri, document_id, chunk_id, \
-                                   span_start, span_end, method) from stdin";
+                                   span_start, span_end, method, confidence) from stdin";
 
 pub async fn write_document_rules(
     pool: &PgPool,
@@ -415,15 +458,19 @@ pub async fn write_document_rules(
     Ok(())
 }
 
+pub const SEGMENT_METHOD: &str = "page_rule";
+
 pub async fn write_text_rules(
     pool: &PgPool,
     content_ids: &[i64],
     outputs: &[ChunkOutput],
+    segments: &[ContentSegments],
+    part_property: Option<&str>,
     key: &str,
     version_id: i64,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    for table in ["mentions", "class_mentions"] {
+    for table in ["mentions", "class_mentions", "relations"] {
         let sql = format!(
             "delete from {table} where chunk_id in \
              (select id from chunks where content_id = any($1))"
@@ -433,7 +480,11 @@ pub async fn write_text_rules(
             .execute(&mut *tx)
             .await?;
     }
-    let entities = outputs
+    sqlx::query("delete from segments where content_id = any($1)")
+        .bind(content_ids)
+        .execute(&mut *tx)
+        .await?;
+    let mut entities: Vec<NewEntity> = outputs
         .iter()
         .flat_map(|o| {
             o.facts
@@ -442,6 +493,19 @@ pub async fn write_text_rules(
                 .map(|hit| new_entity(hit, &o.dataset))
         })
         .collect();
+    for content in segments {
+        for entity in &content.entities {
+            entities.push(NewEntity {
+                class: entity.class.clone(),
+                key: entity.key.clone(),
+                name: entity.name.clone(),
+                dataset: entity.dataset.clone(),
+                method: SEGMENT_METHOD.to_string(),
+                confidence: entity.confidence,
+                document_id: None,
+            });
+        }
+    }
     let map = upsert_entities(&mut tx, entities, version_id).await?;
     let mut mentions = String::new();
     let mut class_mentions = String::new();
@@ -464,8 +528,53 @@ pub async fn write_text_rules(
             class_row(&mut class_mentions, hit, &owner);
         }
     }
+    let mut sources = Vec::new();
+    let mut source_contents = Vec::new();
+    let mut source_chunks = Vec::new();
+    let mut source_confidences = Vec::new();
+    for content in segments {
+        for entity in &content.entities {
+            let Some(id) = map.get(&(entity.class.clone(), entity.key.clone())) else {
+                continue;
+            };
+            mention_row(
+                &mut mentions,
+                *id,
+                &Owner::Chunk(entity.chunk_id),
+                0,
+                entity.span_end,
+                SEGMENT_METHOD,
+                entity.confidence,
+            );
+            sources.push(*id);
+            source_contents.push(content.content_id);
+            source_chunks.push(entity.chunk_id);
+            source_confidences.push(entity.confidence);
+        }
+    }
     copy(&mut tx, COPY_MENTIONS, mentions).await?;
     copy(&mut tx, COPY_CLASS_MENTIONS, class_mentions).await?;
+    if let Some(property) = part_property
+        && !sources.is_empty()
+    {
+        sqlx::query(
+            "insert into relations (src_id, property_iri, dst_id, method, confidence, chunk_id) \
+             select u.src, $5, e.id, $6, u.confidence, u.chunk \
+             from unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::float8[]) \
+             as u(src, content, chunk, confidence) \
+             join documents d on d.content_id = u.content and d.status = 'present' \
+             join entities e on e.document_id = d.id and e.key = d.id::text",
+        )
+        .bind(&sources)
+        .bind(&source_contents)
+        .bind(&source_chunks)
+        .bind(&source_confidences)
+        .bind(property)
+        .bind(SEGMENT_METHOD)
+        .execute(&mut *tx)
+        .await?;
+    }
+    write_segments(&mut tx, segments, key).await?;
     sqlx::query("update contents set rules_key = $2 where id = any($1)")
         .bind(content_ids)
         .bind(key)
@@ -473,6 +582,99 @@ pub async fn write_text_rules(
         .await?;
     tx.commit().await?;
     Ok(())
+}
+
+async fn write_segments(
+    conn: &mut PgConnection,
+    segments: &[ContentSegments],
+    key: &str,
+) -> Result<()> {
+    let mut contents = Vec::new();
+    let mut ords = Vec::new();
+    let mut froms = Vec::new();
+    let mut tos = Vec::new();
+    let mut doc_types = Vec::new();
+    for content in segments {
+        for segment in &content.segments {
+            contents.push(content.content_id);
+            ords.push(segment.ord);
+            froms.push(segment.page_from);
+            tos.push(segment.page_to);
+            doc_types.push(segment.doc_type.clone());
+        }
+    }
+    if contents.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "insert into segments (content_id, ord, page_from, page_to, doc_type, rules_key) \
+         select u.content_id, u.ord, u.page_from, u.page_to, u.doc_type, $6 \
+         from unnest($1::bigint[], $2::int[], $3::int[], $4::int[], $5::text[]) \
+         as u(content_id, ord, page_from, page_to, doc_type)",
+    )
+    .bind(&contents)
+    .bind(&ords)
+    .bind(&froms)
+    .bind(&tos)
+    .bind(&doc_types)
+    .bind(key)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+pub async fn pages_of(pool: &PgPool, content_ids: &[i64]) -> Result<Vec<PageWork>> {
+    let rows = sqlx::query_as(
+        "select p.content_id, c.sha256, p.page_no, p.text, \
+         case when p.method = 'ocr' then p.ocr_confidence end as ocr_confidence \
+         from pages p join contents c on c.id = p.content_id \
+         where p.content_id = any($1) order by p.content_id, p.page_no",
+    )
+    .bind(content_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn known_keys(pool: &PgPool, method_to_skip: &str) -> Result<Vec<(String, String)>> {
+    let rows = sqlx::query_as("select class_iri, key from entities where method <> $1")
+        .bind(method_to_skip)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+pub async fn clear_unlisted_contents(pool: &PgPool) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "select c.id from contents c where c.rules_key is not null and not exists \
+         (select 1 from documents d where d.content_id = c.id and d.status = 'present')",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    for table in ["mentions", "class_mentions", "relations"] {
+        let sql = format!(
+            "delete from {table} where chunk_id in \
+             (select id from chunks where content_id = any($1))"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query("delete from segments where content_id = any($1)")
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("update contents set rules_key = null where id = any($1)")
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(ids.len() as u64)
 }
 
 pub async fn delete_orphans(pool: &PgPool) -> Result<u64> {

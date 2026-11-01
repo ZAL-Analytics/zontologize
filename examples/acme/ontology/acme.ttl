@@ -93,6 +93,15 @@ acme:WorkOrder a owl:Class ;
     rdfs:subClassOf acme:Document ;
     skos:prefLabel "work order"@en, "werkbon"@nl .
 
+acme:Certificate a owl:Class ;
+    rdfs:subClassOf acme:Document ;
+    skos:prefLabel "certificate"@en, "certificaat"@nl .
+
+acme:partOf a owl:ObjectProperty ;
+    rdfs:domain acme:Document ;
+    rdfs:range acme:Document ;
+    skos:prefLabel "part of"@en, "onderdeel van"@nl .
+
 acme:describes a owl:ObjectProperty ;
     rdfs:domain acme:Document ;
     rdfs:range acme:Project ;

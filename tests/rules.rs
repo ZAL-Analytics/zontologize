@@ -147,6 +147,23 @@ async fn deleted_document_loses_its_facts() {
     );
     assert_eq!(
         env.count(
+            "select count(*) from mentions m join chunks k on k.id = m.chunk_id \
+             where not exists (select 1 from documents d where d.content_id = k.content_id \
+             and d.status = 'present')"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        env.count(
+            "select count(*) from contents c where c.rules_key is not null and not exists \
+             (select 1 from documents d where d.content_id = c.id and d.status = 'present')"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        env.count(
             "select count(*) from entities where class_iri = 'https://example.org/acme#WorkOrder'"
         )
         .await,
@@ -158,6 +175,161 @@ async fn deleted_document_loses_its_facts() {
         )
         .await,
         1
+    );
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn facts_from_ocr_pages_carry_the_ocr_confidence() {
+    let env = two_sources("ocr_confidence").await;
+    env.scan().await;
+    sqlx::query(
+        "update pages set method = 'ocr', ocr_confidence = 0.8 where content_id = \
+         (select content_id from documents where path like 'Archief/%')",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    sqlx::query("update contents set rules_key = null")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    env.scan().await;
+    let scanned: (f64, f64) = sqlx::query_as(
+        "select min(m.confidence), max(m.confidence) from mentions m \
+         join chunks c on c.id = m.chunk_id join documents d on d.content_id = c.content_id \
+         where d.path like 'Archief/%'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert!((scanned.0 - 0.8).abs() < 1e-9 && (scanned.1 - 0.8).abs() < 1e-9);
+    let layer: f64 = sqlx::query_scalar(
+        "select min(m.confidence) from mentions m \
+         join chunks c on c.id = m.chunk_id join documents d on d.content_id = c.content_id \
+         where d.path like 'Projects/%'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(layer, 1.0);
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn confused_identifier_in_ocr_text_links_to_the_known_entity() {
+    let env = two_sources("ocr_ids").await;
+    env.file(
+        "archive/Archief/Scans/2023/Brief 0001.txt",
+        "Betreft order P-2O23-O3l1 en order P-2O99-OOO1.",
+    );
+    env.scan().await;
+    sqlx::query(
+        "update pages set method = 'ocr', ocr_confidence = 0.9 where content_id = \
+         (select content_id from documents where path like '%Brief 0001.txt')",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    sqlx::query("update contents set rules_key = null")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let stats = env.scan().await;
+    assert_eq!(stats["ocr_ids"]["accepted"].as_u64().unwrap(), 1);
+    assert_eq!(stats["ocr_ids"]["rejected"].as_u64().unwrap(), 1);
+    let hit: (String, String, f64) = sqlx::query_as(
+        "select e.key, m.method, m.confidence from mentions m join entities e on e.id = m.entity_id \
+         where m.method = 'regex-ocr'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(hit.0, "P-2023-0311");
+    assert_eq!(hit.1, "regex-ocr");
+    assert!((hit.2 - 0.9).abs() < 1e-9);
+    assert_eq!(
+        env.count("select count(*) from entities where key = 'P-2099-0001'")
+            .await,
+        0
+    );
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn bundle_with_two_headers_becomes_two_segments() {
+    let env = two_sources("segments").await;
+    env.file(
+        "archive/Archief/Scans/2023/Bundel 0001.txt",
+        "one page made up for the test",
+    );
+    env.scan().await;
+    let content: i64 =
+        sqlx::query_scalar("select content_id from documents where path like '%Bundel 0001.txt'")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    sqlx::query("delete from pages where content_id = $1")
+        .bind(content)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    for (page_no, text) in [
+        (1, "Certificate of conformity for pump P-2023-0311"),
+        (2, "annex with measurements"),
+        (3, "Certificate of conformity for a second made-up pump"),
+    ] {
+        sqlx::query(
+            "insert into pages (content_id, page_no, method, text) values ($1, $2, 'layer', $3)",
+        )
+        .bind(content)
+        .bind(page_no)
+        .bind(text)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("update contents set chunk_key = null, rules_key = null")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let stats = env.scan().await;
+    assert_eq!(stats["segments"]["split"].as_u64().unwrap(), 1);
+    let segments: Vec<(i32, i32, Option<String>)> = sqlx::query_as(
+        "select page_from, page_to, doc_type from segments where content_id = $1 order by ord",
+    )
+    .bind(content)
+    .fetch_all(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        segments,
+        [
+            (1, 2, Some("certificate".to_string())),
+            (3, 3, Some("certificate".to_string()))
+        ]
+    );
+    assert_eq!(
+        env.count(
+            "select count(*) from entities e join mentions m on m.entity_id = e.id \
+             where e.method = 'page_rule' and e.class_iri = 'https://example.org/acme#Certificate' \
+             and m.chunk_id is not null"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        env.count(
+            "select count(*) from relations r join entities s on s.id = r.src_id \
+             join entities d on d.id = r.dst_id \
+             where r.property_iri = 'https://example.org/acme#partOf' \
+             and s.method = 'page_rule' and d.document_id is not null and r.chunk_id is not null"
+        )
+        .await,
+        2
     );
     env.finish().await;
 }

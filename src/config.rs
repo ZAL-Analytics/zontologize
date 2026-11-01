@@ -2,13 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use toml::{Table, Value};
 
 const DEFAULTS: &str = include_str!("../defaults/zontologize.toml");
 const CONFIG_FILE: &str = "zontologize.toml";
 const ENV_PREFIX: &str = "ZONTOLOGIZE_";
 const REPLACED_TABLES: [&str; 1] = ["scan.kinds"];
+const DEFAULT_CORES_PER_WORKER: usize = 4;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,7 +100,7 @@ fn default_source_kind() -> SourceKind {
     SourceKind::Folder
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtractConfig {
     pub threads: usize,
@@ -108,10 +109,12 @@ pub struct ExtractConfig {
     pub embedded_depth: usize,
     pub max_embedded_mb: u64,
     pub ocr_embedded_images: bool,
-    pub max_memory_mb: u64,
+    pub workers: usize,
+    pub worker_memory_mb: u64,
+    pub worker_files: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TextFormat {
     Markdown,
@@ -127,14 +130,14 @@ impl TextFormat {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OcrConfig {
     pub languages: Vec<String>,
     pub model_tier: ModelTier,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelTier {
     Small,
@@ -166,8 +169,12 @@ fn load_from(
     if config.extract.threads == 0 {
         config.extract.threads = cores;
     }
-    if config.extract.max_memory_mb == 0 {
-        config.extract.max_memory_mb = crate::scan::memory::default_limit_mb();
+    if config.extract.workers == 0 {
+        config.extract.workers = (cores / DEFAULT_CORES_PER_WORKER).max(1);
+    }
+    if config.extract.worker_memory_mb == 0 {
+        config.extract.worker_memory_mb =
+            crate::scan::memory::default_limit_mb() / config.extract.workers as u64;
     }
     if config.scan.hash_threads == 0 {
         config.scan.hash_threads = cores;
@@ -392,6 +399,24 @@ mod tests {
         assert_eq!(config.database.schema, "zontologize");
         assert_eq!(config.ocr.model_tier, ModelTier::Small);
         assert!(config.extract.threads >= 1);
+    }
+
+    #[test]
+    fn workers_and_their_memory_default_from_the_machine() {
+        let config = load_from(None, vars(&[])).unwrap();
+        assert!(config.extract.workers >= 1);
+        assert!(config.extract.worker_memory_mb >= 1);
+        let env = vars(&[("ZONTOLOGIZE_EXTRACT__WORKERS", "3")]);
+        let config = load_from(None, env).unwrap();
+        assert_eq!(config.extract.workers, 3);
+    }
+
+    #[test]
+    fn removed_memory_key_names_the_replacement() {
+        let dir = dir_with("[extract]\nmax_memory_mb = 100\n");
+        let error = format!("{:#}", load_from(Some(dir.path()), vars(&[])).unwrap_err());
+        assert!(error.contains("max_memory_mb"), "{error}");
+        assert!(error.contains("worker_memory_mb"), "{error}");
     }
 
     #[test]

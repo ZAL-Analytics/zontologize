@@ -13,6 +13,10 @@ pub fn test_url() -> String {
     std::env::var(TEST_URL).unwrap_or_else(|_| panic!("{TEST_URL} is not set"))
 }
 
+pub fn options() -> zontologize::scan::Options {
+    zontologize::scan::Options::new(env!("CARGO_BIN_EXE_zontologize").into())
+}
+
 pub fn repo(path: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
 }
@@ -69,6 +73,13 @@ impl Env {
         std::fs::write(self.config().join("zontologize.toml"), text).unwrap();
     }
 
+    pub fn add_extract_setting(&self, line: &str) {
+        let path = self.config().join("zontologize.toml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let text = text.replacen("[extract]\n", &format!("[extract]\n{line}\n"), 1);
+        std::fs::write(path, text).unwrap();
+    }
+
     pub fn write_rules(&self, text: &str) {
         std::fs::write(self.config().join("rules.toml"), text).unwrap();
     }
@@ -99,9 +110,17 @@ impl Env {
         self.scan_sources(&[]).await
     }
 
+    pub async fn scan_with(&self, options: &zontologize::scan::Options) -> serde_json::Value {
+        zontologize::scan::run(Some(&self.config()), &[], Some(&test_url()), options)
+            .await
+            .unwrap();
+        self.last_stats().await
+    }
+
     pub async fn scan_sources(&self, sources: &[&str]) -> serde_json::Value {
         let sources: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
-        zontologize::scan::run(Some(&self.config()), &sources, Some(&test_url()))
+        let options = options();
+        zontologize::scan::run(Some(&self.config()), &sources, Some(&test_url()), &options)
             .await
             .unwrap();
         self.last_stats().await

@@ -32,12 +32,20 @@ enum Command {
             help = "Scan only this source (repeatable)"
         )]
         sources: Vec<String>,
+        #[arg(
+            long,
+            value_name = "MINUTES",
+            help = "Stop handing out files to extract after this many minutes; the next run goes on"
+        )]
+        extract_minutes: Option<u64>,
     },
     #[command(about = "Show counts per source, kind and status, recent runs and errors")]
     Status {
         #[arg(long, help = "List every error instead of the first 20")]
         errors: bool,
     },
+    #[command(name = "extract-worker", hide = true)]
+    ExtractWorker,
 }
 
 #[derive(Debug, Subcommand)]
@@ -75,8 +83,12 @@ fn main() -> ExitCode {
             Command::Db(DbCommand::Migrate) => zontologize::db_migrate(config).await,
             Command::Db(DbCommand::Check) => zontologize::db_check(config).await,
             Command::Ontology(OntologyCommand::Check) => zontologize::ontology_check(config),
-            Command::Scan { sources } => zontologize::scan(config, &sources).await,
+            Command::Scan {
+                sources,
+                extract_minutes,
+            } => zontologize::scan(config, &sources, extract_minutes).await,
             Command::Status { errors } => zontologize::status(config, errors).await,
+            Command::ExtractWorker => zontologize::extract_worker().await,
         }
     });
     match result {
@@ -116,7 +128,17 @@ mod tests {
     fn parses_scan_with_sources() {
         let cli =
             Cli::try_parse_from(["zontologize", "scan", "--source", "a", "--source", "b"]).unwrap();
-        assert!(matches!(cli.command, Command::Scan { sources } if sources == ["a", "b"]));
+        assert!(
+            matches!(cli.command, Command::Scan { sources, extract_minutes: None } if sources == ["a", "b"])
+        );
+        let cli = Cli::try_parse_from(["zontologize", "scan", "--extract-minutes", "480"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Scan {
+                extract_minutes: Some(480),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -128,6 +150,15 @@ mod tests {
         ));
         let cli = Cli::try_parse_from(["zontologize", "status", "--errors"]).unwrap();
         assert!(matches!(cli.command, Command::Status { errors: true }));
+    }
+
+    #[test]
+    fn extract_worker_is_hidden() {
+        use clap::CommandFactory;
+        let cli = Cli::try_parse_from(["zontologize", "extract-worker"]).unwrap();
+        assert!(matches!(cli.command, Command::ExtractWorker));
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("extract-worker"), "{help}");
     }
 
     #[test]

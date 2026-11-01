@@ -7,6 +7,26 @@ inspection_report = "acme:InspectionReport"
 invoice = "acme:Invoice"
 manual = "acme:Manual"
 work_order = "acme:WorkOrder"
+certificate = "acme:Certificate"
+
+[pages]
+head_chars = 400
+part_property = "acme:partOf"
+
+[[page_types]]
+doc_type = "certificate"
+pattern = 'certificate of conformity|certificaat van overeenstemming'
+starts = true
+
+[[page_types]]
+doc_type = "inspection_report"
+pattern = 'inspection report|inspectierapport'
+
+[ocr_confusions]
+"0" = "Oo"
+"1" = "Il|"
+"5" = "S"
+"8" = "B"
 
 [[path_rules]]
 pattern = '^(?:Projects|Projecten)/(?P<year>\d{4})/(?P<project>P-\d{4}-\d{4}) (?P<customer>[^/]+?) - (?P<site>[^/]+)/'

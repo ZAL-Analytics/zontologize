@@ -1,21 +1,22 @@
 pub mod chunk;
 pub mod extract;
 pub mod memory;
+pub mod pool;
 pub mod table;
 pub mod walk;
+pub mod worker;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use sqlx::types::chrono::{DateTime, Utc};
-use tokio::sync::{Semaphore, mpsc};
-use tokio::task::JoinSet;
+use tokio::sync::mpsc;
 
 use crate::config::{self, Config, SourceConfig, SourceKind};
 use crate::db::documents::{self, Row, Stored};
@@ -24,12 +25,14 @@ use crate::ontology::{self, Ontology, hex};
 use crate::rules::{self, Rules};
 use chunk::ChunkSettings;
 use extract::ExtractSettings;
+use pool::{Done, Finished, Job, Limits, Pool, Restarts, WorkerCommand};
 use walk::{Decision, FileEntry, Kinds, WalkItem};
 
 const EXTRACT_BATCH: i64 = 200;
 const MAX_EXTRACT_ATTEMPTS: i32 = 2;
-const UNFINISHED: &str = "extraction did not finish in two runs: the scan stopped or was \
-                          killed while reading this file, most likely because of memory use";
+const UNFINISHED: &str = "extraction did not finish in two attempts: the worker reading this \
+                          file was stopped over extract.worker_memory_mb or crashed, or the \
+                          scan itself was stopped";
 const CHUNK_BATCH: i64 = 200;
 const TEXT_RULES_BATCH: i64 = 100;
 
@@ -132,11 +135,49 @@ pub struct RunStats {
     pub sources: HashMap<String, SourceStats>,
     pub walk: StageStats,
     pub extract: StageStats,
+    pub workers: Restarts,
+    pub extract_left: i64,
     pub chunk: StageStats,
     pub rules: StageStats,
+    pub ocr_ids: OcrIdStats,
+    pub segments: SegmentStats,
 }
 
-pub async fn run(config_dir: Option<&Path>, only: &[String], url: Option<&str>) -> Result<()> {
+#[derive(Debug, Default, Serialize)]
+pub struct SegmentStats {
+    pub segments: u64,
+    pub split: u64,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct OcrIdStats {
+    pub accepted: u64,
+    pub rejected: u64,
+}
+
+pub struct Options {
+    pub worker: WorkerCommand,
+    pub extract_minutes: Option<u64>,
+}
+
+impl Options {
+    pub fn new(worker_program: PathBuf) -> Options {
+        Options {
+            worker: WorkerCommand {
+                program: worker_program,
+                args: vec![worker::SUBCOMMAND.to_string()],
+            },
+            extract_minutes: None,
+        }
+    }
+}
+
+pub async fn run(
+    config_dir: Option<&Path>,
+    only: &[String],
+    url: Option<&str>,
+    options: &Options,
+) -> Result<()> {
     let prepared = Arc::new(prepare(config_dir, only)?);
     if prepared.warnings > 0 {
         println!(
@@ -167,10 +208,8 @@ pub async fn run(config_dir: Option<&Path>, only: &[String], url: Option<&str>) 
         println!("marked {aborted} earlier run(s) that did not finish as aborted");
     }
     println!("run {run_id}");
-    let watchdog = memory::watch(config.extract.max_memory_mb);
     let mut stats = RunStats::default();
-    let result = stages(&pool, prepared.clone(), run_id, &mut stats).await;
-    watchdog.abort();
+    let result = stages(&pool, prepared.clone(), run_id, options, &mut stats).await;
     let status = if result.is_ok() { "finished" } else { "failed" };
     let json = serde_json::to_value(&stats)?;
     db::runs::finish(&pool, run_id, status, &json).await?;
@@ -203,6 +242,7 @@ async fn stages(
     pool: &PgPool,
     prepared: Arc<Prepared>,
     run_id: i64,
+    options: &Options,
     stats: &mut RunStats,
 ) -> Result<()> {
     let (version_id, stored) = db::ontology::store(pool, &prepared.ontology, run_id).await?;
@@ -261,9 +301,9 @@ async fn stages(
         stats.sources.insert(source.name.clone(), source_stats);
     }
     stats.walk.seconds = started.elapsed().as_secs_f64();
-    stats.extract = extract_stage(pool, &prepared, &source_ids, &roots).await?;
+    extract_stage(pool, &prepared, &source_ids, &roots, options, stats).await?;
     stats.chunk = chunk_stage(pool, &prepared, &source_ids).await?;
-    stats.rules = rules_stage(pool, &prepared, &source_ids, version_id).await?;
+    rules_stage(pool, &prepared, &source_ids, version_id, stats).await?;
     Ok(())
 }
 
@@ -505,7 +545,9 @@ async fn extract_stage(
     prepared: &Arc<Prepared>,
     source_ids: &[i64],
     roots: &HashMap<i64, PathBuf>,
-) -> Result<StageStats> {
+    options: &Options,
+    run: &mut RunStats,
+) -> Result<()> {
     let started = Instant::now();
     let key = prepared.extract.key.clone();
     let (failed, retried) =
@@ -518,80 +560,166 @@ async fn extract_stage(
     }
     let todo = contents::count_to_extract(pool, &key, source_ids).await?;
     println!("extract: {todo} to extract");
-    let mut stats = StageStats::default();
     if todo == 0 {
-        return Ok(stats);
+        return Ok(());
     }
-    extract_pass(pool, prepared, source_ids, roots, true, 1, &mut stats).await?;
-    let threads = prepared.config.extract.threads;
-    extract_pass(
-        pool, prepared, source_ids, roots, false, threads, &mut stats,
-    )
-    .await?;
+    let deadline = options
+        .extract_minutes
+        .map(|minutes| started + Duration::from_secs(minutes * 60));
+    let pass = Pass {
+        pool,
+        prepared,
+        source_ids,
+        roots,
+        worker: &options.worker,
+        deadline,
+    };
+    let mut stats = StageStats::default();
+    let workers = prepared.config.extract.workers;
+    run.workers.add(pass.run(true, 1, &mut stats).await?);
+    run.workers.add(pass.run(false, workers, &mut stats).await?);
+    loop {
+        let (failed, retried) =
+            contents::recover_unfinished(pool, &key, MAX_EXTRACT_ATTEMPTS, UNFINISHED).await?;
+        stats.items += failed;
+        stats.errors += failed;
+        if retried == 0 {
+            break;
+        }
+        println!("extract: {retried} file(s) whose worker was stopped are retried one at a time");
+        run.workers.add(pass.run(true, 1, &mut stats).await?);
+    }
     stats.seconds = started.elapsed().as_secs_f64();
     println!(
         "extract: {} done, {} errors, {:.1} s",
         stats.items, stats.errors, stats.seconds
     );
-    Ok(stats)
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        run.extract_left = contents::count_to_extract(pool, &key, source_ids).await?;
+        println!(
+            "extract: stopped after --extract-minutes, {} left for the next run",
+            run.extract_left
+        );
+    }
+    run.extract = stats;
+    Ok(())
 }
 
-async fn extract_pass(
-    pool: &PgPool,
-    prepared: &Arc<Prepared>,
-    source_ids: &[i64],
-    roots: &HashMap<i64, PathBuf>,
-    retries: bool,
-    threads: usize,
-    stats: &mut StageStats,
-) -> Result<()> {
-    let key = prepared.extract.key.clone();
-    let semaphore = Arc::new(Semaphore::new(threads));
-    let mut tasks: JoinSet<Result<bool>> = JoinSet::new();
-    let mut after = 0;
-    loop {
-        let batch =
-            contents::next_to_extract(pool, &key, source_ids, retries, after, EXTRACT_BATCH)
-                .await?;
-        let Some(last) = batch.last() else {
-            break;
+pub fn setup_line(config: &Config, workers: usize) -> Result<String> {
+    let mut extract = config.extract.clone();
+    extract.threads = (extract.threads / workers.max(1)).max(1);
+    let setup = worker::Setup {
+        extract,
+        ocr: config.ocr.clone(),
+    };
+    Ok(serde_json::to_string(&setup)?)
+}
+
+struct Pass<'a> {
+    pool: &'a PgPool,
+    prepared: &'a Arc<Prepared>,
+    source_ids: &'a [i64],
+    roots: &'a HashMap<i64, PathBuf>,
+    worker: &'a WorkerCommand,
+    deadline: Option<Instant>,
+}
+
+impl Pass<'_> {
+    async fn run(&self, retries: bool, workers: usize, stats: &mut StageStats) -> Result<Restarts> {
+        let config = &self.prepared.config;
+        let key = &self.prepared.extract.key;
+        let limits = Limits {
+            timeout: Duration::from_secs(config.extract.timeout_secs),
+            memory_mb: config.extract.worker_memory_mb,
+            files: config.extract.worker_files,
         };
-        after = last.id;
-        for item in batch {
-            let permit = semaphore.clone().acquire_owned().await?;
-            let root = roots.get(&item.source_id).cloned().unwrap_or_default();
-            let path = file_path(&root, &item.path, item.file.as_deref());
-            let pool = pool.clone();
-            let prepared = prepared.clone();
-            let key = key.clone();
-            contents::start_attempt(&pool, item.id).await?;
-            tasks.spawn(async move {
-                let _permit = permit;
-                let started = Instant::now();
-                let result = extract::extract_file(&path, &prepared.extract).await;
-                let seconds = started.elapsed().as_secs_f64();
-                match result {
-                    Ok(pages) => {
-                        contents::write_pages(&pool, item.id, &key, &pages, seconds).await?;
-                        Ok(true)
-                    }
-                    Err(error) => {
-                        let message = format!("{error:#}");
-                        eprintln!("error: {message}");
-                        contents::write_error(&pool, item.id, &key, &message, seconds).await?;
-                        Ok(false)
-                    }
+        let setup = setup_line(config, workers)?;
+        let mut workers_pool: Option<Pool> = None;
+        let mut after = 0;
+        'feed: loop {
+            let batch = contents::next_to_extract(
+                self.pool,
+                key,
+                self.source_ids,
+                retries,
+                after,
+                EXTRACT_BATCH,
+            )
+            .await?;
+            let Some(last) = batch.last() else {
+                break;
+            };
+            after = last.id;
+            for item in batch {
+                if self.deadline.is_some_and(|d| Instant::now() >= d) {
+                    break 'feed;
                 }
-            });
-            while let Some(done) = tasks.try_join_next() {
-                tally(stats, done??);
+                let root = self.roots.get(&item.source_id).cloned().unwrap_or_default();
+                let path = file_path(&root, &item.path, item.file.as_deref());
+                let running = workers_pool.get_or_insert_with(|| {
+                    Pool::start(self.worker, setup.clone(), workers, limits)
+                });
+                contents::start_attempt(self.pool, item.id).await?;
+                if !running.submit(Job { id: item.id, path }).await? {
+                    break 'feed;
+                }
+                while let Some(finished) = running.try_finished() {
+                    self.record(finished, &limits, workers == 1, stats).await?;
+                }
             }
         }
+        let Some(mut running) = workers_pool else {
+            return Ok(Restarts::default());
+        };
+        while let Some(finished) = running.next_finished().await {
+            self.record(finished, &limits, workers == 1, stats).await?;
+        }
+        running.join().await
     }
-    while let Some(done) = tasks.join_next().await {
-        tally(stats, done??);
+
+    async fn record(
+        &self,
+        finished: Finished,
+        limits: &Limits,
+        alone: bool,
+        stats: &mut StageStats,
+    ) -> Result<()> {
+        let key = &self.prepared.extract.key;
+        let path = finished.path.display();
+        let message = match finished.done {
+            Done::Pages(pages) => {
+                contents::write_pages(self.pool, finished.id, key, &pages, finished.seconds)
+                    .await?;
+                tally(stats, true);
+                return Ok(());
+            }
+            Done::Error(message) => message,
+            Done::Panic(message) => format!("the extractor panicked on {path}: {message}"),
+            Done::Timeout if !alone => {
+                eprintln!(
+                    "warning: {path} timed out after {:?} next to other workers; \
+                     it is retried alone with all threads",
+                    limits.timeout
+                );
+                return Ok(());
+            }
+            Done::Timeout => format!(
+                "extraction timed out after {:?}, worker stopped: {path}",
+                limits.timeout
+            ),
+            Done::Lost(reason) => {
+                eprintln!(
+                    "warning: the worker reading {path} was stopped ({reason:?}); \
+                     the file is retried alone"
+                );
+                return Ok(());
+            }
+        };
+        eprintln!("error: {message}");
+        contents::write_error(self.pool, finished.id, key, &message, finished.seconds).await?;
+        tally(stats, false);
+        Ok(())
     }
-    Ok(())
 }
 
 fn tally(stats: &mut StageStats, ok: bool) {
@@ -694,7 +822,8 @@ async fn rules_stage(
     prepared: &Arc<Prepared>,
     source_ids: &[i64],
     version_id: i64,
-) -> Result<StageStats> {
+    run: &mut RunStats,
+) -> Result<()> {
     let started = Instant::now();
     let rules = &prepared.rules;
     let batch = prepared.config.scan.batch_size as i64;
@@ -733,6 +862,7 @@ async fn rules_stage(
         stats.items += outputs.len() as u64;
         entities::write_document_rules(pool, &outputs, &rules.key, version_id).await?;
     }
+    let known = Arc::new(known_keys(pool, rules).await?);
     let mut after = 0;
     loop {
         let ids = entities::next_contents_to_rule(
@@ -749,17 +879,56 @@ async fn rules_stage(
         };
         after = *last;
         let chunks = entities::chunks_of(pool, &ids).await?;
+        let pages = if rules.page_types.is_empty() {
+            Vec::new()
+        } else {
+            entities::pages_of(pool, &ids).await?
+        };
         let worker = prepared.clone();
-        let outputs = tokio::task::spawn_blocking(move || {
-            parallel_map(&chunks, threads, |chunk| entities::ChunkOutput {
+        let known = known.clone();
+        let content_ids = ids.clone();
+        let (outputs, segments) = tokio::task::spawn_blocking(move || {
+            let segments = parallel_map(&content_ids, threads, |id| {
+                segment_content(&worker.rules, *id, &pages, &chunks)
+            });
+            let outputs = parallel_map(&chunks, threads, |chunk| entities::ChunkOutput {
                 id: chunk.id,
                 dataset: chunk.dataset.clone(),
-                facts: worker.rules.text_facts(&chunk.text),
-            })
+                facts: worker
+                    .rules
+                    .text_facts(&chunk.text, chunk.ocr_scale(), &known),
+            });
+            (outputs, segments)
         })
         .await?;
+        for content in &segments {
+            run.segments.segments += content.segments.len() as u64;
+            run.segments.split += u64::from(content.segments.len() > 1);
+        }
+        for output in &outputs {
+            run.ocr_ids.rejected += output.facts.rejected as u64;
+            run.ocr_ids.accepted += output
+                .facts
+                .entities
+                .iter()
+                .filter(|hit| hit.method == rules::ids::OCR_METHOD)
+                .count() as u64;
+        }
         stats.items += ids.len() as u64;
-        entities::write_text_rules(pool, &ids, &outputs, &rules.key, version_id).await?;
+        entities::write_text_rules(
+            pool,
+            &ids,
+            &outputs,
+            &segments,
+            rules.part_property.as_deref(),
+            &rules.key,
+            version_id,
+        )
+        .await?;
+    }
+    let unlisted = entities::clear_unlisted_contents(pool).await?;
+    if unlisted > 0 {
+        println!("rules: facts cleared for {unlisted} contents that no present file uses");
     }
     let orphans = entities::delete_orphans(pool).await?;
     entities::sync_aliases(pool, &rules.lexicon.entries).await?;
@@ -770,7 +939,92 @@ async fn rules_stage(
             stats.items, stats.seconds
         );
     }
-    Ok(stats)
+    if run.ocr_ids.accepted + run.ocr_ids.rejected > 0 {
+        println!(
+            "rules: identifiers in OCR text: {} matched a known key, {} rejected",
+            run.ocr_ids.accepted, run.ocr_ids.rejected
+        );
+    }
+    run.rules = stats;
+    Ok(())
+}
+
+pub fn segment_content(
+    rules: &Rules,
+    content_id: i64,
+    pages: &[entities::PageWork],
+    chunks: &[entities::ChunkWork],
+) -> entities::ContentSegments {
+    let own: Vec<&entities::PageWork> = pages
+        .iter()
+        .filter(|p| p.content_id == content_id)
+        .collect();
+    let inputs: Vec<rules::pages::PageInput> = own
+        .iter()
+        .map(|page| rules::pages::PageInput {
+            page_no: page.page_no,
+            text: &page.text,
+            keys: rules
+                .ids
+                .find(&page.text, rules::ids::On::Text)
+                .into_iter()
+                .map(|hit| hit.key)
+                .collect(),
+            ocr_confidence: page.ocr_confidence,
+        })
+        .collect();
+    let segments = rules.page_types.segments(&inputs);
+    let mut entities = Vec::new();
+    if segments.len() > 1 {
+        let own_chunks: Vec<&entities::ChunkWork> = chunks
+            .iter()
+            .filter(|c| c.content_id == content_id)
+            .collect();
+        for segment in &segments {
+            let Some(class) = rules.document_class_for(segment.doc_type.as_deref()) else {
+                continue;
+            };
+            let first = own_chunks
+                .iter()
+                .find(|c| c.page_to.is_none_or(|to| to >= segment.page_from));
+            let Some(chunk) = first else {
+                continue;
+            };
+            entities.push(entities::SegmentEntity {
+                class: class.to_string(),
+                key: format!("{}#{}", own[0].sha256, segment.ord),
+                name: format!(
+                    "{} pages {}-{}",
+                    segment.doc_type.as_deref().unwrap_or("segment"),
+                    segment.page_from,
+                    segment.page_to
+                ),
+                dataset: chunk.dataset.clone(),
+                chunk_id: chunk.id,
+                span_end: chunk.text.chars().count(),
+                confidence: segment.confidence,
+            });
+        }
+    }
+    entities::ContentSegments {
+        content_id,
+        segments,
+        entities,
+    }
+}
+
+async fn known_keys(pool: &PgPool, rules: &Rules) -> Result<rules::ids::KnownKeys> {
+    let mut known = rules::ids::KnownKeys::new();
+    let stored = entities::known_keys(pool, rules::ids::OCR_METHOD).await?;
+    let listed = rules
+        .lexicon
+        .entries
+        .iter()
+        .map(|e| (e.class.clone(), e.key.clone()));
+    for (class, key) in stored.into_iter().chain(listed) {
+        known.entry(class).or_default().insert(key);
+    }
+    Ok(known)
 }
 
 #[cfg(test)]
