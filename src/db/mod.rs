@@ -1,6 +1,8 @@
 pub mod contents;
 pub mod documents;
 pub mod entities;
+pub mod fit;
+pub mod llm;
 pub mod migrate;
 pub mod ontology;
 pub mod pool;

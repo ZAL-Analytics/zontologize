@@ -1,0 +1,1 @@
+{"data":[{"id":"acme/other-model","pricing":{"prompt":"0.000003","completion":"0.000015"}},{"id":"anthropic/claude-haiku-5.5","pricing":{"prompt":"0.0000001","completion":"0.0000005","input_cache_read":"0.00000001"}}]}

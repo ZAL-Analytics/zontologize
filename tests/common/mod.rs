@@ -194,3 +194,69 @@ pub fn stage(stats: &serde_json::Value, stage: &str) -> u64 {
 pub fn source(stats: &serde_json::Value, name: &str, field: &str) -> u64 {
     stats["sources"][name][field].as_u64().unwrap()
 }
+
+pub struct FakeServer {
+    pub url: String,
+    pub requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+pub fn fixture(path: &str) -> String {
+    std::fs::read_to_string(repo("tests/fixtures/llm").join(path)).unwrap()
+}
+
+pub async fn fake_server(routes: Vec<(&'static str, u16, String)>) -> FakeServer {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut data = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&data).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            let (name, value) = l.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8_lossy(&data).to_string();
+            let path = request
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string();
+            seen.lock().unwrap().push(request);
+            let (status, body) = routes
+                .iter()
+                .find(|(prefix, _, _)| path.ends_with(prefix))
+                .map(|(_, status, body)| (*status, body.clone()))
+                .unwrap_or((404, "{\"error\":\"no route\"}".to_string()));
+            let response = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    FakeServer { url, requests }
+}

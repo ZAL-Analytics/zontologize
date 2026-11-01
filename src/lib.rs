@@ -1,5 +1,7 @@
 pub mod config;
 pub mod db;
+pub mod fit;
+pub mod llm;
 pub mod ontology;
 pub mod rules;
 pub mod scan;
@@ -118,6 +120,156 @@ pub fn ontology_check(config_dir: Option<&Path>) -> Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+pub const PAUSED_EXIT_CODE: u8 = 2;
+
+pub async fn ontology_fit(
+    config_dir: Option<&Path>,
+    options: &fit::run::Options,
+) -> Result<ExitCode> {
+    let outcome = fit::run::run(config_dir, database_url().as_deref(), options).await?;
+    Ok(match outcome {
+        fit::run::Outcome::Paused => ExitCode::from(PAUSED_EXIT_CODE),
+        _ => ExitCode::SUCCESS,
+    })
+}
+
+pub async fn models_check(
+    config_dir: Option<&Path>,
+    claude_program: std::path::PathBuf,
+) -> Result<ExitCode> {
+    let config = config::load(config_dir)?;
+    let tasks = [("fit", &config.models.fit)];
+    let pool = db::pool::connect(database_url().as_deref(), &config.database.schema, 1)
+        .await
+        .ok();
+    let mut failed = false;
+    for (task, model) in tasks {
+        if model.is_empty() {
+            println!("{task}: no model configured");
+            continue;
+        }
+        let name =
+            llm::ModelName::parse(model).map_err(|e| anyhow::anyhow!("models.{task}: {e}"))?;
+        match check_model(&config, &name, claude_program.clone(), pool.as_ref()).await {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{task} {name}: {line}");
+                }
+            }
+            Err(error) => {
+                failed = true;
+                println!("{task} {name}: failed, {error:#}");
+            }
+        }
+    }
+    if let Some(pool) = pool {
+        pool.close().await;
+    }
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+const CHECK_SYSTEM: &str = "Answer with the JSON schema.";
+const CHECK_INPUT: &str = "Say ok.";
+
+async fn check_model(
+    config: &config::Config,
+    name: &llm::ModelName,
+    claude_program: std::path::PathBuf,
+    pool: Option<&sqlx::PgPool>,
+) -> Result<Vec<String>> {
+    let provider = llm::Provider::new(name, config, claude_program)?;
+    match &provider {
+        llm::Provider::ClaudeCode(_) => {
+            let request = llm::Request {
+                task: "check".to_string(),
+                system: CHECK_SYSTEM.to_string(),
+                user: CHECK_INPUT.to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["answer"],
+                    "properties": {"answer": {"type": "string"}},
+                }),
+            };
+            let started = std::time::Instant::now();
+            let reply = provider
+                .send(&request)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            if let Some(pool) = pool {
+                let call = db::llm::Call {
+                    job_id: None,
+                    provider: name.provider.as_str(),
+                    model: &name.model,
+                    task: "check",
+                    cache_key: None,
+                    input_chars: request.chars() as i64,
+                    usage: reply.usage,
+                    subscription: reply.subscription,
+                    windows: reply.windows,
+                    seconds: started.elapsed().as_secs_f64(),
+                    status: "ok",
+                    error: None,
+                };
+                let _ = db::llm::record(pool, &call, None, None).await;
+            }
+            let billing = if reply.subscription {
+                "subscription"
+            } else {
+                "API key, USD caps apply"
+            };
+            let mut lines = vec![format!(
+                "reachable ({billing}), {} input tokens per request at the least",
+                reply.usage.input_tokens
+            )];
+            for (label, window) in [
+                ("5-hour", reply.windows.five_hour),
+                ("7-day", reply.windows.seven_day),
+            ] {
+                if let Some(window) = window {
+                    lines.push(format!(
+                        "{label} window {:.0}% used, resets {}",
+                        window.used * 100.0,
+                        window.resets_at.format("%Y-%m-%d %H:%M UTC")
+                    ));
+                }
+            }
+            Ok(lines)
+        }
+        llm::Provider::OpenRouter(openrouter) => {
+            let prices = openrouter.prices().await?;
+            let credit = openrouter.credit().await?;
+            let left = credit
+                .remaining_usd
+                .map_or("no limit on the key".to_string(), |r| {
+                    format!("${r:.4} left")
+                });
+            Ok(vec![format!(
+                "reachable, ${:.2} and ${:.2} per million input and output tokens, {left}",
+                prices.input * 1e6,
+                prices.output * 1e6
+            )])
+        }
+        llm::Provider::Ollama(ollama) => {
+            if !ollama.has_model().await? {
+                anyhow::bail!(
+                    "the model is not pulled on {}; run ollama pull {}",
+                    llm::ollama::host(),
+                    name.model
+                );
+            }
+            Ok(vec![format!(
+                "reachable at {}, model pulled",
+                llm::ollama::host()
+            )])
+        }
+    }
 }
 
 pub async fn scan(
@@ -281,6 +433,51 @@ async fn print_status(
             "  ... {} more, run zontologize status --errors",
             total - errors.len() as i64
         );
+    }
+    let usage = db::llm::usage(pool).await?;
+    if !usage.is_empty() {
+        println!("models:");
+    }
+    for row in usage {
+        println!(
+            "  {}:{}: {} calls, {} input and {} output tokens, ${:.4}; last 7 days {} calls, ${:.4}",
+            row.provider,
+            row.model,
+            row.calls,
+            row.input_tokens,
+            row.output_tokens,
+            row.cost_usd,
+            row.week_calls,
+            row.week_cost_usd
+        );
+    }
+    let jobs = db::llm::jobs(pool, STATUS_RUNS).await?;
+    if !jobs.is_empty() {
+        println!("model jobs:");
+    }
+    for job in jobs {
+        let mut line = format!(
+            "  {} {} {}:{} {}: {} done, {} left, {} invalid, {} errors",
+            job.task,
+            job.id,
+            job.provider,
+            job.model,
+            job.status,
+            job.done,
+            job.pending,
+            job.invalid,
+            job.error
+        );
+        if let Some(reason) = &job.pause_reason {
+            line.push_str(&format!("; {reason}"));
+        }
+        if let Some(at) = job.resume_after {
+            line.push_str(&format!(
+                "; goes on after {}",
+                at.format("%Y-%m-%d %H:%M UTC")
+            ));
+        }
+        println!("{line}");
     }
     Ok(())
 }

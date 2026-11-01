@@ -1,0 +1,1 @@
+{"data":{"label":"sk-or-v1-000...000","limit":50,"limit_reset":null,"limit_remaining":46.5,"usage":3.5,"budgets":[],"effective_budget":{"scope":"key_limit","guardrail_id":null,"budget_id":null,"limit_usd":50,"spend_usd":3.5,"remaining_usd":46.5,"reset_interval":null,"resets_at":null,"include_byok":false},"is_free_tier":false}}
