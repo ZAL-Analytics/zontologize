@@ -16,6 +16,11 @@ pub struct Eligible {
     pub llm_key: Option<String>,
     pub source: String,
     pub document_id: i64,
+    pub doc_type: Option<String>,
+    pub path: String,
+    pub text: String,
+    pub ocr_confidence: Option<f64>,
+    pub matched: bool,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -92,8 +97,13 @@ pub async fn eligible(
     limit: i64,
 ) -> Result<Vec<Eligible>> {
     let rows = sqlx::query_as(
-        "select k.id, k.llm_key, d.source, d.id as document_id from chunks k \
-         join lateral (select d.id, s.name as source from documents d \
+        "select k.id, k.llm_key, d.source, d.id as document_id, d.doc_type, d.path, k.text, \
+         (select min(p.ocr_confidence) from pages p where p.content_id = k.content_id \
+         and p.method = 'ocr' and p.page_no between coalesce(k.page_from, 0) \
+         and coalesce(k.page_to, 2147483647)) as ocr_confidence, \
+         exists (select 1 from class_mentions m where m.chunk_id = k.id) as matched \
+         from chunks k \
+         join lateral (select d.id, d.doc_type, d.path, s.name as source from documents d \
          join sources s on s.id = d.source_id \
          where d.content_id = k.content_id and d.status = 'present' \
          and (cardinality($1::text[]) = 0 or s.name = any($1)) \
@@ -453,6 +463,23 @@ pub async fn method_counts(pool: &PgPool) -> Result<Vec<(String, i64, i64)>> {
          group by 1 order by 1",
     )
     .bind(MODEL_METHODS)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn name_candidates(
+    pool: &PgPool,
+    min_chunks: i64,
+) -> Result<Vec<(String, String, String, i64)>> {
+    let rows = sqlx::query_as(
+        "select e.class_iri, e.key, e.name, count(distinct m.chunk_id) as chunks \
+         from entities e join mentions m on m.entity_id = e.id \
+         where e.method like $1 and m.method like $1 \
+         group by e.id having count(distinct m.chunk_id) >= $2 order by 4 desc, 1, 2",
+    )
+    .bind(MODEL_METHODS)
+    .bind(min_chunks)
     .fetch_all(pool)
     .await?;
     Ok(rows)

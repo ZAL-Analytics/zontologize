@@ -3,9 +3,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use sqlx::PgPool;
 
 use super::check::check;
+use super::sample::{Candidate, Settings, first_folder, letter_share, select, text_hash};
 use super::{Answer, Built, ChunkInput, Context, Known, TASK, USER_VARIABLES, build};
 use crate::config::{self, Config};
 use crate::db;
@@ -175,7 +177,46 @@ async fn prepare(setup: &Setup<'_>, ids: &[i64]) -> Result<Vec<Prepared>> {
         .collect())
 }
 
-async fn plan(setup: &Setup<'_>) -> Result<Plan> {
+struct Row {
+    id: i64,
+    llm_key: Option<String>,
+    order: (usize, i64, i64),
+}
+
+fn path_filter(patterns: &[String]) -> Result<Option<GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(Glob::new(pattern)?);
+    }
+    Ok(Some(builder.build()?))
+}
+
+async fn compare(setup: &Setup<'_>, rows: &[Row], plan: &mut Plan) -> Result<()> {
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    let by_id: HashMap<i64, &Row> = rows.iter().map(|r| (r.id, r)).collect();
+    for item in prepare(setup, &ids).await? {
+        let Some(row) = by_id.get(&item.chunk.id) else {
+            continue;
+        };
+        if row.llm_key.as_deref() == Some(item.built.key.as_str()) {
+            plan.done += 1;
+            continue;
+        }
+        plan.todo.push(Todo {
+            chunk_id: row.id,
+            key: item.built.key,
+            chars: item.built.request.chars(),
+            resend: row.llm_key.is_some(),
+            order: row.order,
+        });
+    }
+    Ok(())
+}
+
+async fn plan(setup: &Setup<'_>, sample: Option<usize>, seed: &str) -> Result<Plan> {
     let config = setup.config;
     let extract = &config.llm_extract;
     let source_order: Vec<&String> = if extract.sources.is_empty() {
@@ -183,7 +224,10 @@ async fn plan(setup: &Setup<'_>) -> Result<Plan> {
     } else {
         extract.sources.iter().collect()
     };
+    let paths = path_filter(&extract.paths)?;
     let mut plan = Plan::default();
+    let mut candidates = Vec::new();
+    let mut rows: HashMap<i64, Row> = HashMap::new();
     let mut after = 0;
     loop {
         let eligible = db::facts::eligible(
@@ -199,30 +243,71 @@ async fn plan(setup: &Setup<'_>) -> Result<Plan> {
             break;
         };
         after = last.id;
-        plan.eligible += eligible.len();
-        let ids: Vec<i64> = eligible.iter().map(|e| e.id).collect();
-        let prepared = prepare(setup, &ids).await?;
-        let by_id: HashMap<i64, &db::facts::Eligible> =
-            eligible.iter().map(|e| (e.id, e)).collect();
-        for item in prepared {
-            let Some(row) = by_id.get(&item.chunk.id) else {
-                continue;
-            };
-            if row.llm_key.as_deref() == Some(item.built.key.as_str()) {
-                plan.done += 1;
+        let mut batch = Vec::new();
+        for chunk in eligible {
+            if paths.as_ref().is_some_and(|set| !set.is_match(&chunk.path)) {
                 continue;
             }
             let source = source_order
                 .iter()
-                .position(|s| **s == row.source)
+                .position(|s| **s == chunk.source)
                 .unwrap_or(source_order.len());
-            plan.todo.push(Todo {
-                chunk_id: row.id,
-                key: item.built.key,
-                chars: item.built.request.chars(),
-                resend: row.llm_key.is_some(),
-                order: (source, row.document_id, row.id),
-            });
+            let row = Row {
+                id: chunk.id,
+                llm_key: chunk.llm_key.clone(),
+                order: (source, chunk.document_id, chunk.id),
+            };
+            if sample.is_some() {
+                candidates.push(Candidate {
+                    id: chunk.id,
+                    document_id: chunk.document_id,
+                    stratum: format!(
+                        "{}\u{1f}{}\u{1f}{}",
+                        chunk.source,
+                        chunk.doc_type.as_deref().unwrap_or(""),
+                        first_folder(&chunk.path)
+                    ),
+                    text_hash: text_hash(&chunk.text),
+                    letters: letter_share(&chunk.text),
+                    ocr_confidence: chunk.ocr_confidence,
+                    matched: chunk.matched,
+                });
+                rows.insert(chunk.id, row);
+            } else {
+                batch.push(row);
+            }
+        }
+        plan.eligible += batch.len();
+        compare(setup, &batch, &mut plan).await?;
+    }
+    if let Some(size) = sample {
+        let settings = Settings {
+            size,
+            seed,
+            max_per_document: extract.max_per_document,
+            unmatched_share: extract.unmatched_share,
+            min_letter_share: extract.min_letter_share,
+            min_ocr_confidence: extract.min_ocr_confidence,
+        };
+        let selected = select(&candidates, &settings);
+        println!(
+            "extract: sample of {} from {} eligible chunks ({} repeated texts and {} unreadable or \
+             mostly numbers left out)",
+            selected.ids.len(),
+            candidates.len(),
+            selected.duplicates,
+            selected.junk
+        );
+        plan.eligible = selected.ids.len();
+        let mut picked = Vec::new();
+        for (rank, id) in selected.ids.iter().enumerate() {
+            if let Some(mut row) = rows.remove(id) {
+                row.order = (rank, 0, 0);
+                picked.push(row);
+            }
+        }
+        for part in picked.chunks(BATCH as usize) {
+            compare(setup, part, &mut plan).await?;
         }
     }
     plan.todo.sort_by_key(|t| t.order);
@@ -316,7 +401,11 @@ async fn run_with(setup: &Setup<'_>, options: &Options) -> Result<Outcome> {
     let Some(version_id) = db::fit::ontology_version(pool, &setup.ontology.version).await? else {
         bail!("the ontology changed since the last scan; run zontologize scan first");
     };
-    let plan = plan(setup).await?;
+    let seed = options
+        .seed
+        .clone()
+        .unwrap_or_else(|| config.llm_extract.seed.clone());
+    let plan = plan(setup, options.sample, &seed).await?;
     let (cached, invalid) = split_known(pool, &plan.todo).await?;
     let resend = plan.todo.iter().filter(|t| t.resend).count();
     let hits: Vec<i64> = plan

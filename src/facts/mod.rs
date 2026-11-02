@@ -1,6 +1,7 @@
 pub mod check;
 pub mod report;
 pub mod run;
+pub mod sample;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};

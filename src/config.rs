@@ -102,6 +102,12 @@ pub struct LlmExtractConfig {
     pub min_chars: usize,
     pub sources: Vec<String>,
     pub doc_types: Vec<String>,
+    pub paths: Vec<String>,
+    pub seed: String,
+    pub max_per_document: usize,
+    pub unmatched_share: f64,
+    pub min_letter_share: f64,
+    pub min_ocr_confidence: f64,
     pub max_shortlist: usize,
     pub confidence: f64,
     pub resend_share: f64,
@@ -499,12 +505,22 @@ fn check_models(config: &Config) -> Result<(), String> {
             ));
         }
     }
+    check_globs("llm_extract.paths", &extract.paths)?;
+    if extract.max_shortlist == 0 || extract.max_per_document == 0 {
+        return Err(
+            "llm_extract.max_shortlist and llm_extract.max_per_document must be greater than 0"
+                .to_string(),
+        );
+    }
     if extract.max_shortlist == 0 {
         return Err("llm_extract.max_shortlist must be greater than 0".to_string());
     }
     let shares = [
         ("llm_extract.confidence", extract.confidence),
         ("llm_extract.resend_share", extract.resend_share),
+        ("llm_extract.unmatched_share", extract.unmatched_share),
+        ("llm_extract.min_letter_share", extract.min_letter_share),
+        ("llm_extract.min_ocr_confidence", extract.min_ocr_confidence),
         ("classify.confidence", config.classify.confidence),
     ];
     for (key, value) in shares {

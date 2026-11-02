@@ -17,6 +17,7 @@ use crate::ontology::Ontology;
 
 pub const REPORT_FILE: &str = "extract-report.md";
 pub const PROPOSALS_FILE: &str = "relation-proposals.ttl";
+pub const NAMES_FILE: &str = "gazetteer-candidates.csv";
 const EXAMPLES: i32 = 3;
 const NAMES_PER_CLASS: i64 = 5;
 const LISTED_TERMS: usize = 200;
@@ -159,6 +160,37 @@ pub fn turtle(
     );
     text.push_str(&String::from_utf8(bytes).context("Turtle output is not UTF-8")?);
     Ok(text)
+}
+
+pub fn compact(ontology: &Ontology, iri: &str) -> String {
+    for (prefix, namespace) in &ontology.prefixes {
+        if let Some(local) = iri.strip_prefix(namespace.as_str())
+            && !local.is_empty()
+            && local
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        {
+            return format!("{prefix}:{local}");
+        }
+    }
+    format!("<{iri}>")
+}
+
+pub fn names_csv(ontology: &Ontology, rows: &[(String, String, String, i64)]) -> Result<String> {
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    writer.write_record(["class", "key", "name", "aliases", "lang", "chunks"])?;
+    for (class, key, name, chunks) in rows {
+        writer.write_record([
+            compact(ontology, class).as_str(),
+            key,
+            name,
+            "",
+            "",
+            &chunks.to_string(),
+        ])?;
+    }
+    let bytes = writer.into_inner().map_err(|e| anyhow::anyhow!("{e}"))?;
+    String::from_utf8(bytes).context("CSV output is not UTF-8")
 }
 
 pub fn markdown(
@@ -307,9 +339,14 @@ pub async fn write_report(
     )?;
     let path = out.join(PROPOSALS_FILE);
     std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))?;
+    let names = db::facts::name_candidates(pool, config.llm_extract.min_evidence as i64).await?;
+    let path = out.join(NAMES_FILE);
+    std::fs::write(&path, names_csv(ontology, &names)?)
+        .with_context(|| format!("cannot write {}", path.display()))?;
     println!(
-        "extract: report and {} relation proposals in {}",
+        "extract: report, {} relation proposals and {} name candidates in {}",
         proposals.len(),
+        names.len(),
         out.display()
     );
     Ok(())
@@ -381,6 +418,28 @@ mod tests {
         let property = &loaded.ontology.properties["urn:test:proposal#suppliedBy"];
         assert_eq!(property.domain, [iri("Pump")]);
         assert_eq!(property.range, [iri("Company")]);
+    }
+
+    #[test]
+    fn name_candidates_load_as_a_gazetteer() {
+        let onto = ontology();
+        let rows = vec![(
+            iri("Company"),
+            "acme pumps".to_string(),
+            "Acme Pumps".to_string(),
+            4,
+        )];
+        let text = names_csv(&onto, &rows).unwrap();
+        assert!(
+            text.starts_with("class,key,name,aliases,lang,chunks\nex:Company,"),
+            "{text}"
+        );
+        let lexicon = crate::rules::gazetteer::Lexicon::build(
+            &[("names.csv".to_string(), text.into_bytes())],
+            &onto,
+        )
+        .unwrap();
+        assert_eq!(lexicon.entries.len(), 1);
     }
 
     #[test]

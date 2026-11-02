@@ -36,6 +36,8 @@ pub struct Options {
     pub no_wait: bool,
     pub new: bool,
     pub yes: bool,
+    pub sample: Option<usize>,
+    pub seed: Option<String>,
     pub backoff: Duration,
 }
 
@@ -49,6 +51,8 @@ impl Options {
             no_wait: false,
             new: false,
             yes: false,
+            sample: None,
+            seed: None,
             backoff: Duration::from_secs(2),
         }
     }

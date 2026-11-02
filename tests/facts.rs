@@ -287,3 +287,36 @@ async fn review_marks_facts_and_never_draws_them_twice() {
     assert_eq!(precision.iter().map(|p| p.total).sum::<i64>(), 3);
     env.finish().await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn sample_skips_repeated_texts_and_paths_narrow_the_chunks() {
+    let env = setup_extract("facts_sample").await;
+    env.file("copy/notes.txt", NOTES);
+    env.scan().await;
+    let mut sampled = options();
+    sampled.sample = Some(10);
+    sampled.dry_run = true;
+    assert_eq!(extract(&env, &sampled).await.unwrap(), Outcome::DryRun);
+    sampled.dry_run = false;
+    sampled.sample = Some(1);
+    assert_eq!(extract(&env, &sampled).await.unwrap(), Outcome::Finished);
+    assert_eq!(env.count("select count(*) from llm_calls").await, 1);
+    let text = std::fs::read_to_string(env.config().join("zontologize.toml"))
+        .unwrap()
+        .replace("[llm_extract]\n", "[llm_extract]\npaths = [\"site/**\"]\n");
+    std::fs::write(env.config().join("zontologize.toml"), text).unwrap();
+    let mut slice = options();
+    slice.yes = true;
+    assert_eq!(extract(&env, &slice).await.unwrap(), Outcome::Finished);
+    assert_eq!(
+        env.count(
+            "select count(*) from chunks k join documents d on d.content_id = k.content_id \
+             where k.llm_key is not null and d.path like 'site/%'"
+        )
+        .await,
+        1
+    );
+    assert!(env.dir.join("extract/gazetteer-candidates.csv").exists());
+    env.finish().await;
+}

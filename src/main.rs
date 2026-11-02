@@ -141,6 +141,18 @@ struct ExtractArgs {
         help = "Send again even when more than [llm_extract] resend_share of the chunks changed"
     )]
     yes: bool,
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Extract a spread sample of N chunks instead of every eligible chunk"
+    )]
+    sample: Option<usize>,
+    #[arg(
+        long,
+        value_name = "SEED",
+        help = "Seed of the sample (default [llm_extract] seed)"
+    )]
+    seed: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -234,6 +246,8 @@ fn main() -> ExitCode {
             Command::Extract(args) => {
                 let mut options = args.job.options();
                 options.yes = args.yes;
+                options.sample = args.sample;
+                options.seed = args.seed;
                 zontologize::extract(config, &options).await
             }
             Command::Review(ReviewCommand::Sample {
