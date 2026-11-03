@@ -24,6 +24,9 @@ pub struct Config {
     pub providers: ProvidersConfig,
     pub budget: BudgetConfig,
     pub fit: FitConfig,
+    pub llm_extract: LlmExtractConfig,
+    pub classify: ClassifyConfig,
+    pub review: ReviewConfig,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
 }
@@ -32,6 +35,8 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct ModelsConfig {
     pub fit: String,
+    pub extract: String,
+    pub classify: String,
     pub chars_per_token: f64,
 }
 
@@ -89,6 +94,41 @@ pub struct FitConfig {
     pub min_evidence: usize,
     pub proposal_namespace: String,
     pub out: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmExtractConfig {
+    pub min_chars: usize,
+    pub sources: Vec<String>,
+    pub doc_types: Vec<String>,
+    pub paths: Vec<String>,
+    pub exclude: Vec<String>,
+    pub seed: String,
+    pub max_per_document: usize,
+    pub unmatched_share: f64,
+    pub min_letter_share: f64,
+    pub min_ocr_confidence: f64,
+    pub max_shortlist: usize,
+    pub confidence: f64,
+    pub resend_share: f64,
+    pub min_evidence: usize,
+    pub out: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifyConfig {
+    pub head_chars: usize,
+    pub min_chars: usize,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewConfig {
+    pub sample: usize,
+    pub min_verdicts: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -417,9 +457,15 @@ fn check(config: &Config) -> Result<(), String> {
 }
 
 fn check_models(config: &Config) -> Result<(), String> {
-    if !config.models.fit.is_empty() {
-        crate::llm::ModelName::parse(&config.models.fit)
-            .map_err(|error| format!("models.fit: {error}"))?;
+    let models = [
+        ("fit", &config.models.fit),
+        ("extract", &config.models.extract),
+        ("classify", &config.models.classify),
+    ];
+    for (key, name) in models {
+        if !name.is_empty() {
+            crate::llm::ModelName::parse(name).map_err(|error| format!("models.{key}: {error}"))?;
+        }
     }
     if config.models.chars_per_token <= 0.0 {
         return Err("models.chars_per_token must be greater than 0".to_string());
@@ -451,6 +497,40 @@ fn check_models(config: &Config) -> Result<(), String> {
     }
     if config.fit.proposal_namespace.is_empty() {
         return Err("fit.proposal_namespace must be an IRI namespace".to_string());
+    }
+    let extract = &config.llm_extract;
+    for name in &extract.sources {
+        if !config.sources.iter().any(|s| &s.name == name) {
+            return Err(format!(
+                "llm_extract.sources: {name:?} is not the name of a [[sources]] entry"
+            ));
+        }
+    }
+    check_globs("llm_extract.paths", &extract.paths)?;
+    if extract.max_shortlist == 0 || extract.max_per_document == 0 {
+        return Err(
+            "llm_extract.max_shortlist and llm_extract.max_per_document must be greater than 0"
+                .to_string(),
+        );
+    }
+    if extract.max_shortlist == 0 {
+        return Err("llm_extract.max_shortlist must be greater than 0".to_string());
+    }
+    let shares = [
+        ("llm_extract.confidence", extract.confidence),
+        ("llm_extract.resend_share", extract.resend_share),
+        ("llm_extract.unmatched_share", extract.unmatched_share),
+        ("llm_extract.min_letter_share", extract.min_letter_share),
+        ("llm_extract.min_ocr_confidence", extract.min_ocr_confidence),
+        ("classify.confidence", config.classify.confidence),
+    ];
+    for (key, value) in shares {
+        if !(0.0..=1.0).contains(&value) {
+            return Err(format!("{key} must be between 0 and 1"));
+        }
+    }
+    if config.classify.head_chars == 0 {
+        return Err("classify.head_chars must be greater than 0".to_string());
     }
     if config.budget.max_usd < 0.0 || config.budget.calibration_calls <= 0 {
         return Err(
@@ -542,6 +622,29 @@ mod tests {
         assert_eq!(config.models.fit, "ollama:qwen3.5:4b");
         assert!(config.providers.ollama.think);
         assert_eq!(config.providers.ollama.concurrency, 1);
+    }
+
+    #[test]
+    fn extract_and_classify_settings_are_checked() {
+        let config = load_from(None, vars(&[])).unwrap();
+        assert_eq!(config.models.extract, "claude-code:sonnet");
+        assert_eq!(config.models.classify, "claude-code:haiku");
+        assert_eq!(config.llm_extract.min_chars, 200);
+        assert_eq!(config.llm_extract.out, "extract");
+        assert_eq!(config.classify.head_chars, 1500);
+        let dir = dir_with("[models]\nclassify = \"local:x\"\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("models.classify"), "{message}");
+        let dir = dir_with(
+            "[llm_extract]\nsources = [\"other\"]\n\
+             [[sources]]\nname = \"docs\"\nroot = \"/tmp\"\n",
+        );
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("llm_extract.sources"), "{message}");
+        assert!(message.contains("other"), "{message}");
+        let dir = dir_with("[llm_extract]\nconfidence = 1.5\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("llm_extract.confidence"), "{message}");
     }
 
     #[test]

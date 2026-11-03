@@ -817,6 +817,19 @@ async fn chunk_stage(
     Ok(stats)
 }
 
+pub const PATH_METHOD: &str = "path";
+
+pub async fn rules_only(config_dir: Option<&Path>, pool: &PgPool) -> Result<()> {
+    let prepared = Arc::new(prepare(config_dir, &[])?);
+    let names: Vec<String> = prepared.sources.iter().map(|s| s.name.clone()).collect();
+    let ids = documents::source_ids(pool, &names).await?;
+    let Some(version_id) = db::fit::ontology_version(pool, &prepared.ontology.version).await?
+    else {
+        bail!("the ontology changed since the last scan; run zontologize scan first");
+    };
+    rules_stage(pool, &prepared, &ids, version_id, &mut RunStats::default()).await
+}
+
 async fn rules_stage(
     pool: &PgPool,
     prepared: &Arc<Prepared>,
@@ -843,21 +856,7 @@ async fn rules_stage(
         after = last.id;
         let outputs: Vec<entities::DocumentOutput> = work
             .into_iter()
-            .map(|doc| {
-                let facts = (doc.status != "deleted").then(|| rules.document_facts(&doc.path));
-                let document_class = facts.as_ref().and_then(|f| {
-                    rules
-                        .document_class_for(f.doc_type.as_deref())
-                        .map(str::to_string)
-                });
-                entities::DocumentOutput {
-                    id: doc.id,
-                    path: doc.path,
-                    dataset: doc.dataset,
-                    document_class,
-                    facts,
-                }
-            })
+            .map(|doc| document_output(rules, doc))
             .collect();
         stats.items += outputs.len() as u64;
         entities::write_document_rules(pool, &outputs, &rules.key, version_id).await?;
@@ -884,12 +883,21 @@ async fn rules_stage(
         } else {
             entities::pages_of(pool, &ids).await?
         };
+        let model_types: ModelTypes = if rules.page_types.is_empty() {
+            HashMap::new()
+        } else {
+            entities::model_types(pool, &ids)
+                .await?
+                .into_iter()
+                .map(|(content, page, model)| ((content, page), model))
+                .collect()
+        };
         let worker = prepared.clone();
         let known = known.clone();
         let content_ids = ids.clone();
         let (outputs, segments) = tokio::task::spawn_blocking(move || {
             let segments = parallel_map(&content_ids, threads, |id| {
-                segment_content(&worker.rules, *id, &pages, &chunks)
+                segment_content(&worker.rules, *id, &pages, &chunks, &model_types)
             });
             let outputs = parallel_map(&chunks, threads, |chunk| entities::ChunkOutput {
                 id: chunk.id,
@@ -930,6 +938,14 @@ async fn rules_stage(
     if unlisted > 0 {
         println!("rules: facts cleared for {unlisted} contents that no present file uses");
     }
+    if documents_todo + contents_todo > 0 {
+        let stale = entities::delete_unselected(pool, version_id).await?;
+        if stale > 0 {
+            println!(
+                "rules: {stale} facts removed whose class or property the ontology no longer selects"
+            );
+        }
+    }
     let orphans = entities::delete_orphans(pool).await?;
     entities::sync_aliases(pool, &rules.lexicon.entries).await?;
     stats.seconds = started.elapsed().as_secs_f64();
@@ -949,11 +965,43 @@ async fn rules_stage(
     Ok(())
 }
 
+pub fn document_output(rules: &Rules, doc: entities::DocumentWork) -> entities::DocumentOutput {
+    let mut facts = (doc.status != "deleted").then(|| rules.document_facts(&doc.path));
+    let mut type_method = None;
+    let mut type_confidence = 1.0;
+    if let Some(facts) = facts.as_mut() {
+        if facts.doc_type.is_some() {
+            type_method = Some(PATH_METHOD.to_string());
+        } else if let Some(doc_type) = doc.llm_type.filter(|t| rules.doc_types.contains_key(t)) {
+            facts.doc_type = Some(doc_type);
+            type_method = doc.llm_method;
+            type_confidence = doc.llm_confidence.unwrap_or(1.0);
+        }
+    }
+    let document_class = facts.as_ref().and_then(|f| {
+        rules
+            .document_class_for(f.doc_type.as_deref())
+            .map(str::to_string)
+    });
+    entities::DocumentOutput {
+        id: doc.id,
+        path: doc.path,
+        dataset: doc.dataset,
+        document_class,
+        type_method,
+        type_confidence,
+        facts,
+    }
+}
+
+pub type ModelTypes = HashMap<(i64, i32), entities::ModelType>;
+
 pub fn segment_content(
     rules: &Rules,
     content_id: i64,
     pages: &[entities::PageWork],
     chunks: &[entities::ChunkWork],
+    model_types: &ModelTypes,
 ) -> entities::ContentSegments {
     let own: Vec<&entities::PageWork> = pages
         .iter()
@@ -981,7 +1029,15 @@ pub fn segment_content(
             .filter(|c| c.content_id == content_id)
             .collect();
         for segment in &segments {
-            let Some(class) = rules.document_class_for(segment.doc_type.as_deref()) else {
+            let model = model_types
+                .get(&(content_id, segment.page_from))
+                .filter(|_| segment.doc_type.is_none())
+                .filter(|m| rules.doc_types.contains_key(&m.doc_type));
+            let doc_type = segment
+                .doc_type
+                .as_deref()
+                .or(model.map(|m| m.doc_type.as_str()));
+            let Some(class) = rules.document_class_for(doc_type) else {
                 continue;
             };
             let first = own_chunks
@@ -992,17 +1048,18 @@ pub fn segment_content(
             };
             entities.push(entities::SegmentEntity {
                 class: class.to_string(),
+                method: model.map_or(entities::SEGMENT_METHOD.to_string(), |m| m.method.clone()),
                 key: format!("{}#{}", own[0].sha256, segment.ord),
                 name: format!(
                     "{} pages {}-{}",
-                    segment.doc_type.as_deref().unwrap_or("segment"),
+                    doc_type.unwrap_or("segment"),
                     segment.page_from,
                     segment.page_to
                 ),
                 dataset: chunk.dataset.clone(),
                 chunk_id: chunk.id,
                 span_end: chunk.text.chars().count(),
-                confidence: segment.confidence,
+                confidence: segment.confidence * model.map_or(1.0, |m| m.confidence),
             });
         }
     }

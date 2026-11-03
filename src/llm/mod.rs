@@ -1,8 +1,10 @@
 pub mod budget;
 pub mod claude_code;
+pub mod job;
 pub mod ollama;
 pub mod openrouter;
 pub mod prompt;
+pub mod shortlist;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -15,6 +17,7 @@ use sqlx::types::chrono::{DateTime, Utc};
 use crate::config::Config;
 
 pub const RETRIES: u32 = 3;
+pub const METHOD_PREFIX: &str = "llm:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -61,6 +64,12 @@ impl ModelName {
             provider,
             model: model.to_string(),
         })
+    }
+}
+
+impl ModelName {
+    pub fn method(&self) -> String {
+        format!("{METHOD_PREFIX}{self}")
     }
 }
 

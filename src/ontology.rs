@@ -53,6 +53,7 @@ pub struct Class {
     pub alt_labels: LangMap<Vec<String>>,
     pub definition: LangMap<String>,
     pub selected: bool,
+    pub meta: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,6 +327,7 @@ fn build(ontology: &mut Ontology, nodes: HashMap<String, Node>) {
                 alt_labels: all_per_language(&node.alt_labels, &languages),
                 definition: first_per_language(definitions, &languages),
                 selected: false,
+                meta: false,
             };
             ontology.classes.insert(iri, class);
         } else if let Some(kind) = kind {
@@ -339,6 +341,16 @@ fn build(ontology: &mut Ontology, nodes: HashMap<String, Node>) {
                 selected: false,
             };
             ontology.properties.insert(iri, property);
+        }
+    }
+    let metas: BTreeSet<String> = ontology
+        .classes
+        .values()
+        .flat_map(|c| c.types.iter().cloned())
+        .collect();
+    for iri in metas {
+        if let Some(class) = ontology.classes.get_mut(&iri) {
+            class.meta = true;
         }
     }
 }
@@ -555,7 +567,7 @@ impl Ontology {
                 continue;
             }
             if let Some(class) = self.classes.get(iri) {
-                stack.extend(class.parents.iter().map(String::as_str));
+                stack.extend(class.parents.iter().chain(&class.types).map(String::as_str));
             }
         }
         false
@@ -755,6 +767,12 @@ mod tests {
             ex:Site a rdfs:Class, ex:LocationClass .\n";
         let loaded = load_text(&[flat], &config(&["ex:EquipmentClass"], &[]));
         assert_eq!(selected(&loaded), ["EquipmentClass", "Pump", "Valve"]);
+        let ontology = &loaded.ontology;
+        let iri = |name: &str| format!("http://example.org/onto#{name}");
+        assert!(ontology.is_a(&iri("Pump"), &iri("EquipmentClass")));
+        assert!(!ontology.is_a(&iri("Site"), &iri("EquipmentClass")));
+        assert!(ontology.classes[&iri("EquipmentClass")].meta);
+        assert!(!ontology.classes[&iri("Pump")].meta);
     }
 
     #[test]

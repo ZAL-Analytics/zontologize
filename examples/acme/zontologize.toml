@@ -60,6 +60,8 @@ text_search = "simple"
 
 [models]
 fit = "claude-code:sonnet"
+extract = "claude-code:sonnet"
+classify = "claude-code:haiku"
 # fit = "claude-code:haiku"
 # fit = "openrouter:anthropic/claude-haiku-5.5"
 # fit = "ollama:qwen3.5:4b"
@@ -96,6 +98,32 @@ max_shortlist = 30
 min_evidence = 2
 proposal_namespace = "https://example.org/acme/proposal#"
 out = "fit"
+
+[llm_extract]
+min_chars = 100
+sources = []
+doc_types = []
+paths = []
+exclude = []
+seed = "acme"
+max_per_document = 3
+unmatched_share = 0.3
+min_letter_share = 0.5
+min_ocr_confidence = 0.6
+max_shortlist = 30
+confidence = 0.7
+resend_share = 0.2
+min_evidence = 1
+out = "extract"
+
+[classify]
+head_chars = 1500
+min_chars = 50
+confidence = 0.7
+
+[review]
+sample = 50
+min_verdicts = 30
 
 [[sources]]
 name = "projects"

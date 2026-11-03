@@ -13,7 +13,7 @@ use super::{CallError, Reply, Request, Resume, Usage, Window, Windows};
 pub const BIN_VARIABLE: &str = "CLAUDE_CODE_BIN";
 pub const DEFAULT_BIN: &str = "claude";
 const SUBSCRIPTION_KEY_SOURCE: &str = "none";
-const ALLOWED: &str = "allowed";
+const ALLOWED: [&str; 2] = ["allowed", "allowed_warning"];
 const STDERR_TAIL: usize = 500;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -256,7 +256,7 @@ impl Parsed {
     fn into_reply(self) -> Result<Reply, CallError> {
         let windows = self.windows();
         if let Some(limit) = &self.limit
-            && limit.status != ALLOWED
+            && !ALLOWED.contains(&limit.status.as_str())
         {
             let resume = limit
                 .resets_at
@@ -359,6 +359,20 @@ mod tests {
             panic!("{error:?}");
         };
         assert_eq!(resume, Resume::At(time(1893456000).unwrap()));
+    }
+
+    #[test]
+    fn a_warning_status_still_answers() {
+        let lines = "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"allowed_warning\",\
+            \"resetsAt\":1893456000}}\n\
+            {\"type\":\"result\",\"is_error\":false,\"structured_output\":{\"a\":1}}\n";
+        let reply = parse(lines).into_reply().unwrap();
+        assert_eq!(reply.response, "{\"a\":1}");
+        let rejected = lines.replace("allowed_warning", "rejected");
+        assert!(matches!(
+            parse(&rejected).into_reply(),
+            Err(CallError::Pause { .. })
+        ));
     }
 
     #[test]
