@@ -91,6 +91,7 @@ pub struct Context<'a> {
     pub ontology: &'a Ontology,
     pub languages: &'a [String],
     pub max_shortlist: usize,
+    pub exclude: &'a [String],
     pub system: &'a Prompt,
     pub user: &'a Prompt,
     pub model: &'a ModelName,
@@ -261,6 +262,7 @@ pub fn build(context: &Context, input: &ChunkInput) -> Built {
         ontology,
         &input.counts,
         &ontology.roots,
+        context.exclude,
         context.max_shortlist,
     );
     let known: Vec<Known> = input
@@ -393,6 +395,7 @@ pub mod tests {
             ontology,
             languages: &languages,
             max_shortlist: 10,
+            exclude: &[],
             system: &system,
             user: &user,
             model: &model,

@@ -103,6 +103,7 @@ pub struct LlmExtractConfig {
     pub sources: Vec<String>,
     pub doc_types: Vec<String>,
     pub paths: Vec<String>,
+    pub exclude: Vec<String>,
     pub seed: String,
     pub max_per_document: usize,
     pub unmatched_share: f64,

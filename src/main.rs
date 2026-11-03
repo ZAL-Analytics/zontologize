@@ -86,7 +86,12 @@ struct FitArgs {
         help = "Stop the job when it has spent this much"
     )]
     max_usd: Option<f64>,
-    #[arg(long, value_name = "N", help = "Stop the job after this many requests")]
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Stop the job after this many requests (at least 1)"
+    )]
     max_requests: Option<u64>,
     #[arg(long, help = "Print the estimate and send nothing")]
     dry_run: bool,
@@ -107,7 +112,12 @@ struct JobArgs {
         help = "Stop the job when it has spent this much"
     )]
     max_usd: Option<f64>,
-    #[arg(long, value_name = "N", help = "Stop the job after this many requests")]
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Stop the job after this many requests (at least 1)"
+    )]
     max_requests: Option<u64>,
     #[arg(long, help = "Print the estimate and send nothing")]
     dry_run: bool,
@@ -383,6 +393,15 @@ mod tests {
         };
         assert_eq!(args.job.max_requests, Some(5));
         assert!(args.yes && args.job.no_wait && !args.job.dry_run);
+    }
+
+    #[test]
+    fn max_requests_zero_is_rejected() {
+        assert!(Cli::try_parse_from(["zontologize", "extract", "--max-requests", "0"]).is_err());
+        assert!(
+            Cli::try_parse_from(["zontologize", "ontology", "fit", "--max-requests", "0"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["zontologize", "classify", "--max-requests", "1"]).is_ok());
     }
 
     #[test]

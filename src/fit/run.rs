@@ -369,6 +369,7 @@ async fn prepare(
             ontology,
             counts.get(&chunk.id).map(Vec::as_slice).unwrap_or(&[]),
             &ontology.roots,
+            &[],
             config.fit.max_shortlist,
         );
         let lines = shortlist_lines(ontology, &list, languages);

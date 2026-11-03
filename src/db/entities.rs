@@ -733,6 +733,29 @@ pub async fn clear_unlisted_contents(pool: &PgPool) -> Result<u64> {
     Ok(ids.len() as u64)
 }
 
+pub async fn delete_unselected(pool: &PgPool, version_id: i64) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    let mentions = sqlx::query(
+        "delete from mentions m using entities e where m.entity_id = e.id \
+         and not exists (select 1 from classes c where c.ontology_version_id = $1 \
+         and c.iri = e.class_iri and c.selected)",
+    )
+    .bind(version_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let relations = sqlx::query(
+        "delete from relations r where not exists (select 1 from properties p \
+         where p.ontology_version_id = $1 and p.iri = r.property_iri and p.selected)",
+    )
+    .bind(version_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(mentions + relations)
+}
+
 pub async fn delete_orphans(pool: &PgPool) -> Result<u64> {
     let count = sqlx::query(
         "delete from entities e where not exists (select 1 from mentions m where m.entity_id = e.id)",

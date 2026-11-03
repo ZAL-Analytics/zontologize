@@ -70,6 +70,38 @@ async fn rules_rerun_keeps_model_facts_and_unused_contents_lose_them() {
     env.finish().await;
 }
 
+#[tokio::test]
+#[ignore]
+async fn facts_of_classes_the_ontology_drops_are_removed() {
+    let env = setup("facts_unselected").await;
+    add_model_facts(&env).await;
+    let path = env.config().join("zontologize.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let text = text.replacen(
+        "document_class = ",
+        "exclude = [\"acme:Pump\"]\ndocument_class = ",
+        1,
+    );
+    std::fs::write(&path, text).unwrap();
+    env.scan().await;
+    assert_eq!(
+        env.count("select count(*) from mentions where method = 'llm:x'")
+            .await,
+        0
+    );
+    assert_eq!(
+        env.count("select count(*) from entities where class_iri like '%#Pump'")
+            .await,
+        0
+    );
+    assert_eq!(
+        env.count("select count(*) from relations where method = 'llm:x'")
+            .await,
+        0
+    );
+    env.finish().await;
+}
+
 use zontologize::facts::run::{Options, Outcome, run};
 
 const BOOSTER: &str = "Inspection report for project P-2024-0001 at the north site. The booster \

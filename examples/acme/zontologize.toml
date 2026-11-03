@@ -104,6 +104,7 @@ min_chars = 100
 sources = []
 doc_types = []
 paths = []
+exclude = []
 seed = "acme"
 max_per_document = 3
 unmatched_share = 0.3

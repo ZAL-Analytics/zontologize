@@ -8,12 +8,17 @@ pub fn shortlist(
     ontology: &Ontology,
     counts: &[(String, i64)],
     roots: &[String],
+    exclude: &[String],
     max: usize,
 ) -> Vec<String> {
-    let mut mentioned: Vec<&(String, i64)> = counts
-        .iter()
-        .filter(|(iri, _)| ontology.classes.get(iri).is_some_and(|c| c.selected))
-        .collect();
+    let keep = |iri: &str| {
+        ontology
+            .classes
+            .get(iri)
+            .is_some_and(|c| c.selected && !c.meta)
+            && !exclude.iter().any(|e| ontology.is_a(iri, e))
+    };
+    let mut mentioned: Vec<&(String, i64)> = counts.iter().filter(|(iri, _)| keep(iri)).collect();
     mentioned.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let mut list: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
@@ -24,7 +29,7 @@ pub fn shortlist(
     }
     if list.is_empty() {
         for root in roots {
-            if ontology.classes.get(root).is_some_and(|c| c.selected) && seen.insert(root.clone()) {
+            if keep(root) && seen.insert(root.clone()) {
                 list.push(root.clone());
             }
         }
@@ -37,9 +42,7 @@ pub fn shortlist(
             .map(|c| c.parents.clone())
             .unwrap_or_default();
         for parent in parents {
-            if ontology.classes.get(&parent).is_some_and(|c| c.selected)
-                && seen.insert(parent.clone())
-            {
+            if keep(&parent) && seen.insert(parent.clone()) {
                 list.push(parent);
             }
         }
@@ -161,19 +164,56 @@ mod tests {
     fn shortlist_adds_ancestors_and_caps() {
         let onto = ontology();
         let counts = vec![(iri("Valve"), 1), (iri("Pump"), 5), (iri("Other"), 9)];
-        let list = shortlist(&onto, &counts, &onto.roots, 10);
+        let list = shortlist(&onto, &counts, &onto.roots, &[], 10);
         assert_eq!(
             list,
             [iri("Pump"), iri("Valve"), iri("Machine"), iri("Asset")]
         );
-        let capped = shortlist(&onto, &counts, &onto.roots, 2);
+        let capped = shortlist(&onto, &counts, &onto.roots, &[], 2);
         assert_eq!(capped, [iri("Pump"), iri("Valve")]);
     }
 
     #[test]
     fn chunk_without_mentions_gets_the_roots() {
         let onto = ontology();
-        assert_eq!(shortlist(&onto, &[], &onto.roots, 10), [iri("Asset")]);
+        assert_eq!(shortlist(&onto, &[], &onto.roots, &[], 10), [iri("Asset")]);
+    }
+
+    #[test]
+    fn meta_classes_never_enter_the_shortlist() {
+        let ttl = "@prefix ex: <http://example.org/ex#> .\n\
+            @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+            ex:EquipmentClass a owl:Class .\n\
+            ex:Pump a owl:Class, ex:EquipmentClass .\n";
+        let config = OntologyConfig {
+            files: vec!["a.ttl".to_string()],
+            languages: vec!["en".to_string()],
+            include: vec!["ex:EquipmentClass".to_string()],
+            exclude: vec![],
+            document_class: String::new(),
+        };
+        let onto = crate::ontology::load_sources(
+            &[("a.ttl".to_string(), ttl.as_bytes().to_vec())],
+            &config,
+        )
+        .ontology;
+        let counts = vec![(iri("EquipmentClass"), 3), (iri("Pump"), 1)];
+        assert_eq!(
+            shortlist(&onto, &counts, &onto.roots, &[], 10),
+            [iri("Pump")]
+        );
+        assert!(shortlist(&onto, &[], &onto.roots, &[], 10).is_empty());
+    }
+
+    #[test]
+    fn excluded_roots_leave_the_shortlist_with_their_descendants() {
+        let onto = ontology();
+        let counts = vec![(iri("Valve"), 1), (iri("Pump"), 5)];
+        let list = shortlist(&onto, &counts, &onto.roots, &[iri("Pump")], 10);
+        assert_eq!(list, [iri("Valve"), iri("Machine"), iri("Asset")]);
+        let list = shortlist(&onto, &counts, &onto.roots, &[iri("Machine")], 10);
+        assert_eq!(list, [iri("Asset")]);
+        assert!(shortlist(&onto, &[], &onto.roots, &[iri("Asset")], 10).is_empty());
     }
 
     #[test]

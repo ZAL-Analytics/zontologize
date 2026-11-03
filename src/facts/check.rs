@@ -12,6 +12,7 @@ pub const UNKNOWN_REF: &str = "unknown or dropped ref";
 pub const DOMAIN_RANGE: &str = "domain or range not met";
 pub const LANGUAGE: &str = "language not configured";
 pub const EMPTY_LABEL: &str = "empty label";
+pub const CLASS_NAME: &str = "named after its class";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Endpoint {
@@ -107,6 +108,19 @@ impl Haystack {
     }
 }
 
+fn named_after_class(ontology: &Ontology, class: &str, name: &str) -> bool {
+    let Some(class) = ontology.classes.get(class) else {
+        return false;
+    };
+    let name = normalise(name);
+    class.labels.values().any(|l| normalise(l) == name)
+        || class
+            .alt_labels
+            .values()
+            .flatten()
+            .any(|l| normalise(l) == name)
+}
+
 fn exact<'a>(allowed: &'a [String], value: &str) -> Option<&'a String> {
     allowed
         .iter()
@@ -135,6 +149,10 @@ pub fn check(
             checked.drop(NOT_IN_SHORTLIST, &entity.class);
             continue;
         };
+        if named_after_class(ontology, class, &entity.name) {
+            checked.drop(CLASS_NAME, class);
+            continue;
+        }
         if haystack.find(&entity.name).is_none() {
             checked.drop(NAME_NOT_FOUND, class);
             continue;
@@ -277,7 +295,8 @@ mod tests {
                     {"ref": "e2", "class": iri("Site"), "name": "north site", "evidence": "north site"},
                     {"ref": "e3", "class": iri("Pump"), "name": "rotor", "evidence": "booster"},
                     {"ref": "e4", "class": iri("Pump"), "name": "booster pump", "evidence": "a pump not here"},
-                    {"ref": "e5", "class": iri("Pump"), "name": "booster  pump", "evidence": "booster pump B"}
+                    {"ref": "e5", "class": iri("Pump"), "name": "booster  pump", "evidence": "booster pump B"},
+                    {"ref": "e6", "class": iri("Pump"), "name": " PUMP ", "evidence": "booster pump B"}
                 ],
                 "other_relations": []
             })),
@@ -291,7 +310,8 @@ mod tests {
         assert_eq!(entity.class, iri("Pump"));
         assert_eq!(entity.key, "booster pump");
         assert_eq!((entity.start, entity.end), (0, 16));
-        assert_eq!(checked.drops.values().sum::<i64>(), 3);
+        assert_eq!(checked.drops.values().sum::<i64>(), 4);
+        assert_eq!(checked.drops[&format!("{CLASS_NAME}|{}", iri("Pump"))], 1);
         assert_eq!(
             checked.drops[&format!("{NOT_IN_SHORTLIST}|{}", iri("Site"))],
             1

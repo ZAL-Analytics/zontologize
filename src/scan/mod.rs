@@ -938,6 +938,14 @@ async fn rules_stage(
     if unlisted > 0 {
         println!("rules: facts cleared for {unlisted} contents that no present file uses");
     }
+    if documents_todo + contents_todo > 0 {
+        let stale = entities::delete_unselected(pool, version_id).await?;
+        if stale > 0 {
+            println!(
+                "rules: {stale} facts removed whose class or property the ontology no longer selects"
+            );
+        }
+    }
     let orphans = entities::delete_orphans(pool).await?;
     entities::sync_aliases(pool, &rules.lexicon.entries).await?;
     stats.seconds = started.elapsed().as_secs_f64();

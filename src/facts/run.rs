@@ -29,6 +29,7 @@ struct Setup<'a> {
     pool: &'a PgPool,
     config: &'a Config,
     ontology: Arc<Ontology>,
+    exclude: Arc<Vec<String>>,
     system: Arc<Prompt>,
     user: Arc<Prompt>,
     name: &'a ModelName,
@@ -94,6 +95,14 @@ pub async fn run(
             bail!("llm_extract.doc_types: {doc_type:?} is not a key of [doc_types] in rules.toml");
         }
     }
+    let mut exclude = Vec::new();
+    for name in &config.llm_extract.exclude {
+        let class = loaded
+            .ontology
+            .class(name)
+            .map_err(|e| anyhow::anyhow!("llm_extract.exclude: {e}"))?;
+        exclude.push(class.iri.clone());
+    }
     let system = prompt::load(config_dir, "extract-system")?;
     system.check(&[])?;
     let user = prompt::load(config_dir, "extract-user")?;
@@ -108,6 +117,7 @@ pub async fn run(
         pool: &pool,
         config: &config,
         ontology: Arc::new(loaded.ontology),
+        exclude: Arc::new(exclude),
         system: Arc::new(system),
         user: Arc::new(user),
         name: &name,
@@ -156,12 +166,14 @@ async fn prepare(setup: &Setup<'_>, ids: &[i64]) -> Result<Vec<Prepared>> {
     let model = setup.name.clone();
     let languages = config.ontology.languages.clone();
     let max_shortlist = config.llm_extract.max_shortlist;
+    let exclude = setup.exclude.clone();
     let threads = setup.threads;
     let (built, pairs) = tokio::task::spawn_blocking(move || {
         let context = Context {
             ontology: &ontology,
             languages: &languages,
             max_shortlist,
+            exclude: &exclude,
             system: &system,
             user: &user,
             model: &model,

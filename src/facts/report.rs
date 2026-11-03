@@ -193,6 +193,19 @@ pub fn names_csv(ontology: &Ontology, rows: &[(String, String, String, i64)]) ->
     String::from_utf8(bytes).context("CSV output is not UTF-8")
 }
 
+pub fn short_label(ontology: &Ontology, iri: &str) -> String {
+    let languages = &ontology.languages;
+    if let Some(class) = ontology.classes.get(iri) {
+        return crate::llm::shortlist::label(class, languages);
+    }
+    if let Some(property) = ontology.properties.get(iri)
+        && let Some(label) = crate::llm::shortlist::pick(&property.labels, languages)
+    {
+        return label;
+    }
+    local_name(iri).to_string()
+}
+
 pub fn markdown(
     ontology: &Ontology,
     totals: &Totals,
@@ -242,7 +255,7 @@ pub fn markdown(
         let about = if about.is_empty() {
             String::new()
         } else {
-            format!(" ({})", local_name(about))
+            format!(" ({})", short_label(ontology, about))
         };
         let _ = writeln!(out, "- {reason}{about}: {count}");
     }
@@ -454,6 +467,8 @@ mod tests {
         let text = markdown(&onto, &totals, &rows, &[]);
         assert!(text.contains("Partial: job 3"), "{text}");
         assert!(text.contains("quote not in the chunk (Pump): 2"), "{text}");
+        assert_eq!(short_label(&onto, &iri("installedAt")), "installed at");
+        assert_eq!(short_label(&onto, "urn:x:other"), "other");
         assert!(
             text.contains("\"near\"@en: Pump -> Site, 2 chunks"),
             "{text}"

@@ -114,6 +114,7 @@ min_chars = 200
 sources = []
 doc_types = []
 paths = []
+exclude = []
 seed = "zontologize"
 max_per_document = 3
 unmatched_share = 0.3
