@@ -62,6 +62,7 @@ text_search = "simple"
 fit = "claude-code:sonnet"
 extract = "claude-code:sonnet"
 classify = "claude-code:haiku"
+embed = "local:multilingual-e5-small"
 # fit = "claude-code:haiku"
 # fit = "openrouter:anthropic/claude-haiku-5.5"
 # fit = "ollama:qwen3.5:4b"
@@ -124,6 +125,44 @@ confidence = 0.7
 [review]
 sample = 50
 min_verdicts = 30
+
+[embed]
+threads = 0
+batch_size = 8
+max_tokens = 512
+min_chars = 50
+min_letter_share = 0.5
+min_ocr_confidence = 0.6
+max_aliases = 5
+cache_dir = ""
+out = "eval"
+eval_sample = 500
+eval_max_expected = 20
+
+[embed.models."multilingual-e5-small"]
+max_tokens = 256
+
+[embed.models."acme-minilm"]
+repo = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+revision = ""
+file = "onnx/model.onnx"
+data_files = []
+tokenizer = "tokenizer.json"
+pooling = "mean"
+output = ""
+normalize = true
+passage_prefix = ""
+query_prefix = ""
+max_tokens = 128
+
+[resolve]
+strip_words = ["bv", "b v", "gmbh", "ltd", "inc"]
+fuzzy_score = 0.92
+embed_score = 0.9
+max_candidates = 5
+max_block = 1000
+block_chars = 4
+classes = []
 
 [[sources]]
 name = "projects"

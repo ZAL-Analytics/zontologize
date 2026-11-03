@@ -1,8 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::postgres::PgPool;
 use zontologize::db;
 
 pub const TEST_URL: &str = "ZONTOLOGIZE_TEST_DATABASE_URL";
@@ -39,12 +38,7 @@ impl Env {
         let mut conn = db::connect(Some(&test_url()), &schema).await.unwrap();
         db::migrate::run(&mut conn, &schema).await.unwrap();
         db::close(conn).await;
-        let options = PgConnectOptions::from_str(&test_url())
-            .unwrap()
-            .options([("search_path", schema.as_str())]);
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect_with(options)
+        let pool = db::pool::connect(Some(&test_url()), &schema, 2)
             .await
             .unwrap();
         Env { schema, dir, pool }
@@ -259,4 +253,77 @@ pub async fn fake_server(routes: Vec<(&'static str, u16, String)>) -> FakeServer
         }
     });
     FakeServer { url, requests }
+}
+
+pub struct FakeEmbed {
+    pub dimensions: usize,
+    pub texts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl FakeEmbed {
+    pub fn new(dimensions: usize) -> FakeEmbed {
+        FakeEmbed {
+            dimensions,
+            texts: Default::default(),
+        }
+    }
+}
+
+pub fn fake_vector(text: &str, dimensions: usize) -> Vec<f32> {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(text.as_bytes());
+    let mut vector: Vec<f32> = (0..dimensions)
+        .map(|i| digest[i % digest.len()] as f32 - 127.5)
+        .collect();
+    zontologize::embed::local::normalise(&mut vector);
+    vector
+}
+
+impl zontologize::embed::Embed for FakeEmbed {
+    fn revision(&self) -> &str {
+        "fake"
+    }
+
+    fn sha256(&mut self) -> anyhow::Result<String> {
+        Ok("fake".to_string())
+    }
+
+    fn dimensions(&mut self) -> anyhow::Result<usize> {
+        Ok(self.dimensions)
+    }
+
+    fn embed(&mut self, texts: &[String]) -> anyhow::Result<zontologize::embed::Embedded> {
+        self.texts.lock().unwrap().extend(texts.iter().cloned());
+        Ok(zontologize::embed::Embedded {
+            vectors: texts
+                .iter()
+                .map(|t| fake_vector(t, self.dimensions))
+                .collect(),
+            truncated: vec![false; texts.len()],
+        })
+    }
+}
+
+impl Env {
+    pub async fn embed(
+        &self,
+        model: &str,
+        embedder: FakeEmbed,
+        options: &zontologize::embed::run::Options,
+    ) -> zontologize::embed::run::Stats {
+        let config = zontologize::config::load(Some(&self.config())).unwrap();
+        let ontology =
+            zontologize::embed::run::load_ontology(Some(&self.config()), &config).unwrap();
+        let model = zontologize::embed::model::parse(model, &config.embed.models).unwrap();
+        zontologize::embed::run::run_with(
+            &self.pool,
+            &config,
+            &ontology,
+            &model,
+            Box::new(embedder),
+            options,
+        )
+        .await
+        .unwrap()
+    }
 }

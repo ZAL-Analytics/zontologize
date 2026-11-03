@@ -1,5 +1,6 @@
 # Cache files
 .metadata_cache
+.claude
 __pycache__/
 
 # Ignore build artifacts

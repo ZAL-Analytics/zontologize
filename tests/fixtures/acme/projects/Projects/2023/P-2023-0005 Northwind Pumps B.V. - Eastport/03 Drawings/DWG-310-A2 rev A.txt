@@ -1,0 +1,3 @@
+Drawing DWG-310-A2 revision A
+
+Pipe section layout for the cooling line at Eastport. The pipe runs along the east wall of the pump room.

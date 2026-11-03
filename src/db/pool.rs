@@ -11,6 +11,7 @@ pub async fn connect(url: Option<&str>, schema: &str, max_connections: u32) -> R
     };
     PgPoolOptions::new()
         .max_connections(max_connections)
+        .after_connect(|conn, _| Box::pin(async move { super::add_vector_path(conn).await }))
         .connect_with(options.options([("search_path", schema)]))
         .await
         .context("cannot connect to PostgreSQL (DATABASE_URL or PG* variables)")

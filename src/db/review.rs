@@ -90,3 +90,85 @@ pub async fn precision(pool: &PgPool) -> Result<Vec<Precision>> {
     .await?;
     Ok(rows)
 }
+
+#[derive(Debug, Clone, FromRow)]
+pub struct Merge {
+    pub id: i64,
+    pub method: String,
+    pub confidence: f64,
+    pub a_id: i64,
+    pub a_name: String,
+    pub a_class: String,
+    pub b_id: i64,
+    pub b_name: String,
+    pub b_class: String,
+}
+
+pub async fn proposed_merges(
+    pool: &PgPool,
+    class_iri: &str,
+    seed: &str,
+    n: i64,
+) -> Result<Vec<Merge>> {
+    let rows = sqlx::query_as(
+        "select r.id, r.method, r.confidence, a.id as a_id, a.name as a_name, \
+         a.class_iri as a_class, b.id as b_id, b.name as b_name, b.class_iri as b_class \
+         from relations r join entities a on a.id = r.src_id join entities b on b.id = r.dst_id \
+         where r.property_iri = $1 and r.status = 'proposed' \
+         and ($2 = '' or a.class_iri = $2 or b.class_iri = $2) \
+         order by md5($3 || r.id::text), r.id limit $4",
+    )
+    .bind(crate::db::resolve::SAME_AS)
+    .bind(class_iri)
+    .bind(seed)
+    .bind(n)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct Example {
+    pub path: String,
+    pub page_from: Option<i32>,
+    pub text: String,
+    pub span_start: i32,
+    pub span_end: i32,
+}
+
+pub async fn entity_card(
+    pool: &PgPool,
+    id: i64,
+    examples: i64,
+) -> Result<(Vec<String>, i64, Vec<Example>)> {
+    let aliases =
+        sqlx::query_scalar("select alias from aliases where entity_id = $1 order by alias")
+            .bind(id)
+            .fetch_all(pool)
+            .await?;
+    let mentions = sqlx::query_scalar("select count(*) from mentions where entity_id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
+    let rows = sqlx::query_as(
+        "select d.path, k.page_from, k.text, m.span_start, m.span_end from mentions m \
+         join chunks k on k.id = m.chunk_id \
+         join lateral (select d.path from documents d where d.content_id = k.content_id \
+         and d.status = 'present' order by d.id limit 1) d on true \
+         where m.entity_id = $1 order by m.id limit $2",
+    )
+    .bind(id)
+    .bind(examples)
+    .fetch_all(pool)
+    .await?;
+    Ok((aliases, mentions, rows))
+}
+
+pub async fn set_merge_status(pool: &PgPool, id: i64, status: &str) -> Result<()> {
+    sqlx::query("update relations set status = $2 where id = $1 and status = 'proposed'")
+        .bind(id)
+        .bind(status)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
