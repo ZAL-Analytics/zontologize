@@ -342,9 +342,10 @@ pub async fn write_document_rules(
     let ids: Vec<i64> = outputs.iter().map(|o| o.id).collect();
     let mut tx = pool.begin().await?;
     for table in ["mentions", "relations", "class_mentions"] {
-        let sql = format!("delete from {table} where document_id = any($1)");
+        let sql = format!("delete from {table} where document_id = any($1) and method not like $2");
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(&ids)
+            .bind(RESOLVE_METHODS)
             .execute(&mut *tx)
             .await?;
     }
@@ -486,6 +487,7 @@ pub async fn write_document_rules(
 
 pub const SEGMENT_METHOD: &str = "page_rule";
 const MODEL_METHODS: &str = "llm:%";
+const RESOLVE_METHODS: &str = "resolve:%";
 
 pub async fn write_text_rules(
     pool: &PgPool,
@@ -500,11 +502,13 @@ pub async fn write_text_rules(
     for table in ["mentions", "class_mentions", "relations"] {
         let sql = format!(
             "delete from {table} where chunk_id in \
-             (select id from chunks where content_id = any($1)) and method not like $2"
+             (select id from chunks where content_id = any($1)) \
+             and method not like $2 and method not like $3"
         );
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(content_ids)
             .bind(MODEL_METHODS)
+            .bind(RESOLVE_METHODS)
             .execute(&mut *tx)
             .await?;
     }
@@ -745,10 +749,12 @@ pub async fn delete_unselected(pool: &PgPool, version_id: i64) -> Result<u64> {
     .await?
     .rows_affected();
     let relations = sqlx::query(
-        "delete from relations r where not exists (select 1 from properties p \
+        "delete from relations r where r.status in ('auto', 'proposed') \
+         and r.property_iri <> all($2) and not exists (select 1 from properties p \
          where p.ontology_version_id = $1 and p.iri = r.property_iri and p.selected)",
     )
     .bind(version_id)
+    .bind(super::resolve::BUILT_IN)
     .execute(&mut *tx)
     .await?
     .rows_affected();

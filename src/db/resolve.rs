@@ -4,6 +4,7 @@ use sqlx::{FromRow, PgPool};
 pub const SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
 pub const REFERENCES: &str = "http://purl.org/dc/terms/references";
 pub const REPLACES: &str = "http://purl.org/dc/terms/replaces";
+pub const BUILT_IN: [&str; 3] = [SAME_AS, REFERENCES, REPLACES];
 
 #[derive(Debug, Clone, FromRow)]
 pub struct EntityRow {
@@ -148,6 +149,29 @@ pub async fn neighbours(
         .fetch_all(&mut *tx)
         .await?;
     tx.commit().await?;
+    Ok(rows)
+}
+
+pub async fn pair_scores(
+    pool: &PgPool,
+    model_id: i64,
+    dimensions: i32,
+    pairs: &[(i64, i64)],
+) -> Result<Vec<(i64, i64, f64)>> {
+    let cast = format!("halfvec({dimensions})");
+    let sql = format!(
+        "select v.a, v.b, 1 - (x.embedding::{cast} <=> y.embedding::{cast}) \
+         from unnest($2::bigint[], $3::bigint[]) as v(a, b) \
+         join embeddings x on x.model_id = $1 and x.owner_kind = 'entity' and x.owner_id = v.a \
+         join embeddings y on y.model_id = $1 and y.owner_kind = 'entity' and y.owner_id = v.b"
+    );
+    let (a, b): (Vec<i64>, Vec<i64>) = pairs.iter().copied().unzip();
+    let rows = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(model_id)
+        .bind(a)
+        .bind(b)
+        .fetch_all(pool)
+        .await?;
     Ok(rows)
 }
 

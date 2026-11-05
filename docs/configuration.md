@@ -41,6 +41,8 @@ ignore = ["**/*.bak"]      # optional globs
 | Key | Default | Meaning |
 |---|---|---|
 | `database.schema` | `"zontologize"` | Schema to write |
+| `database.graph` | `"zontologize_graph"` | AGE graph that `graph sync` rebuilds; must differ from the schemas |
+| `database.api_schema` | `"zontologize_api"` | Schema of the views for apps, made by `db migrate` |
 | `database.max_connections` | `8` | Connection pool size |
 | `ontology.files` | `[]` | Turtle files, relative to the config directory |
 | `ontology.languages` | `["en"]` | Label languages, first preferred |

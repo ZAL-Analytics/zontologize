@@ -37,6 +37,9 @@ impl Env {
         drop_schema(&schema).await;
         let mut conn = db::connect(Some(&test_url()), &schema).await.unwrap();
         db::migrate::run(&mut conn, &schema).await.unwrap();
+        db::api::create(&mut conn, &schema, &format!("{schema}_api"))
+            .await
+            .unwrap();
         db::close(conn).await;
         let pool = db::pool::connect(Some(&test_url()), &schema, 2)
             .await
@@ -55,9 +58,9 @@ impl Env {
     pub fn write_config(&self, extra: &str) {
         let ontology = repo("examples/acme/ontology/acme.ttl");
         let text = format!(
-            "[database]\nschema = \"{}\"\nmax_connections = 4\n\
+            "[database]\nschema = \"{0}\"\ngraph = \"{0}_graph\"\napi_schema = \"{0}_api\"\nmax_connections = 4\n\
              [extract]\nthreads = 2\ntimeout_secs = 60\n\
-             [ontology]\nfiles = [\"{}\"]\nlanguages = [\"en\", \"nl\"]\n\
+             [ontology]\nfiles = [\"{1}\"]\nlanguages = [\"en\", \"nl\"]\n\
              include = [\"acme:Organisation\", \"acme:Site\", \"acme:Project\", \
              \"acme:Equipment\", \"acme:Document\"]\n\
              document_class = \"acme:Document\"\n{extra}",
@@ -153,6 +156,8 @@ impl Drop for Env {
             runtime.block_on(async {
                 drop_schema(&schema).await;
                 drop_schema(&format!("{schema}_store")).await;
+                drop_schema(&format!("{schema}_api")).await;
+                drop_graph(&format!("{schema}_graph")).await;
             });
             let _ = std::fs::remove_dir_all(&dir);
         })
@@ -171,6 +176,24 @@ pub async fn drop_schema(schema: &str) {
         .execute(&mut conn)
         .await
         .unwrap();
+    db::close(conn).await;
+}
+
+pub async fn drop_graph(graph: &str) {
+    let mut conn = db::connect(Some(&test_url()), "public").await.unwrap();
+    let exists: bool =
+        sqlx::query_scalar("select exists(select 1 from ag_catalog.ag_graph where name = $1)")
+            .bind(graph)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    if exists {
+        sqlx::query("select ag_catalog.drop_graph($1, true)")
+            .bind(graph)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
     db::close(conn).await;
 }
 

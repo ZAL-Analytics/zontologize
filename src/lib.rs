@@ -2,8 +2,10 @@ pub mod classify;
 pub mod config;
 pub mod db;
 pub mod embed;
+pub mod export;
 pub mod facts;
 pub mod fit;
+pub mod graph;
 pub mod llm;
 pub mod ontology;
 pub mod resolve;
@@ -20,7 +22,14 @@ pub async fn db_migrate(config_dir: Option<&Path>) -> Result<ExitCode> {
     let config = config::load(config_dir)?;
     let schema = &config.database.schema;
     let mut conn = db::connect(database_url().as_deref(), schema).await?;
-    let result = db::migrate::run(&mut conn, schema).await;
+    let api = &config.database.api_schema;
+    let result = async {
+        db::runs::take_lock(&mut conn, schema).await?;
+        let applied = db::migrate::run(&mut conn, schema).await?;
+        db::api::create(&mut conn, schema, api).await?;
+        anyhow::Ok(applied)
+    }
+    .await;
     db::close(conn).await;
     let applied = result?;
     if applied.is_empty() {
@@ -29,6 +38,7 @@ pub async fn db_migrate(config_dir: Option<&Path>) -> Result<ExitCode> {
     for version in applied {
         println!("schema {schema}: applied {version:04}");
     }
+    println!("schema {api}: views up to date");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -128,6 +138,22 @@ pub fn ontology_check(config_dir: Option<&Path>) -> Result<ExitCode> {
 }
 
 pub const PAUSED_EXIT_CODE: u8 = 2;
+
+pub async fn ontology_export(config_dir: Option<&Path>, out: &Path) -> Result<ExitCode> {
+    let text = export::run(config_dir, database_url().as_deref()).await?;
+    std::fs::write(out, text).with_context(|| format!("cannot write {}", out.display()))?;
+    println!("ontology export: written to {}", out.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+pub async fn graph_sync(config_dir: Option<&Path>) -> Result<ExitCode> {
+    let stats = graph::sync(config_dir, database_url().as_deref()).await?;
+    println!(
+        "graph sync: {} vertices, {} edges, {} labels; {:.1} s",
+        stats.vertices, stats.edges, stats.labels, stats.seconds
+    );
+    Ok(ExitCode::SUCCESS)
+}
 
 pub async fn ontology_fit(
     config_dir: Option<&Path>,
@@ -596,7 +622,27 @@ async fn print_status(
         println!("{line}");
     }
     print_model_facts(pool, config).await?;
-    print_embeddings(pool).await
+    print_embeddings(pool).await?;
+    print_graph(pool, &config.database.api_schema).await
+}
+
+async fn print_graph(pool: &sqlx::PgPool, api_schema: &str) -> Result<()> {
+    if let Some(sha) = db::status::ontology_version(pool).await? {
+        println!("ontology: version {}", &sha[..sha.len().min(12)]);
+    }
+    if let Some((stats, finished)) = db::status::last_graph(pool).await? {
+        println!(
+            "graph: {} vertices, {} edges, synced {}",
+            stats["vertices"],
+            stats["edges"],
+            finished.format("%Y-%m-%d %H:%M UTC")
+        );
+    }
+    match db::status::contract_version(pool, api_schema).await? {
+        Some(version) => println!("views: {api_schema} contract {version}"),
+        None => println!("views: missing, run zontologize db migrate"),
+    }
+    Ok(())
 }
 
 async fn print_embeddings(pool: &sqlx::PgPool) -> Result<()> {

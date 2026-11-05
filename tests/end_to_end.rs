@@ -30,6 +30,14 @@ async fn acme_example_end_to_end() {
             &format!("schema = \"{}\"", env.schema),
         )
         .replace(
+            "graph = \"zontologize_graph\"",
+            &format!("graph = \"{}_graph\"", env.schema),
+        )
+        .replace(
+            "api_schema = \"zontologize_api\"",
+            &format!("api_schema = \"{}_api\"", env.schema),
+        )
+        .replace(
             "../../tests/fixtures/acme",
             &env.data().display().to_string(),
         )
@@ -223,10 +231,52 @@ async fn acme_example_end_to_end() {
     assert_eq!(env.count("select count(*) from llm_calls").await, calls);
     assert_eq!(env.count(model_facts).await, kept);
 
+    graph_export_and_views(&env, &url).await;
     if std::env::var("ZONTOLOGIZE_TEST_EMBED_MODEL").is_ok() {
         embed_resolve_and_review(&env, &url).await;
     }
     env.finish().await;
+}
+
+async fn graph_export_and_views(env: &Env, url: &str) {
+    let config = Some(env.config());
+    zontologize::resolve::run(config.as_deref(), Some(url))
+        .await
+        .unwrap();
+    let graph = zontologize::graph::sync(config.as_deref(), Some(url))
+        .await
+        .unwrap();
+    assert_eq!(
+        graph.vertices as i64,
+        env.count("select count(*) from entities").await
+    );
+    let text = zontologize::export::run(config.as_deref(), Some(url))
+        .await
+        .unwrap();
+    assert!(text.contains("owl:Ontology"));
+    let api = format!("\"{}_api\"", env.schema);
+    let documents = env
+        .count(&format!(
+            "select count(*) from {api}.documents d join {api}.chunks c on c.content_id = d.content_id"
+        ))
+        .await;
+    assert!(documents > 0);
+    let snapshot = "select (select count(*) from relations) + (select count(*) from aliases) \
+        + (select count(*) from entities where canonical_id is not null)";
+    let before = env.count(snapshot).await;
+    env.scan().await;
+    let again = zontologize::resolve::run(config.as_deref(), Some(url))
+        .await
+        .unwrap();
+    assert_eq!(again.written(), 0, "{again:?}");
+    let synced = zontologize::graph::sync(config.as_deref(), Some(url))
+        .await
+        .unwrap();
+    assert_eq!(
+        (synced.vertices, synced.edges),
+        (graph.vertices, graph.edges)
+    );
+    assert_eq!(env.count(snapshot).await, before);
 }
 
 async fn embed_resolve_and_review(env: &Env, url: &str) {

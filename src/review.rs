@@ -139,6 +139,7 @@ pub async fn sample<R: AsyncBufRead + Unpin>(
             .resolve(&options.class)
             .map_err(|e| anyhow::anyhow!("--class: {e}"))?
     };
+    let _lock = db::runs::lock(url, &config.database.schema).await?;
     let pool = db::pool::connect(url, &config.database.schema, 2).await?;
     let n = options.n.unwrap_or(config.review.sample);
     let result = async {
@@ -258,6 +259,7 @@ pub async fn merges<R: AsyncBufRead + Unpin>(
             .resolve(&options.class)
             .map_err(|e| anyhow::anyhow!("--class: {e}"))?
     };
+    let _lock = db::runs::lock(url, &config.database.schema).await?;
     let pool = db::pool::connect(url, &config.database.schema, 2).await?;
     let n = options.n.unwrap_or(config.review.sample);
     let result = async {

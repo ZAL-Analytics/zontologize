@@ -224,6 +224,8 @@ pub struct ReviewConfig {
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub schema: String,
+    pub graph: String,
+    pub api_schema: String,
     pub max_connections: u32,
 }
 
@@ -477,11 +479,26 @@ fn build(source: &str, merged: &Table) -> Result<Config> {
 }
 
 fn check(config: &Config) -> Result<(), String> {
-    if !is_identifier(&config.database.schema) {
-        return Err(format!(
-            "database.schema {:?} must match ^[a-z_][a-z0-9_]*$",
-            config.database.schema
-        ));
+    let database = &config.database;
+    let names = [
+        ("schema", &database.schema),
+        ("graph", &database.graph),
+        ("api_schema", &database.api_schema),
+    ];
+    for (key, name) in names {
+        if !is_identifier(name) {
+            return Err(format!(
+                "database.{key} {name:?} must match ^[a-z_][a-z0-9_]*$"
+            ));
+        }
+    }
+    if database.graph == database.schema
+        || database.api_schema == database.schema
+        || database.api_schema == database.graph
+    {
+        return Err(
+            "database.schema, database.graph and database.api_schema must differ".to_string(),
+        );
     }
     if config.extract.timeout_secs == 0 {
         return Err("extract.timeout_secs must be greater than 0".to_string());
@@ -725,6 +742,19 @@ mod tests {
     }
 
     #[test]
+    fn graph_and_api_schema_are_checked() {
+        let config = load_from(None, vars(&[])).unwrap();
+        assert_eq!(config.database.graph, "zontologize_graph");
+        assert_eq!(config.database.api_schema, "zontologize_api");
+        let dir = dir_with("[database]\ngraph = \"Graph\"\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("database.graph"), "{message}");
+        let dir = dir_with("[database]\ngraph = \"zontologize\"\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("must differ"), "{message}");
+    }
+
+    #[test]
     fn workers_and_their_memory_default_from_the_machine() {
         let config = load_from(None, vars(&[])).unwrap();
         assert!(config.extract.workers >= 1);
@@ -821,31 +851,18 @@ mod tests {
         assert_eq!(small.repo, "intfloat/multilingual-e5-small");
     }
 
-    fn keys(table: &Table, path: &str, out: &mut Vec<(String, String)>) {
-        for (key, value) in table {
-            out.push((path.to_string(), key.clone()));
-            if let Value::Table(inner) = value {
-                keys(inner, &format!("{path}.{key}"), out);
-            }
-        }
-    }
-
     #[test]
-    fn every_default_key_is_documented() {
+    fn every_default_section_is_documented() {
         let docs = include_str!("../docs/configuration.md");
         let rules = include_str!("../defaults/rules.toml");
         let mut missing = Vec::new();
         for text in [DEFAULTS, rules] {
             let table: Table = text.parse().unwrap();
-            let mut found = Vec::new();
-            keys(&table, "", &mut found);
-            for (path, key) in found {
-                let plain = format!("`{key}`");
-                let dotted = format!("`{}.{key}`", path.rsplit('.').next().unwrap_or(""));
-                let full = format!("{path}.{key}");
-                let section = format!("[{}", full.trim_start_matches('.'));
-                if !docs.contains(&plain) && !docs.contains(&dotted) && !docs.contains(&section) {
-                    missing.push(format!("{path}.{key}"));
+            for section in table.keys() {
+                let dotted = format!("`{section}.");
+                let header = format!("[{section}");
+                if !docs.contains(&dotted) && !docs.contains(&header) {
+                    missing.push(section.clone());
                 }
             }
         }

@@ -245,3 +245,116 @@ async fn review_merges_confirms_rejects_and_quits() {
     assert_eq!(tally, zontologize::review::MergeTally::default());
     env.finish().await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn a_second_writer_stops_and_leaves_the_running_run() {
+    let env = setup("writer").await;
+    let lock = zontologize::db::runs::lock(Some(&common::test_url()), &env.schema)
+        .await
+        .unwrap();
+    let (run_id, _) = zontologize::db::runs::start(&env.pool, "held")
+        .await
+        .unwrap();
+    let error = zontologize::resolve::run(Some(&env.config()), Some(&common::test_url()))
+        .await
+        .err()
+        .unwrap();
+    assert!(format!("{error:#}").contains("another zontologize run is writing"));
+    let status: String = sqlx::query_scalar("select status from runs where id = $1")
+        .bind(run_id)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "running");
+    lock.release().await;
+    resolve(&env).await;
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn an_embedding_link_the_search_misses_is_kept_while_it_scores() {
+    let env = Env::new("resolve_stable").await;
+    env.copy_acme_rules();
+    env.write_config(&format!(
+        "[resolve]\nmax_candidates = 1\n{}{}",
+        folder_source("projects", &repo("tests/fixtures/acme/projects"), "current"),
+        folder_source("archive", &repo("tests/fixtures/acme/archive"), "legacy")
+    ));
+    env.scan().await;
+    env.embed(
+        "local:arctic-embed-m-v2.0",
+        FakeEmbed::new(8),
+        &zontologize::embed::run::Options::default(),
+    )
+    .await;
+    let set = |vector: &'static str, id: Option<i64>| {
+        let pool = env.pool.clone();
+        async move {
+            sqlx::query(
+                "update embeddings set embedding = $1::halfvec \
+                 where owner_kind = 'entity' and ($2::bigint is null or owner_id = $2)",
+            )
+            .bind(vector)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    set("[1,0,0,0,0,0,0,0]", None).await;
+    resolve(&env).await;
+    let (link, b): (i64, i64) = sqlx::query_as(
+        "select r.id, r.dst_id from relations r \
+         join entities a on a.id = r.src_id join entities b on b.id = r.dst_id \
+         where r.method = 'resolve:embed' and a.class_iri = b.class_iri \
+         and (select count(*) from entities c where c.class_iri = a.class_iri) >= 3 \
+         order by r.id limit 1",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    set("[0.95,0.31,0,0,0,0,0,0]", Some(b)).await;
+    resolve(&env).await;
+    let kept = env
+        .count(&format!("select count(*) from relations where id = {link}"))
+        .await;
+    assert_eq!(kept, 1);
+    set("[0,1,0,0,0,0,0,0]", Some(b)).await;
+    resolve(&env).await;
+    let kept = env
+        .count(&format!("select count(*) from relations where id = {link}"))
+        .await;
+    assert_eq!(kept, 0);
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_rules_rerun_keeps_links_and_reviews() {
+    let env = setup("resolve_rerun").await;
+    resolve(&env).await;
+    let links = "select count(*) from relations where method like 'resolve:%'";
+    let before = env.count(links).await;
+    assert!(before > 0);
+    sqlx::query(
+        "update relations set status = 'confirmed' \
+         where id = (select min(id) from relations where method = 'resolve:fuzzy')",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    let rules = env.config().join("rules.toml");
+    let text = std::fs::read_to_string(&rules).unwrap();
+    std::fs::write(&rules, format!("{text}\n# changed\n")).unwrap();
+    let stats = env.scan().await;
+    assert!(common::stage(&stats, "rules") > 0);
+    assert_eq!(env.count(links).await, before);
+    assert_eq!(
+        env.count("select count(*) from relations where status = 'confirmed'")
+            .await,
+        1
+    );
+    env.finish().await;
+}

@@ -1,5 +1,7 @@
 [database]
 schema = "zontologize"
+graph = "zontologize_graph"
+api_schema = "zontologize_api"
 max_connections = 8
 
 [extract]

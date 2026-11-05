@@ -4,6 +4,14 @@ use sqlx::PgPool;
 use super::copy_row;
 use crate::ontology::Ontology;
 
+pub const CURRENT: &str = "select v.id from ontology_versions v join runs r on r.id = v.last_run_id \
+     where r.status = 'finished' order by r.id desc limit 1";
+
+pub async fn current(pool: &PgPool) -> Result<Option<i64>> {
+    let id = sqlx::query_scalar(CURRENT).fetch_optional(pool).await?;
+    Ok(id)
+}
+
 pub async fn store(pool: &PgPool, ontology: &Ontology, run_id: i64) -> Result<(i64, bool)> {
     let existing: Option<i64> =
         sqlx::query_scalar("select id from ontology_versions where sha256 = $1")
@@ -11,12 +19,17 @@ pub async fn store(pool: &PgPool, ontology: &Ontology, run_id: i64) -> Result<(i
             .fetch_optional(pool)
             .await?;
     if let Some(id) = existing {
+        sqlx::query("update ontology_versions set last_run_id = $2 where id = $1")
+            .bind(id)
+            .bind(run_id)
+            .execute(pool)
+            .await?;
         return Ok((id, false));
     }
     let mut tx = pool.begin().await?;
     let id: i64 = sqlx::query_scalar(
-        "insert into ontology_versions (sha256, files, loaded_run_id) values ($1, $2, $3) \
-         returning id",
+        "insert into ontology_versions (sha256, files, loaded_run_id, last_run_id) \
+         values ($1, $2, $3, $3) returning id",
     )
     .bind(&ontology.version)
     .bind(sqlx::types::Json(&ontology.files))
@@ -109,4 +122,83 @@ mod tests {
             "{\"a\",\"b\\\"c\"}"
         );
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct ClassRow {
+    iri: String,
+    parents: Vec<String>,
+    types: Vec<String>,
+    labels: sqlx::types::Json<crate::ontology::LangMap<String>>,
+    alt_labels: sqlx::types::Json<crate::ontology::LangMap<Vec<String>>>,
+    definition: sqlx::types::Json<crate::ontology::LangMap<String>>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PropertyRow {
+    iri: String,
+    kind: String,
+    domain: Vec<String>,
+    range: Vec<String>,
+    parents: Vec<String>,
+    labels: sqlx::types::Json<crate::ontology::LangMap<String>>,
+}
+
+pub struct Stored {
+    pub sha256: String,
+    pub classes: Vec<crate::ontology::Class>,
+    pub properties: Vec<crate::ontology::Property>,
+}
+
+pub async fn selected(pool: &PgPool, version_id: i64) -> Result<Stored> {
+    let sha256 = sqlx::query_scalar("select sha256 from ontology_versions where id = $1")
+        .bind(version_id)
+        .fetch_one(pool)
+        .await?;
+    let classes: Vec<ClassRow> = sqlx::query_as(
+        "select iri, parents, types, labels, alt_labels, definition from classes \
+         where ontology_version_id = $1 and selected order by iri",
+    )
+    .bind(version_id)
+    .fetch_all(pool)
+    .await?;
+    let properties: Vec<PropertyRow> = sqlx::query_as(
+        "select iri, kind, domain, range, parents, labels from properties \
+         where ontology_version_id = $1 and selected order by iri",
+    )
+    .bind(version_id)
+    .fetch_all(pool)
+    .await?;
+    let classes = classes
+        .into_iter()
+        .map(|row| crate::ontology::Class {
+            iri: row.iri,
+            parents: row.parents,
+            types: row.types,
+            labels: row.labels.0,
+            alt_labels: row.alt_labels.0,
+            definition: row.definition.0,
+            selected: true,
+            meta: false,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for row in properties {
+        let kind = crate::ontology::PropertyKind::parse(&row.kind)
+            .ok_or_else(|| anyhow::anyhow!("property {} has unknown kind {}", row.iri, row.kind))?;
+        out.push(crate::ontology::Property {
+            iri: row.iri,
+            kind,
+            domain: row.domain,
+            range: row.range,
+            parents: row.parents,
+            labels: row.labels.0,
+            selected: true,
+        });
+    }
+    Ok(Stored {
+        sha256,
+        classes,
+        properties: out,
+    })
 }

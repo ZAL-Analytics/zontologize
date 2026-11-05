@@ -438,3 +438,25 @@ async fn file_that_times_out_next_to_others_is_retried_alone_once() {
     assert!(error.contains("timed out"), "{error}");
     env.finish().await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn the_current_ontology_follows_the_last_finished_scan() {
+    let env = Env::new("current_ontology").await;
+    env.write_config(&folder_source("projects", &env.data(), "current"));
+    env.file("a.txt", "some text");
+    env.scan().await;
+    let first = zontologize::db::ontology::current(&env.pool).await.unwrap();
+    let path = env.config().join("zontologize.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let english = text.replace("languages = [\"en\", \"nl\"]", "languages = [\"en\"]");
+    std::fs::write(&path, &english).unwrap();
+    env.scan().await;
+    let second = zontologize::db::ontology::current(&env.pool).await.unwrap();
+    assert_ne!(first, second);
+    std::fs::write(&path, &text).unwrap();
+    env.scan().await;
+    let third = zontologize::db::ontology::current(&env.pool).await.unwrap();
+    assert_eq!(first, third);
+    env.finish().await;
+}

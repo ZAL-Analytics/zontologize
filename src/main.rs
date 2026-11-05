@@ -26,6 +26,8 @@ enum Command {
     Ontology(OntologyCommand),
     #[command(subcommand, about = "Model commands")]
     Models(ModelsCommand),
+    #[command(subcommand, about = "Graph commands")]
+    Graph(GraphCommand),
     #[command(about = "Walk the sources and update documents, text, chunks and rule facts")]
     Scan {
         #[arg(
@@ -67,11 +69,27 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+enum GraphCommand {
+    #[command(about = "Rebuild the AGE graph from entities and relations")]
+    Sync,
+}
+
+#[derive(Debug, Subcommand)]
 enum OntologyCommand {
     #[command(about = "Load the ontology files and report errors, warnings and the selection")]
     Check,
     #[command(about = "Ask the fit model which shortlisted classes a sample of chunks is about")]
     Fit(FitArgs),
+    #[command(about = "Write the selected ontology the facts use as one Turtle file")]
+    Export {
+        #[arg(
+            long,
+            value_name = "FILE",
+            default_value = "ontology.ttl",
+            help = "Turtle file to write"
+        )]
+        out: PathBuf,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -319,6 +337,9 @@ fn main() -> ExitCode {
             Command::Db(DbCommand::Migrate) => zontologize::db_migrate(config).await,
             Command::Db(DbCommand::Check) => zontologize::db_check(config).await,
             Command::Ontology(OntologyCommand::Check) => zontologize::ontology_check(config),
+            Command::Ontology(OntologyCommand::Export { out }) => {
+                zontologize::ontology_export(config, &out).await
+            }
             Command::Ontology(OntologyCommand::Fit(args)) => {
                 let mut options =
                     zontologize::fit::run::Options::new(zontologize::llm::claude_program());
@@ -331,6 +352,7 @@ fn main() -> ExitCode {
                 options.new = args.new;
                 zontologize::ontology_fit(config, &options).await
             }
+            Command::Graph(GraphCommand::Sync) => zontologize::graph_sync(config).await,
             Command::Models(ModelsCommand::Check) => {
                 zontologize::models_check(config, zontologize::llm::claude_program()).await
             }
