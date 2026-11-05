@@ -75,6 +75,7 @@ pub async fn run(config_dir: Option<&Path>, url: Option<&str>) -> Result<Stats> 
     let config = crate::config::load(config_dir)?;
     let ontology = crate::embed::run::load_ontology(config_dir, &config)?;
     let rules = crate::rules::load(config_dir, &ontology, &config.ontology.document_class)?;
+    let _lock = db::runs::lock(url, &config.database.schema).await?;
     let pool = db::pool::connect(url, &config.database.schema, 2).await?;
     let result = run_with(&pool, &config, &ontology, &rules).await;
     pool.close().await;
@@ -208,29 +209,36 @@ async fn embed_pairs(
     }
     let keys: HashMap<i64, &str> = items.iter().map(|e| (e.row.id, e.key.as_str())).collect();
     let ids: Vec<i64> = items.iter().map(|e| e.row.id).collect();
+    let mut found = Vec::new();
     for batch in ids.chunks(NEIGHBOUR_BATCH) {
-        let found = db::resolve::neighbours(
-            pool,
-            model_id,
-            dimensions,
-            batch,
-            config.resolve.max_candidates as i64,
-        )
-        .await?;
-        for (a, b, score) in found {
-            let (Some(ka), Some(kb)) = (keys.get(&a), keys.get(&b)) else {
-                continue;
-            };
-            if score < config.resolve.embed_score || !names::digits_agree(ka, kb) {
-                continue;
-            }
-            let candidate = Candidate {
-                rule: "embed",
-                status: PROPOSED,
-                score,
-            };
-            offer(pairs, a, b, candidate);
+        let k = config.resolve.max_candidates as i64;
+        found.extend(db::resolve::neighbours(pool, model_id, dimensions, batch, k).await?);
+    }
+    let seen: BTreeSet<(i64, i64)> = found
+        .iter()
+        .map(|&(a, b, _)| (a.min(b), a.max(b)))
+        .collect();
+    let missed: Vec<(i64, i64)> = db::resolve::links(pool, SAME_AS)
+        .await?
+        .into_iter()
+        .filter(|l| l.status == PROPOSED && l.method == method("embed"))
+        .map(|l| (l.src_id.min(l.dst_id), l.src_id.max(l.dst_id)))
+        .filter(|key| !seen.contains(key))
+        .collect();
+    found.extend(db::resolve::pair_scores(pool, model_id, dimensions, &missed).await?);
+    for (a, b, score) in found {
+        let (Some(ka), Some(kb)) = (keys.get(&a), keys.get(&b)) else {
+            continue;
+        };
+        if score < config.resolve.embed_score || !names::digits_agree(ka, kb) {
+            continue;
         }
+        let candidate = Candidate {
+            rule: "embed",
+            status: PROPOSED,
+            score,
+        };
+        offer(pairs, a, b, candidate);
     }
     Ok(None)
 }

@@ -186,6 +186,7 @@ pub async fn run(
         );
     }
     let config = &prepared.config;
+    let _lock = db::runs::lock(url, &config.database.schema).await?;
     let pool = db::pool::connect(
         url,
         &config.database.schema,

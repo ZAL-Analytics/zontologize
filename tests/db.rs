@@ -6,7 +6,7 @@ use zontologize::db;
 
 const TEST_URL: &str = "ZONTOLOGIZE_TEST_DATABASE_URL";
 const SCHEMA_PREFIX: &str = "zontologize_test_";
-const TABLES: [&str; 26] = [
+const TABLES: [&str; 27] = [
     "_sqlx_migrations",
     "aliases",
     "chunks",
@@ -19,6 +19,7 @@ const TABLES: [&str; 26] = [
     "embeddings",
     "entities",
     "fact_reviews",
+    "graph_labels",
     "llm_cache",
     "llm_calls",
     "llm_job_items",
@@ -205,4 +206,21 @@ async fn database_without_extensions_names_the_sql() {
         error.contains("create extension if not exists vector;"),
         "{error}"
     );
+}
+
+#[tokio::test]
+#[ignore]
+async fn one_writer_per_schema() {
+    let url = test_url();
+    let first = db::runs::lock(Some(&url), "lock_a").await.unwrap();
+    let error = db::runs::lock(Some(&url), "lock_a").await.err().unwrap();
+    assert!(
+        format!("{error:#}").contains("another zontologize run is writing to schema lock_a"),
+        "{error:#}"
+    );
+    let other = db::runs::lock(Some(&url), "lock_b").await.unwrap();
+    first.release().await;
+    let again = db::runs::lock(Some(&url), "lock_a").await.unwrap();
+    again.release().await;
+    other.release().await;
 }

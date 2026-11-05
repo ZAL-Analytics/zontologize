@@ -71,6 +71,16 @@ impl PropertyKind {
             PropertyKind::Rdf => "rdf",
         }
     }
+
+    pub fn parse(text: &str) -> Option<PropertyKind> {
+        [
+            PropertyKind::Object,
+            PropertyKind::Datatype,
+            PropertyKind::Rdf,
+        ]
+        .into_iter()
+        .find(|kind| kind.as_str() == text)
+    }
 }
 
 #[derive(Debug, Clone)]

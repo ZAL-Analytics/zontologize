@@ -1,3 +1,4 @@
+pub mod api;
 pub mod classify;
 pub mod contents;
 pub mod documents;
@@ -5,6 +6,7 @@ pub mod embed;
 pub mod entities;
 pub mod facts;
 pub mod fit;
+pub mod graph;
 pub mod llm;
 pub mod migrate;
 pub mod ontology;
@@ -65,6 +67,14 @@ pub async fn schema_exists(conn: &mut PgConnection, schema: &str) -> Result<bool
     let exists = sqlx::query_scalar("select exists(select 1 from pg_namespace where nspname = $1)")
         .bind(schema)
         .fetch_one(&mut *conn)
+        .await?;
+    Ok(exists)
+}
+
+pub async fn schema_exists_in(pool: &sqlx::PgPool, schema: &str) -> Result<bool> {
+    let exists = sqlx::query_scalar("select exists(select 1 from pg_namespace where nspname = $1)")
+        .bind(schema)
+        .fetch_one(pool)
         .await?;
     Ok(exists)
 }

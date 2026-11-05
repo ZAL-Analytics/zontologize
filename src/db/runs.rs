@@ -27,3 +27,38 @@ pub async fn finish(pool: &PgPool, id: i64, status: &str, stats: &serde_json::Va
         .await?;
     Ok(())
 }
+
+pub struct WriterLock {
+    conn: Option<sqlx::PgConnection>,
+}
+
+impl WriterLock {
+    pub async fn release(mut self) {
+        if let Some(conn) = self.conn.take() {
+            super::close(conn).await;
+        }
+    }
+}
+
+pub async fn take_lock(conn: &mut sqlx::PgConnection, schema: &str) -> Result<()> {
+    let taken: bool =
+        sqlx::query_scalar("select pg_try_advisory_lock(hashtext('zontologize'), hashtext($1))")
+            .bind(schema)
+            .fetch_one(&mut *conn)
+            .await?;
+    if !taken {
+        anyhow::bail!(
+            "another zontologize run is writing to schema {schema}; try again when it is done"
+        );
+    }
+    Ok(())
+}
+
+pub async fn lock(url: Option<&str>, schema: &str) -> Result<WriterLock> {
+    let mut conn = super::connect(url, schema).await?;
+    if let Err(error) = take_lock(&mut conn, schema).await {
+        super::close(conn).await;
+        return Err(error);
+    }
+    Ok(WriterLock { conn: Some(conn) })
+}

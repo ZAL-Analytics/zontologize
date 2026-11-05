@@ -45,11 +45,26 @@ impl Normaliser {
     }
 }
 
-pub fn digit_tokens(key: &str) -> Vec<&str> {
-    let mut tokens: Vec<&str> = key
-        .split(' ')
-        .filter(|t| t.chars().any(|c| c.is_ascii_digit()))
-        .collect();
+const TAG_PREFIX_CHARS: usize = 3;
+
+pub fn digit_tokens(key: &str) -> Vec<String> {
+    let words: Vec<&str> = key.split(' ').collect();
+    let mut tokens = Vec::new();
+    for (i, word) in words.iter().enumerate() {
+        if !word.chars().any(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let prefix = match i.checked_sub(1).map(|j| words[j]) {
+            Some(before)
+                if before.chars().count() <= TAG_PREFIX_CHARS
+                    && before.chars().all(char::is_alphabetic) =>
+            {
+                before
+            }
+            _ => "",
+        };
+        tokens.push(format!("{prefix}{word}"));
+    }
     tokens.sort_unstable();
     tokens
 }
@@ -139,6 +154,10 @@ mod tests {
         assert!(!digits_agree(&plain("P-101"), &plain("P-102")));
         assert!(digits_agree(&plain("Pump P-101"), &plain("P 101 pump")));
         assert!(digits_agree("acme pumps", "acme pump"));
+        assert!(!digits_agree(&plain("XX-372"), &plain("XY-372")));
+        assert!(digits_agree(&plain("P-101"), &plain("P 101")));
+        assert!(digits_agree(&plain("P-101"), &plain("p101")));
+        assert!(digits_agree(&plain("Pump 101"), &plain("pump 101")));
         let a = plain("Pump P-101");
         let b = plain("Pump P-102");
         assert!(similarity(&a, &b) > 0.9);

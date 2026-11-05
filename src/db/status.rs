@@ -140,3 +140,38 @@ pub async fn last_embed(pool: &PgPool, model_id: i64) -> Result<Option<serde_jso
     .await?;
     Ok(row.map(|j| j.0))
 }
+
+pub async fn last_graph(
+    pool: &PgPool,
+) -> Result<Option<(sqlx::types::Json<serde_json::Value>, DateTime<Utc>)>> {
+    let row = sqlx::query_as(
+        "select stats -> 'graph', finished_at from runs \
+         where status = 'finished' and stats ? 'graph' order by id desc limit 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+pub async fn ontology_version(pool: &PgPool) -> Result<Option<String>> {
+    let sha = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "select sha256 from ontology_versions where id = ({})",
+        super::ontology::CURRENT
+    )))
+    .fetch_optional(pool)
+    .await?;
+    Ok(sha)
+}
+
+pub async fn contract_version(pool: &PgPool, api: &str) -> Result<Option<i32>> {
+    if !super::schema_exists_in(pool, api).await? {
+        return Ok(None);
+    }
+    let version = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "select {}.contract_version()",
+        super::quote_identifier(api)
+    )))
+    .fetch_one(pool)
+    .await?;
+    Ok(Some(version))
+}

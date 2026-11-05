@@ -156,6 +156,10 @@ pub async fn run(
     system.check(&[])?;
     let user = prompt::load(config_dir, "classify-user")?;
     user.check(&USER_VARIABLES)?;
+    let _lock = match options.dry_run {
+        true => None,
+        false => Some(db::runs::lock(url, &config.database.schema).await?),
+    };
     let pool = db::pool::connect(
         url,
         &config.database.schema,

@@ -72,6 +72,7 @@ pub async fn run(config_dir: Option<&Path>, url: Option<&str>, options: &Options
     let model =
         super::model::parse(name, &config.embed.models).map_err(|e| anyhow!("--model: {e}"))?;
     let ontology = load_ontology(config_dir, &config)?;
+    let _lock = db::runs::lock(url, &config.database.schema).await?;
     let pool = db::pool::connect(url, &config.database.schema, 2).await?;
     let result = async {
         let fetched = model.clone();
@@ -105,7 +106,7 @@ pub fn load_ontology(config_dir: Option<&Path>, config: &Config) -> Result<Ontol
     Ok(loaded.ontology)
 }
 
-fn config_hash(config: &Config) -> String {
+pub fn config_hash(config: &Config) -> String {
     hex(&Sha256::digest(format!("{config:?}").as_bytes()))
 }
 

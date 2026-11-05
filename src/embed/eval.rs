@@ -516,6 +516,7 @@ pub async fn run(
         .clone()
         .unwrap_or_else(|| config.llm_extract.seed.clone());
     let size = options.sample.unwrap_or(config.embed.eval_sample);
+    let _lock = db::runs::lock(url, &config.database.schema).await?;
     let pool = db::pool::connect(url, &config.database.schema, 2).await?;
     let result = async {
         let sample = sample(&pool, &config, &ontology, &questions, size, &seed).await?;
