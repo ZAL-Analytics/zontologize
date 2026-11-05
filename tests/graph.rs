@@ -226,7 +226,7 @@ async fn the_views_keep_their_contract() {
     let version = env
         .count(&format!("select {api}.contract_version()::bigint"))
         .await;
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 
     let documents = env
         .count(&format!("select count(*) from {api}.documents"))

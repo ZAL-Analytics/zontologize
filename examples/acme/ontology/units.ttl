@@ -1,0 +1,53 @@
+@prefix acme: <https://example.org/acme#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix qudt: <http://qudt.org/schema/qudt/> .
+@prefix unit: <http://qudt.org/vocab/unit/> .
+@prefix quantitykind: <http://qudt.org/vocab/quantitykind/> .
+@prefix qkdv: <http://qudt.org/vocab/dimensionvector/> .
+
+<https://example.org/acme/units> a owl:Ontology ;
+    rdfs:label "Acme example units, a small hand-written set in the QUDT vocabulary"@en .
+
+quantitykind:Pressure a qudt:QuantityKind ; qudt:hasDimensionVector qkdv:A0E0L-1I0M1H0T-2D0 .
+quantitykind:Power a qudt:QuantityKind ; qudt:hasDimensionVector qkdv:A0E0L2I0M1H0T-3D0 .
+quantitykind:VolumeFlowRate a qudt:QuantityKind ; qudt:hasDimensionVector qkdv:A0E0L3I0M0H0T-1D0 .
+quantitykind:RotationalVelocity a qudt:QuantityKind ; qudt:hasDimensionVector qkdv:A0E0L0I0M0H0T-1D0 .
+quantitykind:Temperature a qudt:QuantityKind ; qudt:hasDimensionVector qkdv:A0E0L0I0M0H1T0D0 .
+quantitykind:Mass a qudt:QuantityKind ; qudt:hasDimensionVector qkdv:A0E0L0I0M1H0T0D0 .
+
+unit:BAR a qudt:Unit ; rdfs:label "bar"@en ; qudt:symbol "bar" ;
+    qudt:conversionMultiplier 100000.0 ; qudt:hasDimensionVector qkdv:A0E0L-1I0M1H0T-2D0 .
+unit:KiloPA a qudt:Unit ; rdfs:label "kilopascal"@en ; qudt:symbol "kPa" ;
+    qudt:conversionMultiplier 1000.0 ; qudt:hasDimensionVector qkdv:A0E0L-1I0M1H0T-2D0 .
+unit:PSI a qudt:Unit ; rdfs:label "pound per square inch"@en ; qudt:symbol "psi" ;
+    qudt:conversionMultiplier 6894.757293168361 ; qudt:hasDimensionVector qkdv:A0E0L-1I0M1H0T-2D0 .
+acme:BAR_G a qudt:Unit ; rdfs:label "bar gauge"@en, "bar overdruk"@nl ; qudt:symbol "barg" ;
+    skos:altLabel "bar(g)", "bar g", "bar ü" ;
+    qudt:conversionMultiplier 100000.0 ; qudt:conversionOffset 1.01325 ;
+    qudt:hasDimensionVector qkdv:A0E0L-1I0M1H0T-2D0 .
+unit:KiloW a qudt:Unit ; rdfs:label "kilowatt"@en ; qudt:symbol "kW" ;
+    qudt:conversionMultiplier 1000.0 ; qudt:hasDimensionVector qkdv:A0E0L2I0M1H0T-3D0 .
+unit:HP a qudt:Unit ; rdfs:label "horsepower"@en, "paardenkracht"@nl ; qudt:symbol "HP" ;
+    skos:altLabel "pk"@nl ;
+    qudt:conversionMultiplier 745.6999 ; qudt:hasDimensionVector qkdv:A0E0L2I0M1H0T-3D0 .
+unit:M3-PER-HR a qudt:Unit ; rdfs:label "cubic metre per hour"@en ; qudt:symbol "m³/h" ;
+    skos:altLabel "m3/hr", "m3/uur"@nl ;
+    qudt:conversionMultiplier 0.0002777777777777778 ;
+    qudt:hasDimensionVector qkdv:A0E0L3I0M0H0T-1D0 .
+unit:L-PER-MIN a qudt:Unit ; rdfs:label "litre per minute"@en ; qudt:symbol "L/min" ;
+    skos:altLabel "l/min" ;
+    qudt:conversionMultiplier 0.00001666666666666667 ;
+    qudt:hasDimensionVector qkdv:A0E0L3I0M0H0T-1D0 .
+unit:REV-PER-MIN a qudt:Unit ; rdfs:label "revolution per minute"@en ; qudt:symbol "rev/min" ;
+    skos:altLabel "rpm", "omw/min"@nl ;
+    qudt:conversionMultiplier 0.10471975511965977 ;
+    qudt:hasDimensionVector qkdv:A0E0L0I0M0H0T-1D0 .
+unit:DEG_C a qudt:Unit ; rdfs:label "degree Celsius"@en ; qudt:symbol "°C" ;
+    qudt:conversionMultiplier 1.0 ; qudt:conversionOffset 273.15 ;
+    qudt:hasDimensionVector qkdv:A0E0L0I0M0H1T0D0 .
+unit:KiloGM a qudt:Unit ; rdfs:label "kilogram"@en ; qudt:symbol "kg" ;
+    qudt:conversionMultiplier 1.0 ; qudt:hasDimensionVector qkdv:A0E0L0I0M1H0T0D0 .
+unit:TONNE a qudt:Unit ; rdfs:label "tonne"@en ; qudt:symbol "t" ; skos:altLabel "ton"@nl ;
+    qudt:conversionMultiplier 1000.0 ; qudt:hasDimensionVector qkdv:A0E0L0I0M1H0T0D0 .

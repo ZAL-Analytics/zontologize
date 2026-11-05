@@ -25,6 +25,7 @@ pub struct Config {
     pub budget: BudgetConfig,
     pub fit: FitConfig,
     pub llm_extract: LlmExtractConfig,
+    pub attributes: AttributesConfig,
     pub classify: ClassifyConfig,
     pub review: ReviewConfig,
     pub embed: EmbedConfig,
@@ -39,6 +40,7 @@ pub struct ModelsConfig {
     pub fit: String,
     pub extract: String,
     pub classify: String,
+    pub attributes: String,
     pub embed: String,
     pub chars_per_token: f64,
 }
@@ -70,6 +72,28 @@ pub struct ResolveConfig {
     pub max_block: usize,
     pub block_chars: usize,
     pub classes: Vec<String>,
+    pub similar: SimilarConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimilarConfig {
+    pub property: String,
+    pub tolerance: f64,
+    pub min_shared: usize,
+    pub min_score: f64,
+    pub max_links: usize,
+    pub weights: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttributesConfig {
+    pub confidence: f64,
+    pub max_text_chars: usize,
+    pub max_properties: usize,
+    pub context_chars: usize,
+    pub out: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -575,6 +599,7 @@ fn check_models(config: &Config) -> Result<(), String> {
         ("fit", &config.models.fit),
         ("extract", &config.models.extract),
         ("classify", &config.models.classify),
+        ("attributes", &config.models.attributes),
     ];
     for (key, name) in models {
         if !name.is_empty() {
@@ -638,11 +663,45 @@ fn check_models(config: &Config) -> Result<(), String> {
         ("llm_extract.min_letter_share", extract.min_letter_share),
         ("llm_extract.min_ocr_confidence", extract.min_ocr_confidence),
         ("classify.confidence", config.classify.confidence),
+        ("attributes.confidence", config.attributes.confidence),
+        (
+            "resolve.similar.min_score",
+            config.resolve.similar.min_score,
+        ),
     ];
     for (key, value) in shares {
         if !(0.0..=1.0).contains(&value) {
             return Err(format!("{key} must be between 0 and 1"));
         }
+    }
+    let attributes = &config.attributes;
+    if attributes.max_text_chars == 0 || attributes.max_properties == 0 {
+        return Err(
+            "attributes.max_text_chars and attributes.max_properties must be greater than 0"
+                .to_string(),
+        );
+    }
+    let similar = &config.resolve.similar;
+    if similar.property.is_empty() {
+        return Err("resolve.similar.property must be an IRI".to_string());
+    }
+    if similar.tolerance <= 0.0 || !similar.tolerance.is_finite() {
+        return Err("resolve.similar.tolerance must be greater than 0".to_string());
+    }
+    if similar.min_shared == 0 || similar.max_links == 0 {
+        return Err(
+            "resolve.similar.min_shared and resolve.similar.max_links must be greater than 0"
+                .to_string(),
+        );
+    }
+    if let Some((name, _)) = similar
+        .weights
+        .iter()
+        .find(|(_, w)| !(**w > 0.0 && w.is_finite()))
+    {
+        return Err(format!(
+            "resolve.similar.weights.{name} must be greater than 0"
+        ));
     }
     if config.classify.head_chars == 0 {
         return Err("classify.head_chars must be greater than 0".to_string());
@@ -792,6 +851,26 @@ mod tests {
         assert_eq!(config.llm_extract.min_chars, 200);
         assert_eq!(config.llm_extract.out, "extract");
         assert_eq!(config.classify.head_chars, 1500);
+        assert_eq!(config.models.attributes, "claude-code:sonnet");
+        assert_eq!(config.attributes.context_chars, 400);
+        assert_eq!(config.resolve.similar.property, "urn:zontologize#similarTo");
+        assert_eq!(config.resolve.similar.min_shared, 2);
+        let dir = dir_with(
+            "[resolve.similar.weights]
+\"acme:speed\" = 0\n",
+        );
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(
+            message.contains("resolve.similar.weights.acme:speed"),
+            "{message}"
+        );
+        let dir = dir_with("[resolve.similar]\nweights = { \"acme:speed\" = 2.0 }\n");
+        let config = load_from(Some(dir.path()), vars(&[])).unwrap();
+        assert_eq!(config.resolve.similar.weights["acme:speed"], 2.0);
+        assert_eq!(config.resolve.similar.max_links, 5);
+        let dir = dir_with("[attributes]\nconfidence = 2.0\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("attributes.confidence"), "{message}");
         let dir = dir_with("[models]\nclassify = \"local:x\"\n");
         let message = error(load_from(Some(dir.path()), vars(&[])));
         assert!(message.contains("models.classify"), "{message}");

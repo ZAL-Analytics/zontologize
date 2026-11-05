@@ -6,9 +6,10 @@ use zontologize::db;
 
 const TEST_URL: &str = "ZONTOLOGIZE_TEST_DATABASE_URL";
 const SCHEMA_PREFIX: &str = "zontologize_test_";
-const TABLES: [&str; 27] = [
+const TABLES: [&str; 29] = [
     "_sqlx_migrations",
     "aliases",
+    "attributes",
     "chunks",
     "class_embeddings",
     "class_mentions",
@@ -34,6 +35,7 @@ const TABLES: [&str; 27] = [
     "runs",
     "segments",
     "sources",
+    "units",
 ];
 
 fn all_versions() -> Vec<i64> {

@@ -940,7 +940,8 @@ async fn rules_stage(
         println!("rules: facts cleared for {unlisted} contents that no present file uses");
     }
     if documents_todo + contents_todo > 0 {
-        let stale = entities::delete_unselected(pool, version_id).await?;
+        let similar = prepared.config.resolve.similar.property.as_str();
+        let stale = entities::delete_unselected(pool, version_id, similar).await?;
         if stale > 0 {
             println!(
                 "rules: {stale} facts removed whose class or property the ontology no longer selects"

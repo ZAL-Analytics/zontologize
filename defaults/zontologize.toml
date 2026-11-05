@@ -77,6 +77,7 @@ text_search = "simple"
 fit = "claude-code:sonnet"
 extract = "claude-code:sonnet"
 classify = "claude-code:haiku"
+attributes = "claude-code:sonnet"
 embed = "local:arctic-embed-m-v2.0"
 chars_per_token = 2.0
 
@@ -128,6 +129,13 @@ confidence = 0.7
 resend_share = 0.2
 min_evidence = 3
 out = "extract"
+
+[attributes]
+confidence = 0.7
+max_text_chars = 120
+max_properties = 30
+context_chars = 400
+out = "attributes"
 
 [classify]
 head_chars = 1500
@@ -224,3 +232,11 @@ max_candidates = 5
 max_block = 1000
 block_chars = 4
 classes = []
+
+[resolve.similar]
+property = "urn:zontologize#similarTo"
+tolerance = 0.2
+min_shared = 2
+min_score = 0.8
+max_links = 5
+weights = {}

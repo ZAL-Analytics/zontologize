@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-const BUILT_IN: [(&str, &str); 6] = [
+const BUILT_IN: [(&str, &str); 8] = [
     ("fit-system", include_str!("../../prompts/fit-system.md")),
     ("fit-user", include_str!("../../prompts/fit-user.md")),
     (
@@ -20,6 +20,14 @@ const BUILT_IN: [(&str, &str); 6] = [
     (
         "classify-user",
         include_str!("../../prompts/classify-user.md"),
+    ),
+    (
+        "attributes-system",
+        include_str!("../../prompts/attributes-system.md"),
+    ),
+    (
+        "attributes-user",
+        include_str!("../../prompts/attributes-user.md"),
     ),
 ];
 

@@ -12,6 +12,7 @@ const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
 const OWL: &str = "http://www.w3.org/2002/07/owl#";
 const SKOS: &str = "http://www.w3.org/2004/02/skos/core#";
 const DCTERMS: &str = "http://purl.org/dc/terms/";
+const QUDT: &str = "http://qudt.org/schema/qudt/";
 const ONTOLOGY_IRI: &str = "urn:zontologize:ontology";
 
 pub async fn run(config_dir: Option<&std::path::Path>, url: Option<&str>) -> Result<String> {
@@ -46,6 +47,7 @@ pub fn turtle(stored: &Stored) -> Result<String> {
         ("owl", OWL),
         ("skos", SKOS),
         ("dcterms", DCTERMS),
+        ("qudt", QUDT),
     ] {
         serializer = serializer.with_prefix(prefix, iri)?;
     }
@@ -134,6 +136,86 @@ pub fn turtle(stored: &Stored) -> Result<String> {
                 &property.iri,
                 &format!("{SKOS}prefLabel"),
                 Value::Text(label.clone(), lang.clone()),
+            )?;
+        }
+        for (lang, labels) in &property.alt_labels {
+            for label in labels {
+                add(
+                    &property.iri,
+                    &format!("{SKOS}altLabel"),
+                    Value::Text(label.clone(), lang.clone()),
+                )?;
+            }
+        }
+        if let Some(kind) = &property.quantity_kind {
+            add(
+                &property.iri,
+                &format!("{QUDT}hasQuantityKind"),
+                Value::Node(kind.clone()),
+            )?;
+        }
+        if let Some(tolerance) = property.tolerance {
+            add(
+                &property.iri,
+                crate::ontology::TOLERANCE,
+                Value::Text(tolerance.to_string(), String::new()),
+            )?;
+        }
+    }
+    let mut kinds = std::collections::BTreeMap::new();
+    for property in &stored.properties {
+        if let (Some(kind), Some(dimension)) = (&property.quantity_kind, &property.dimension) {
+            kinds.insert(kind.clone(), dimension.clone());
+        }
+    }
+    for (kind, dimension) in kinds {
+        add(&kind, &a, Value::Node(format!("{QUDT}QuantityKind")))?;
+        add(
+            &kind,
+            &format!("{QUDT}hasDimensionVector"),
+            Value::Node(dimension),
+        )?;
+    }
+    for unit in &stored.units {
+        add(&unit.iri, &a, Value::Node(format!("{QUDT}Unit")))?;
+        for symbol in &unit.symbols {
+            add(
+                &unit.iri,
+                &format!("{QUDT}symbol"),
+                Value::Text(symbol.clone(), String::new()),
+            )?;
+        }
+        for (lang, label) in &unit.labels {
+            add(
+                &unit.iri,
+                &format!("{RDFS}label"),
+                Value::Text(label.clone(), lang.clone()),
+            )?;
+        }
+        for (lang, labels) in &unit.alt_labels {
+            for label in labels {
+                add(
+                    &unit.iri,
+                    &format!("{SKOS}altLabel"),
+                    Value::Text(label.clone(), lang.clone()),
+                )?;
+            }
+        }
+        add(
+            &unit.iri,
+            &format!("{QUDT}hasDimensionVector"),
+            Value::Node(unit.dimension.clone()),
+        )?;
+        add(
+            &unit.iri,
+            &format!("{QUDT}conversionMultiplier"),
+            Value::Text(unit.multiplier.to_string(), String::new()),
+        )?;
+        if unit.offset != 0.0 {
+            add(
+                &unit.iri,
+                &format!("{QUDT}conversionOffset"),
+                Value::Text(unit.offset.to_string(), String::new()),
             )?;
         }
     }

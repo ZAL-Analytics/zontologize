@@ -49,6 +49,10 @@ enum Command {
     Classify(JobArgs),
     #[command(about = "Send chunks to the extract model and write the facts it finds")]
     Extract(ExtractArgs),
+    #[command(
+        about = "Send chunks with a value and a unit to the attributes model and write the values it finds"
+    )]
+    Attributes(AttributesArgs),
     #[command(about = "Embed chunks, entities and classes with the local embedding model")]
     Embed(EmbedArgs),
     #[command(
@@ -189,6 +193,31 @@ struct ExtractArgs {
         help = "Seed of the sample (default [llm_extract] seed)"
     )]
     seed: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct AttributesArgs {
+    #[command(flatten)]
+    job: JobArgs,
+    #[arg(
+        long,
+        help = "Send again even when more than [llm_extract] resend_share of the chunks changed"
+    )]
+    yes: bool,
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Send a spread sample of N chunks instead of every eligible chunk"
+    )]
+    sample: Option<usize>,
+    #[arg(
+        long,
+        value_name = "SEED",
+        help = "Seed of the sample (default [llm_extract] seed)"
+    )]
+    seed: Option<String>,
+    #[arg(long, help = "Only chunks the extract model has already answered")]
+    extracted: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -368,6 +397,14 @@ fn main() -> ExitCode {
                 options.seed = args.seed;
                 zontologize::extract(config, &options).await
             }
+            Command::Attributes(args) => {
+                let mut options = args.job.options();
+                options.yes = args.yes;
+                options.sample = args.sample;
+                options.seed = args.seed;
+                options.extracted = args.extracted;
+                zontologize::attributes(config, &options).await
+            }
             Command::Embed(args) => {
                 let options = zontologize::embed::run::Options {
                     model: args.model,
@@ -526,6 +563,24 @@ mod tests {
         };
         assert_eq!(args.job.max_requests, Some(5));
         assert!(args.yes && args.job.no_wait && !args.job.dry_run);
+    }
+
+    #[test]
+    fn parses_attributes() {
+        let cli = Cli::try_parse_from([
+            "zontologize",
+            "attributes",
+            "--extracted",
+            "--sample",
+            "100",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Command::Attributes(args) = cli.command else {
+            panic!("not attributes");
+        };
+        assert!(args.extracted && args.job.dry_run && !args.yes);
+        assert_eq!(args.sample, Some(100));
     }
 
     #[test]

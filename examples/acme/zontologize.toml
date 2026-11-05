@@ -20,7 +20,7 @@ languages = ["nl", "en"]
 model_tier = "small"
 
 [ontology]
-files = ["ontology/acme.ttl"]
+files = ["ontology/acme.ttl", "ontology/units.ttl"]
 languages = ["en", "nl"]
 include = ["acme:Organisation", "acme:Site", "acme:Project", "acme:Procedure", "acme:Equipment", "acme:Document"]
 exclude = []
@@ -64,6 +64,7 @@ text_search = "simple"
 fit = "claude-code:sonnet"
 extract = "claude-code:sonnet"
 classify = "claude-code:haiku"
+attributes = "claude-code:sonnet"
 embed = "local:multilingual-e5-small"
 # fit = "claude-code:haiku"
 # fit = "openrouter:anthropic/claude-haiku-5.5"
@@ -119,6 +120,13 @@ resend_share = 0.2
 min_evidence = 1
 out = "extract"
 
+[attributes]
+confidence = 0.7
+max_text_chars = 120
+max_properties = 30
+context_chars = 400
+out = "attributes"
+
 [classify]
 head_chars = 1500
 min_chars = 50
@@ -165,6 +173,14 @@ max_candidates = 5
 max_block = 1000
 block_chars = 4
 classes = []
+
+[resolve.similar]
+property = "urn:zontologize#similarTo"
+tolerance = 0.2
+min_shared = 2
+min_score = 0.8
+max_links = 5
+weights = { "acme:ratedPower" = 2.0, "acme:dischargePressure" = 1.0 }
 
 [[sources]]
 name = "projects"

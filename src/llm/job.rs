@@ -38,6 +38,7 @@ pub struct Options {
     pub yes: bool,
     pub sample: Option<usize>,
     pub seed: Option<String>,
+    pub extracted: bool,
     pub backoff: Duration,
 }
 
@@ -53,6 +54,7 @@ impl Options {
             yes: false,
             sample: None,
             seed: None,
+            extracted: false,
             backoff: Duration::from_secs(2),
         }
     }
