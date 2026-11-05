@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use aho_corasick::{AhoCorasick, Anchored, Input, MatchKind, StartKind};
 use anyhow::{Context, Result};
 use regex::Regex;
+use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::ontology::{Ontology, Unit};
@@ -120,6 +121,25 @@ impl<'a> UnitIndex<'a> {
         out.dedup();
         out.truncate(limit);
         out
+    }
+
+    pub fn fingerprint(&self) -> String {
+        let mut hasher = Sha256::new();
+        for ((dimension, text), iris) in &self.exact {
+            for part in [dimension.as_str(), text.as_str()]
+                .into_iter()
+                .chain(iris.iter().copied())
+            {
+                hasher.update(part.as_bytes());
+                hasher.update([0]);
+            }
+        }
+        for unit in self.units.values() {
+            hasher.update(unit.iri.as_bytes());
+            hasher.update(unit.multiplier.to_le_bytes());
+            hasher.update(unit.offset.to_le_bytes());
+        }
+        crate::ontology::hex(&hasher.finalize())
     }
 
     pub fn finder(&self) -> Result<UnitFinder> {

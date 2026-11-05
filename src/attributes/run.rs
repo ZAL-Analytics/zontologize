@@ -38,6 +38,7 @@ struct Setup<'a> {
     user: &'a Prompt,
     name: &'a ModelName,
     threads: usize,
+    check_key: String,
 }
 
 struct Prepared {
@@ -134,6 +135,7 @@ pub async fn run(
         user: &user,
         name: &name,
         threads: config.scan.hash_threads,
+        check_key: super::check_key(&units, config.attributes.max_text_chars),
     };
     let result = run_with(&setup, options).await;
     pool.close().await;
@@ -195,6 +197,7 @@ async fn prepare(setup: &Setup<'_>, ids: &[i64]) -> Result<Vec<Prepared>> {
         units: setup.units,
         languages: &config.ontology.languages,
         max_properties: config.attributes.max_properties,
+        check_key: &setup.check_key,
         system: setup.system,
         user: setup.user,
         model: setup.name,
@@ -465,7 +468,11 @@ async fn run_with(setup: &Setup<'_>, options: &Options) -> Result<Outcome> {
     let started = std::time::Instant::now();
     let plan = plan(setup, options, &seed).await?;
     let (cached, invalid) = split_known(pool, &plan.todo).await?;
-    let resend = plan.todo.iter().filter(|t| t.resend).count();
+    let resend = plan
+        .todo
+        .iter()
+        .filter(|t| t.resend && !cached.contains(&t.cache_key))
+        .count();
     let hits: Vec<i64> = plan
         .todo
         .iter()

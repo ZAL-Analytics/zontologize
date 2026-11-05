@@ -79,6 +79,7 @@ pub struct Context<'a> {
     pub units: &'a UnitIndex<'a>,
     pub languages: &'a [String],
     pub max_properties: usize,
+    pub check_key: &'a str,
     pub system: &'a Prompt,
     pub user: &'a Prompt,
     pub model: &'a ModelName,
@@ -267,9 +268,17 @@ pub fn cache_key(request: &Request, model: &ModelName) -> String {
     hex(&hasher.finalize())
 }
 
-pub fn state_key(cache_key: &str, subjects: &[Subject]) -> String {
+pub fn check_key(units: &UnitIndex, max_text_chars: usize) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(units.fingerprint().as_bytes());
+    hasher.update((max_text_chars as u64).to_le_bytes());
+    hex(&hasher.finalize())
+}
+
+pub fn state_key(cache_key: &str, check_key: &str, subjects: &[Subject]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(cache_key.as_bytes());
+    hasher.update(check_key.as_bytes());
     for subject in subjects {
         hasher.update(subject.entity_id.to_le_bytes());
     }
@@ -328,7 +337,7 @@ pub fn build(context: &Context, input: &ChunkInput, hits: &Hits) -> Option<Built
         schema: schema(&properties, &references),
     };
     let cache_key = cache_key(&request, context.model);
-    let key = state_key(&cache_key, &subjects);
+    let key = state_key(&cache_key, context.check_key, &subjects);
     Some(Built {
         subjects,
         properties,
@@ -435,11 +444,13 @@ pub mod tests {
         let user = crate::llm::prompt::load(None, "attributes-user").unwrap();
         let model = ModelName::parse("claude-code:sonnet").unwrap();
         let languages = vec!["en".to_string(), "nl".to_string()];
+        let check = check_key(&units, 120);
         let context = Context {
             ontology: onto,
             units: &units,
             languages: &languages,
             max_properties: 30,
+            check_key: &check,
             system: &system,
             user: &user,
             model: &model,
@@ -514,6 +525,26 @@ pub mod tests {
         assert!(schema.contains("\"enum\":[\"r1\",\"doc\"]"), "{schema}");
         assert!(!schema.contains("material"));
         assert!(built.request.user.contains("| number | MW, kW, mW |"));
+    }
+
+    #[test]
+    fn a_new_unit_alias_changes_the_key_but_not_the_request() {
+        let pump = subject("r1", 10, "Pump", "P-101");
+        let chunk = input("P-101 power 7,5 kWe", vec![pump], None);
+        let before = built_for(&ontology(), &chunk).unwrap();
+        let config = OntologyConfig {
+            files: Vec::new(),
+            languages: vec!["en".to_string(), "nl".to_string()],
+            include: vec![iri("Asset"), iri("Company"), iri("Document")],
+            exclude: Vec::new(),
+            document_class: String::new(),
+        };
+        let text = format!("{TTL}\nex:kW skos:altLabel \"kWe\" .");
+        let changed =
+            crate::ontology::load_sources(&[("t.ttl".to_string(), text.into())], &config).ontology;
+        let after = built_for(&changed, &chunk).unwrap();
+        assert_eq!(before.cache_key, after.cache_key);
+        assert_ne!(before.key, after.key);
     }
 
     #[test]
