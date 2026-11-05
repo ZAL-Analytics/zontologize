@@ -3,7 +3,7 @@ pub mod common;
 use common::{Env, FakeEmbed, folder_source};
 use zontologize::embed::run::Options;
 
-const DEFAULT: &str = "local:multilingual-e5-base";
+const DEFAULT: &str = "local:arctic-embed-m-v2.0";
 const OTHER: &str = "local:multilingual-e5-small";
 
 const REPORT: &str = "Inspection report for the north site. The booster pump showed wear on the \
@@ -42,13 +42,6 @@ async fn embed_is_incremental_and_skips_junk() {
         .filter(|t| t.contains("booster pump"))
         .count();
     assert_eq!(report_calls, 1);
-    assert!(
-        texts
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|t| t.starts_with("passage: "))
-    );
     assert_eq!(
         env.count("select count(*) from embeddings where owner_kind = 'chunk'")
             .await,
@@ -143,7 +136,7 @@ async fn an_alias_change_re_embeds_that_entity_only() {
     assert_eq!(stats.entities.embedded, 1, "{stats:?}");
     assert_eq!(
         texts.lock().unwrap().as_slice(),
-        ["passage: Acme Pumps (customer); Acme"]
+        ["Acme Pumps (customer); Acme"]
     );
     env.finish().await;
 }

@@ -780,7 +780,7 @@ mod tests {
     #[test]
     fn embed_models_are_checked_and_merge_key_by_key() {
         let config = load_from(None, vars(&[])).unwrap();
-        assert_eq!(config.models.embed, "local:multilingual-e5-base");
+        assert_eq!(config.models.embed, "local:arctic-embed-m-v2.0");
         assert_eq!(config.embed.models.len(), 5);
         assert!(config.embed.threads >= 1);
         let e5 = &config.embed.models["multilingual-e5-base"];

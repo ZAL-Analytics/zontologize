@@ -1,41 +1,15 @@
 # zontologize
 
-A Rust CLI that indexes folders into PostgreSQL, shaped by an ontology.
+A Rust CLI that indexes folders into PostgreSQL, shaped by an OWL ontology (Turtle). It stores
+documents, pages, chunks, entities, relations and the provenance of every fact in its own schema.
+Runs are incremental: only changed files and stages are processed. CPU only.
 
-Point it at one or more folders and an OWL ontology (Turtle). It fills its own schema with
-documents, pages, text chunks, entities, relations and the provenance of every fact (file, page,
-chunk, method, confidence), and mirrors entities and relations into an Apache AGE graph. Apps
-read the database for search, RAG and agents.
-
-It is built for large folders that are re-indexed on a schedule. Each run is an incremental
-snapshot: only files and stages that changed are processed. For now CPU only with GPU planned for LLM extraction and embeddings.
-
-## Status
-
-Early development.
-
-## Planned features
-
-- **Ontology fit.** Start from a public reference model (for example CFIHOS or ISO 14224
-  extracts), let `ontology fit` report which classes the documents use and propose subclasses
-  and aliases.
-- **Scan.** Walk, hash (sha256), extract text per page with `xberg`, OCR scans, chunk, and full-text index.
-- **Rules first.** Path rules, ID patterns and gazetteers create entities and relations without a
-  model.
-- **LLM extraction.** Claude Code, OpenRouter or Ollama, with a JSON schema built
-  from the ontology. Output is validated against domain and range rules; responses are cached
-  and runs have budget caps.
-- **Embeddings and resolution.** pgvector embeddings for chunks, entities and class labels;
-  duplicate entities merged by keys, aliases and similarity.
-- **Graph and export.** AGE graph sync, Turtle export of the fitted ontology, and a stable views
-  schema for consumers that shows complete runs only.
-- **Attributes and units.** Numeric attributes normalised to SI units.
+Status: early development.
 
 ## Requirements
 
-- Rust stable (edition 2024)
-- PostgreSQL 18 with the `vector` (0.8+) and `age` (1.8+) extensions installed
-- cmake and a C++ compiler; network access on first build. 
+- Rust stable (edition 2024), cmake and a C++ compiler
+- PostgreSQL 18 with the `vector` (0.8+) and `age` (1.8+) extensions
 
 ## Setup
 
@@ -43,50 +17,49 @@ Early development.
 cargo build --release
 ```
 
-zontologize never creates extensions. Prepare the database once as a superuser:
+Create the extensions once as a superuser (zontologize never does this itself):
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS age;
 ```
 
-The connection comes from `DATABASE_URL` or the standard libpq variables (`PGHOST`, `PGUSER`,
-`PGPASSWORD`, `PGDATABASE`, ...). Then create the schema:
+Set `DATABASE_URL` (or the `PG*` variables), then create the schema:
 
 ```sh
 zontologize --config my-config db migrate
 zontologize --config my-config db check
 ```
 
-## Configuration
+## Config
 
-Everything organisation-specific lives in a config directory outside this repo
-(`--config <dir>` or `ZONTOLOGIZE_CONFIG`). Every file is optional; missing files use the
-built-in defaults in `defaults/`. See `examples/acme/` for a complete made-up example.
+A config directory (`--config DIR` or `ZONTOLOGIZE_CONFIG`) holds everything specific to your
+data. All files are optional; see `examples/acme/` for a complete example and
+[docs/configuration.md](docs/configuration.md) for every setting.
 
 ```
 my-config/
-  zontologize.toml   database, sources, ontology selection, OCR, models, budgets
-  ontology/*.ttl     reference ontology and local extensions
-  rules.toml         path rules, ID patterns, ignore lists
+  zontologize.toml   database, sources, ontology, OCR, models, budgets
+  rules.toml         path rules, ID patterns, document types
+  ontology/*.ttl     ontology files
   gazetteer/*.csv    known entities and aliases
-  prompts/*.md       replacements for built-in prompts
+  prompts/*.md       prompt overrides
 ```
 
-## Intended use
-
-Run it from cron or a job queue against the same config directory:
+## Run
 
 ```sh
-zontologize --config my-config ontology check     # validate the ontology
-zontologize --config my-config scan               # index new and changed files
-zontologize --config my-config ontology fit       # report and proposals, reviewed by a person
-zontologize --config my-config extract            # LLM extraction for what rules missed
-zontologize --config my-config embed
-zontologize --config my-config resolve
-zontologize --config my-config graph sync
+zontologize --config my-config ontology check   # validate the ontology
+zontologize --config my-config scan             # index new and changed files
+zontologize --config my-config ontology fit     # propose ontology changes for review
+zontologize --config my-config classify         # document types rules missed
+zontologize --config my-config extract          # LLM extraction
+zontologize --config my-config embed            # local embeddings, see docs/embeddings.md
+zontologize --config my-config resolve          # merge duplicates, link documents
 zontologize --config my-config status
 ```
+
+Each command has `--help`.
 
 ## License
 

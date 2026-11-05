@@ -75,7 +75,7 @@ text_search = "simple"
 fit = "claude-code:sonnet"
 extract = "claude-code:sonnet"
 classify = "claude-code:haiku"
-embed = "local:multilingual-e5-base"
+embed = "local:arctic-embed-m-v2.0"
 chars_per_token = 2.0
 
 [providers.claude-code]

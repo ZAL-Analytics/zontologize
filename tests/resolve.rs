@@ -141,7 +141,7 @@ async fn documents_get_reference_and_revision_links() {
 async fn embedding_matches_are_proposed() {
     let env = setup("resolve_embed").await;
     env.embed(
-        "local:multilingual-e5-base",
+        "local:arctic-embed-m-v2.0",
         FakeEmbed::new(8),
         &zontologize::embed::run::Options::default(),
     )
