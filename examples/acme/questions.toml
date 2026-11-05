@@ -1,0 +1,39 @@
+[[questions]]
+text = "What wear was found on the heat exchanger at Eastport?"
+expect = ["Projects/2021/P-2021-0042 Northwind Pumps - Eastport/04 Reports/Inspection report*"]
+
+[[questions]]
+text = "When was the visit to Eastport planned?"
+expect = ["Projects/2021/P-2021-0042 Northwind Pumps - Eastport/01 Correspondence/*"]
+
+[[questions]]
+text = "Which drawing shows the pipe section for project P-2021-0042?"
+expect = ["Projects/2021/P-2021-0042 Northwind Pumps - Eastport/04 Reports/*", "Projects/2021/P-2021-0042 Northwind Pumps - Eastport/01 Correspondence/*"]
+
+[[questions]]
+text = "Did the pressure sensor meet the requirements?"
+expect = ["Projects/2021/P-2021-0042 Northwind Pumps - Eastport/04 Reports/*"]
+
+[[questions]]
+text = "Who installed the booster pump at the north site?"
+expect = ["Projects/2021/P-2021-0042 Northwind Pumps - Eastport/06 Service/*"]
+
+[[questions]]
+text = "Hoeveel kostte het vervangen van de klep in Havenstad?"
+expect = ["Projecten/2022/P-2022-0107 Zuidwal Techniek - Havenstad/05 Facturen/*"]
+
+[[questions]]
+text = "Which seal had to be replaced at Eastport?"
+expect = ["Archief/Scans/2021/Work order P-2021-0042*"]
+
+[[questions]]
+text = "Which customer asked for a quotation after the inspection?"
+expect = ["Projects/2021/P-2021-0042 Northwind Pumps - Eastport/04 Reports/*"]
+
+[[questions]]
+text = "Welke tekening hoort bij de factuur van Zuidwal Techniek?"
+expect = ["Projecten/2022/P-2022-0107 Zuidwal Techniek - Havenstad/05 Facturen/*"]
+
+[[questions]]
+text = "Was the valve on the cooling line inspected?"
+expect = ["Projects/2021/P-2021-0042 Northwind Pumps - Eastport/01 Correspondence/*", "Projects/2021/P-2021-0042 Northwind Pumps - Eastport/06 Service/*"]

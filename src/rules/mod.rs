@@ -50,6 +50,39 @@ struct RulesFile {
     #[serde(default)]
     page_types: Vec<pages::PageTypeSpec>,
     pages: Option<pages::PagesSpec>,
+    #[serde(default)]
+    revisions: Vec<RevisionSpec>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RevisionOrder {
+    #[default]
+    Natural,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevisionSpec {
+    pattern: String,
+    #[serde(default)]
+    order: RevisionOrder,
+}
+
+#[derive(Debug, Clone)]
+pub struct Revision {
+    pub regex: regex::Regex,
+    pub order: RevisionOrder,
+}
+
+impl Revision {
+    pub fn parse<'a>(&self, path: &'a str) -> Option<(&'a str, &'a str)> {
+        let captures = self.regex.captures(path)?;
+        Some((
+            captures.name("series")?.as_str(),
+            captures.name("rev")?.as_str(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +143,7 @@ pub struct Rules {
     pub page_types: pages::PageTypes,
     pub part_property: Option<String>,
     pub lexicon: gazetteer::Lexicon,
+    pub revisions: Vec<Revision>,
 }
 
 pub fn load(config_dir: Option<&Path>, ontology: &Ontology, document_class: &str) -> Result<Rules> {
@@ -233,6 +267,20 @@ pub fn compile(
     )
     .map_err(|e| anyhow::anyhow!("{rules_name}: pages.part_property: {e}"))?;
     let lexicon = gazetteer::Lexicon::build(gazetteer_sources, ontology)?;
+    let mut revisions = Vec::new();
+    for (index, spec) in file.revisions.iter().enumerate() {
+        let regex = regex::Regex::new(&spec.pattern)
+            .map_err(|e| anyhow::anyhow!("{rules_name}: revisions[{index}].pattern: {e}"))?;
+        for group in ["series", "rev"] {
+            if !regex.capture_names().flatten().any(|n| n == group) {
+                bail!("{rules_name}: revisions[{index}].pattern has no named group {group}");
+            }
+        }
+        revisions.push(Revision {
+            regex,
+            order: spec.order,
+        });
+    }
     if path_rules.iter().any(|r| r.uses_document())
         && document_class.is_none()
         && doc_types.is_empty()
@@ -251,6 +299,7 @@ pub fn compile(
         page_types,
         part_property,
         lexicon,
+        revisions,
     })
 }
 
@@ -340,6 +389,13 @@ impl Rules {
             classes,
             rejected,
         }
+    }
+
+    pub fn is_document_class(&self, ontology: &Ontology, iri: &str) -> bool {
+        self.document_class
+            .iter()
+            .chain(self.doc_types.values())
+            .any(|class| ontology.is_a(iri, class))
     }
 
     pub fn document_class_for(&self, doc_type: Option<&str>) -> Option<&str> {
@@ -517,6 +573,29 @@ pub(crate) mod tests {
     fn unknown_doc_type_class_is_an_error() {
         let error = rules("[doc_types]\nreport = \"ex:Nope\"\n").err().unwrap();
         assert!(format!("{error}").contains("doc_types.report"), "{error}");
+    }
+
+    #[test]
+    fn revisions_need_series_and_rev() {
+        let good = rules(
+            "[[revisions]]\npattern = '(?P<series>DWG-\\d+) rev (?P<rev>\\w+)'\norder = \"natural\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            good.revisions[0].parse("a/DWG-12 rev B.pdf"),
+            Some(("DWG-12", "B"))
+        );
+        let error = rules("[[revisions]]\npattern = '(?P<series>DWG-\\d+)'\n")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("rev"), "{error}");
+        let error = rules("[[revisions]]\npattern = '(?P<series>a)(?P<rev>b)'\norder = \"date\"\n")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("natural"), "{error}");
+        assert!(rules("[[revisions]]\npattern = '('\n").is_err());
     }
 
     #[test]

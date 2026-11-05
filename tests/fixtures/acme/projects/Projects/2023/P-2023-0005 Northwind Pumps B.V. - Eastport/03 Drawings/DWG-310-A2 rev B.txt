@@ -1,0 +1,3 @@
+Drawing DWG-310-A2 revision B
+
+Pipe section layout for the cooling line at Eastport. The pipe section is moved two metres north to make room for the new heat exchanger.

@@ -40,13 +40,17 @@ async fn acme_example_end_to_end() {
         .replace(
             "out = \"extract\"",
             &format!("out = \"{}\"", env.dir.join("extract").display()),
+        )
+        .replace(
+            "out = \"eval\"",
+            &format!("out = \"{}\"", env.dir.join("eval").display()),
         );
     std::fs::write(env.config().join("zontologize.toml"), text).unwrap();
 
     let stats = env.scan().await;
-    assert_eq!(stats["sources"]["projects"]["files"].as_u64(), Some(6));
+    assert_eq!(stats["sources"]["projects"]["files"].as_u64(), Some(9));
     assert_eq!(stats["sources"]["archive"]["files"].as_u64(), Some(3));
-    assert_eq!(stage(&stats, "extract"), 7);
+    assert_eq!(stage(&stats, "extract"), 10);
     assert_eq!(
         env.count(
             "select count(*) from documents where status = 'skipped' and sha256 is null \
@@ -146,11 +150,11 @@ async fn acme_example_end_to_end() {
     assert_eq!(stats["sources"]["projects"]["changed"].as_u64(), Some(1));
     assert_eq!(stage(&stats, "extract"), 1);
     assert_eq!(stage(&stats, "chunk"), 1);
-    assert_eq!(stage(&stats, "rules"), 9 + 7);
+    assert_eq!(stage(&stats, "rules"), 12 + 10);
     assert_eq!(
         env.count("select count(*) from documents where doc_type = 'quotation'")
             .await,
-        1
+        2
     );
 
     let stats = env.scan().await;
@@ -218,5 +222,79 @@ async fn acme_example_end_to_end() {
     assert_eq!(outcome, zontologize::llm::job::Outcome::Finished);
     assert_eq!(env.count("select count(*) from llm_calls").await, calls);
     assert_eq!(env.count(model_facts).await, kept);
+
+    if std::env::var("ZONTOLOGIZE_TEST_EMBED_MODEL").is_ok() {
+        embed_resolve_and_review(&env, &url).await;
+    }
     env.finish().await;
+}
+
+async fn embed_resolve_and_review(env: &Env, url: &str) {
+    let config = Some(env.config());
+    let options = zontologize::embed::run::Options::default();
+    let stats = zontologize::embed::run::run(config.as_deref(), Some(url), &options)
+        .await
+        .unwrap();
+    assert!(
+        stats.chunks.embedded > 0 && stats.entities.embedded > 0,
+        "{stats:?}"
+    );
+    assert!(stats.classes.embedded > 0, "{stats:?}");
+    assert_eq!(
+        env.count(
+            "select count(*) from pg_indexes where schemaname = current_schema() \
+             and indexname like 'embeddings_m%'"
+        )
+        .await,
+        2
+    );
+    let eval = zontologize::embed::eval::Options {
+        sample: Some(20),
+        ..Default::default()
+    };
+    let report = zontologize::embed::eval::run(config.as_deref(), Some(url), &eval)
+        .await
+        .unwrap();
+    let report = std::fs::read_to_string(report).unwrap();
+    assert!(report.contains("Question R@10"), "{report}");
+    let stats = zontologize::resolve::run(config.as_deref(), Some(url))
+        .await
+        .unwrap();
+    assert!(stats.embed_skipped.is_none(), "{stats:?}");
+    let canonical: Vec<Option<i64>> = sqlx::query_scalar(
+        "select distinct canonical_id from entities where name like 'Northwind Pumps%'",
+    )
+    .fetch_all(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(canonical.len(), 1, "{canonical:?}");
+    assert_eq!(
+        env.count(
+            "select count(*) from relations where property_iri = 'http://purl.org/dc/terms/replaces'"
+        )
+        .await,
+        1
+    );
+    let options = zontologize::review::MergeOptions {
+        n: Some(3),
+        class: String::new(),
+        seed: "e2e".to_string(),
+    };
+    let mut input = tokio::io::BufReader::new("y\nn\nq\n".as_bytes());
+    let tally = zontologize::review::merges(config.as_deref(), Some(url), &options, &mut input)
+        .await
+        .unwrap();
+    assert_eq!((tally.confirmed, tally.rejected), (1, 1));
+
+    env.scan().await;
+    let options = zontologize::embed::run::Options::default();
+    let stats = zontologize::embed::run::run(config.as_deref(), Some(url), &options)
+        .await
+        .unwrap();
+    let embedded = stats.chunks.embedded + stats.entities.embedded + stats.classes.embedded;
+    assert_eq!(embedded, 0, "{stats:?}");
+    let stats = zontologize::resolve::run(config.as_deref(), Some(url))
+        .await
+        .unwrap();
+    assert_eq!(stats.written(), 0, "{stats:?}");
 }

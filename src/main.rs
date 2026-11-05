@@ -47,6 +47,14 @@ enum Command {
     Classify(JobArgs),
     #[command(about = "Send chunks to the extract model and write the facts it finds")]
     Extract(ExtractArgs),
+    #[command(about = "Embed chunks, entities and classes with the local embedding model")]
+    Embed(EmbedArgs),
+    #[command(
+        about = "Link entities that are the same thing and documents that name or replace each other"
+    )]
+    Resolve,
+    #[command(subcommand, about = "Evaluation commands")]
+    Eval(EvalCommand),
     #[command(subcommand, about = "Fact review commands")]
     Review(ReviewCommand),
     #[command(about = "Show counts per source, kind and status, recent runs and errors")]
@@ -165,6 +173,55 @@ struct ExtractArgs {
     seed: Option<String>,
 }
 
+#[derive(Debug, clap::Args)]
+struct EmbedArgs {
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Embed with this model (local:<name>) instead of [models] embed"
+    )]
+    model: Option<String>,
+    #[arg(
+        long,
+        value_name = "MINUTES",
+        help = "Stop handing out batches after this many minutes; the next run goes on"
+    )]
+    minutes: Option<u64>,
+    #[arg(long, help = "Do not build the vector index at the end")]
+    no_index: bool,
+    #[arg(
+        long,
+        help = "Delete vectors and records of every model but [models] embed"
+    )]
+    prune: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum EvalCommand {
+    #[command(about = "Compare embedding models on a sample of the own data")]
+    Embed {
+        #[arg(
+            long,
+            value_name = "NAMES",
+            value_delimiter = ',',
+            help = "Models to compare, comma separated (default [models] embed)"
+        )]
+        models: Vec<String>,
+        #[arg(
+            long,
+            value_name = "N",
+            help = "Chunk queries to sample (default [embed] eval_sample)"
+        )]
+        sample: Option<usize>,
+        #[arg(
+            long,
+            value_name = "SEED",
+            help = "Seed of the sample (default [llm_extract] seed)"
+        )]
+        seed: Option<String>,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum ReviewCommand {
     #[command(about = "Show random facts with their evidence and mark each right or wrong")]
@@ -196,6 +253,28 @@ enum ReviewCommand {
         )]
         seed: Option<String>,
     },
+    #[command(about = "Show proposed links between entities and confirm or reject each")]
+    Merges {
+        #[arg(
+            long,
+            value_name = "N",
+            help = "Links to show (default [review] sample)"
+        )]
+        n: Option<usize>,
+        #[arg(
+            long,
+            value_name = "NAME",
+            default_value = "",
+            help = "Only links of this class (prefixed name or IRI)"
+        )]
+        class: String,
+        #[arg(
+            long,
+            value_name = "SEED",
+            help = "Seed of the draw (default: the current time)"
+        )]
+        seed: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -210,6 +289,13 @@ enum DbCommand {
     Migrate,
     #[command(about = "Show server, extension, schema and migration state")]
     Check,
+}
+
+fn now_seed() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+        .to_string()
 }
 
 const THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
@@ -260,6 +346,28 @@ fn main() -> ExitCode {
                 options.seed = args.seed;
                 zontologize::extract(config, &options).await
             }
+            Command::Embed(args) => {
+                let options = zontologize::embed::run::Options {
+                    model: args.model,
+                    minutes: args.minutes,
+                    no_index: args.no_index,
+                    prune: args.prune,
+                };
+                zontologize::embed(config, &options).await
+            }
+            Command::Resolve => zontologize::resolve(config).await,
+            Command::Eval(EvalCommand::Embed {
+                models,
+                sample,
+                seed,
+            }) => {
+                let options = zontologize::embed::eval::Options {
+                    models,
+                    sample,
+                    seed,
+                };
+                zontologize::eval_embed(config, &options).await
+            }
             Command::Review(ReviewCommand::Sample {
                 n,
                 method,
@@ -270,14 +378,17 @@ fn main() -> ExitCode {
                     n,
                     method,
                     class,
-                    seed: seed.unwrap_or_else(|| {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_nanos())
-                            .to_string()
-                    }),
+                    seed: seed.unwrap_or_else(now_seed),
                 };
                 zontologize::review_sample(config, &options).await
+            }
+            Command::Review(ReviewCommand::Merges { n, class, seed }) => {
+                let options = zontologize::review::MergeOptions {
+                    n,
+                    class,
+                    seed: seed.unwrap_or_else(now_seed),
+                };
+                zontologize::review_merges(config, &options).await
             }
             Command::Status { errors } => zontologize::status(config, errors).await,
             Command::ExtractWorker => zontologize::extract_worker().await,
@@ -402,6 +513,26 @@ mod tests {
             Cli::try_parse_from(["zontologize", "ontology", "fit", "--max-requests", "0"]).is_err()
         );
         assert!(Cli::try_parse_from(["zontologize", "classify", "--max-requests", "1"]).is_ok());
+    }
+
+    #[test]
+    fn parses_embed() {
+        let cli = Cli::try_parse_from([
+            "zontologize",
+            "embed",
+            "--model",
+            "local:x",
+            "--minutes",
+            "30",
+            "--no-index",
+        ])
+        .unwrap();
+        let Command::Embed(args) = cli.command else {
+            panic!("not embed");
+        };
+        assert_eq!(args.model.as_deref(), Some("local:x"));
+        assert_eq!(args.minutes, Some(30));
+        assert!(args.no_index && !args.prune);
     }
 
     #[test]

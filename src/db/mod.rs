@@ -1,6 +1,7 @@
 pub mod classify;
 pub mod contents;
 pub mod documents;
+pub mod embed;
 pub mod entities;
 pub mod facts;
 pub mod fit;
@@ -8,6 +9,7 @@ pub mod llm;
 pub mod migrate;
 pub mod ontology;
 pub mod pool;
+pub mod resolve;
 pub mod review;
 pub mod runs;
 pub mod status;
@@ -20,16 +22,28 @@ use sqlx::{ConnectOptions, Connection};
 
 pub const EXTENSIONS: [&str; 2] = ["vector", "age"];
 
+const VECTOR_PATH: &str = "select set_config('search_path', \
+    current_setting('search_path') || ', ' || quote_ident(n.nspname), false) \
+    from pg_extension e join pg_namespace n on n.oid = e.extnamespace \
+    where e.extname = 'vector' and n.nspname <> all(current_schemas(false))";
+
 pub async fn connect(url: Option<&str>, schema: &str) -> Result<PgConnection> {
     let options = match url {
         Some(url) => PgConnectOptions::from_str(url).context("database URL is not valid")?,
         None => PgConnectOptions::new(),
     };
-    options
+    let mut conn = options
         .options([("search_path", schema)])
         .connect()
         .await
-        .context("cannot connect to PostgreSQL (DATABASE_URL or PG* variables)")
+        .context("cannot connect to PostgreSQL (DATABASE_URL or PG* variables)")?;
+    add_vector_path(&mut conn).await?;
+    Ok(conn)
+}
+
+pub async fn add_vector_path(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::query(VECTOR_PATH).execute(&mut *conn).await?;
+    Ok(())
 }
 
 pub async fn server_version(conn: &mut PgConnection) -> Result<String> {

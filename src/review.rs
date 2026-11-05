@@ -160,6 +160,126 @@ pub async fn sample<R: AsyncBufRead + Unpin>(
     result
 }
 
+pub const MERGE_EXAMPLES: i64 = 2;
+
+pub struct MergeOptions {
+    pub n: Option<usize>,
+    pub class: String,
+    pub seed: String,
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct MergeTally {
+    pub confirmed: usize,
+    pub rejected: usize,
+    pub skipped: usize,
+}
+
+async fn card(pool: &sqlx::PgPool, id: i64, name: &str, class: &str) -> Result<String> {
+    let (aliases, mentions, examples) = db::review::entity_card(pool, id, MERGE_EXAMPLES).await?;
+    let mut out = format!("  {name} ({}), {mentions} mentions", local_name(class));
+    if !aliases.is_empty() {
+        out.push_str(&format!(", aliases: {}", aliases.join("; ")));
+    }
+    for example in examples {
+        let page = example
+            .page_from
+            .map_or(String::new(), |p| format!(", page {p}"));
+        out.push_str(&format!(
+            "\n    {}{page}: {}",
+            example.path,
+            context(
+                &example.text,
+                Some(example.span_start),
+                Some(example.span_end)
+            )
+        ));
+    }
+    Ok(out)
+}
+
+pub async fn ask_merges<R: AsyncBufRead + Unpin>(
+    pool: &sqlx::PgPool,
+    merges: &[db::review::Merge],
+    input: &mut R,
+) -> Result<MergeTally> {
+    let mut tally = MergeTally::default();
+    let mut lines = input.lines();
+    for (i, merge) in merges.iter().enumerate() {
+        println!(
+            "[{}/{}] link {}: {}, score {:.2}",
+            i + 1,
+            merges.len(),
+            merge.id,
+            merge.method,
+            merge.confidence
+        );
+        println!(
+            "{}",
+            card(pool, merge.a_id, &merge.a_name, &merge.a_class).await?
+        );
+        println!(
+            "{}",
+            card(pool, merge.b_id, &merge.b_name, &merge.b_class).await?
+        );
+        println!("same thing? y = yes, n = no, s = skip, q = quit");
+        let Some(line) = lines.next_line().await? else {
+            break;
+        };
+        match line.trim().to_lowercase().as_str() {
+            "y" | "yes" => {
+                db::review::set_merge_status(pool, merge.id, "confirmed").await?;
+                tally.confirmed += 1;
+            }
+            "n" | "no" => {
+                db::review::set_merge_status(pool, merge.id, "rejected").await?;
+                tally.rejected += 1;
+            }
+            "q" | "quit" => break,
+            _ => tally.skipped += 1,
+        }
+    }
+    Ok(tally)
+}
+
+pub async fn merges<R: AsyncBufRead + Unpin>(
+    config_dir: Option<&Path>,
+    url: Option<&str>,
+    options: &MergeOptions,
+    input: &mut R,
+) -> Result<MergeTally> {
+    let config = config::load(config_dir)?;
+    let iri = if options.class.is_empty() {
+        String::new()
+    } else {
+        let loaded = crate::ontology::load(config_dir, &config.ontology)?;
+        loaded
+            .ontology
+            .resolve(&options.class)
+            .map_err(|e| anyhow::anyhow!("--class: {e}"))?
+    };
+    let pool = db::pool::connect(url, &config.database.schema, 2).await?;
+    let n = options.n.unwrap_or(config.review.sample);
+    let result = async {
+        let merges = db::review::proposed_merges(&pool, &iri, &options.seed, n as i64).await?;
+        if merges.is_empty() {
+            println!("review merges: no proposed links left for this filter");
+            return Ok(MergeTally::default());
+        }
+        let tally = ask_merges(&pool, &merges, input).await?;
+        let mut stats = crate::resolve::Stats::default();
+        crate::resolve::canonical(&pool, &mut stats).await?;
+        println!(
+            "review merges: {} confirmed, {} rejected, {} skipped; {} canonical ids changed",
+            tally.confirmed, tally.rejected, tally.skipped, stats.canonical_changed
+        );
+        Ok(tally)
+    }
+    .await;
+    pool.close().await;
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

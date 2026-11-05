@@ -75,6 +75,7 @@ text_search = "simple"
 fit = "claude-code:sonnet"
 extract = "claude-code:sonnet"
 classify = "claude-code:haiku"
+embed = "local:arctic-embed-m-v2.0"
 chars_per_token = 2.0
 
 [providers.claude-code]
@@ -134,3 +135,90 @@ confidence = 0.7
 [review]
 sample = 50
 min_verdicts = 30
+
+[embed]
+threads = 0
+batch_size = 8
+max_tokens = 512
+min_chars = 50
+min_letter_share = 0.5
+min_ocr_confidence = 0.6
+max_aliases = 5
+cache_dir = ""
+out = "eval"
+eval_sample = 500
+eval_max_expected = 20
+
+[embed.models."multilingual-e5-base"]
+repo = "intfloat/multilingual-e5-base"
+revision = "d128750597153bb5987e10b1c3493a34e5a4502a"
+file = "onnx/model.onnx"
+data_files = []
+tokenizer = "tokenizer.json"
+pooling = "mean"
+output = ""
+normalize = true
+passage_prefix = "passage: "
+query_prefix = "query: "
+max_tokens = 512
+
+[embed.models."multilingual-e5-small"]
+repo = "intfloat/multilingual-e5-small"
+revision = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
+file = "onnx/model.onnx"
+data_files = []
+tokenizer = "tokenizer.json"
+pooling = "mean"
+output = ""
+normalize = true
+passage_prefix = "passage: "
+query_prefix = "query: "
+max_tokens = 512
+
+[embed.models."bge-m3"]
+repo = "BAAI/bge-m3"
+revision = "5617a9f61b028005a4858fdac845db406aefb181"
+file = "onnx/model.onnx"
+data_files = ["onnx/model.onnx_data", "onnx/Constant_7_attr__value"]
+tokenizer = "onnx/tokenizer.json"
+pooling = "cls"
+output = ""
+normalize = true
+passage_prefix = ""
+query_prefix = ""
+max_tokens = 512
+
+[embed.models."arctic-embed-m-v2.0"]
+repo = "Snowflake/snowflake-arctic-embed-m-v2.0"
+revision = "95c2741480856aa9666782eb4afe11959938017f"
+file = "onnx/model.onnx"
+data_files = []
+tokenizer = "tokenizer.json"
+pooling = "cls"
+output = ""
+normalize = true
+passage_prefix = ""
+query_prefix = "query: "
+max_tokens = 512
+
+[embed.models."qwen3-embedding-0.6b"]
+repo = "onnx-community/Qwen3-Embedding-0.6B-ONNX"
+revision = "c25a394dd583836952667c12f008335071b3f43d"
+file = "onnx/model.onnx"
+data_files = ["onnx/model.onnx_data"]
+tokenizer = "tokenizer.json"
+pooling = "last"
+output = ""
+normalize = true
+passage_prefix = ""
+query_prefix = "Instruct: Given a question, retrieve passages that answer it\nQuery:"
+max_tokens = 512
+
+[resolve]
+strip_words = []
+fuzzy_score = 0.92
+embed_score = 0.9
+max_candidates = 5
+max_block = 1000
+block_chars = 4
+classes = []

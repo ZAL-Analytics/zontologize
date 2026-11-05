@@ -6,14 +6,17 @@ use zontologize::db;
 
 const TEST_URL: &str = "ZONTOLOGIZE_TEST_DATABASE_URL";
 const SCHEMA_PREFIX: &str = "zontologize_test_";
-const TABLES: [&str; 23] = [
+const TABLES: [&str; 26] = [
     "_sqlx_migrations",
     "aliases",
     "chunks",
+    "class_embeddings",
     "class_mentions",
     "classes",
     "contents",
     "documents",
+    "embedding_models",
+    "embeddings",
     "entities",
     "fact_reviews",
     "llm_cache",

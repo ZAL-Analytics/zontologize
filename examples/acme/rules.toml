@@ -123,3 +123,7 @@ class = "acme:Drawing"
 pattern = '\bDWG-\d{3}-[A-Z]\d\b'
 key_case = "upper"
 on = "both"
+
+[[revisions]]
+pattern = '(?P<series>DWG-\d{3}-[A-Z]\d) rev (?P<rev>[A-Z0-9]+)\.'
+order = "natural"

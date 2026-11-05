@@ -1,10 +1,12 @@
 pub mod classify;
 pub mod config;
 pub mod db;
+pub mod embed;
 pub mod facts;
 pub mod fit;
 pub mod llm;
 pub mod ontology;
+pub mod resolve;
 pub mod review;
 pub mod rules;
 pub mod scan;
@@ -151,6 +153,91 @@ pub async fn review_sample(
 ) -> Result<ExitCode> {
     let mut input = tokio::io::BufReader::new(tokio::io::stdin());
     review::sample(config_dir, database_url().as_deref(), options, &mut input).await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+pub async fn embed(config_dir: Option<&Path>, options: &embed::run::Options) -> Result<ExitCode> {
+    let stats = embed::run::run(config_dir, database_url().as_deref(), options).await?;
+    for (kind, counts) in [
+        ("chunks", &stats.chunks),
+        ("entities", &stats.entities),
+        ("classes", &stats.classes),
+    ] {
+        println!(
+            "embed: {kind}: {} eligible, {} embedded, {} copied from equal text, {} unchanged, {} removed, {} truncated",
+            counts.eligible,
+            counts.embedded,
+            counts.copied,
+            counts.kept,
+            counts.deleted,
+            counts.truncated
+        );
+    }
+    let embedded = stats.chunks.embedded + stats.entities.embedded + stats.classes.embedded;
+    if embedded > 0 {
+        println!(
+            "embed: {embedded} texts in {:.1} s of model time, {:.1}/s",
+            stats.embed_seconds,
+            embedded as f64 / stats.embed_seconds.max(1e-9)
+        );
+    }
+    if stats.junk > 0 {
+        println!("embed: {} chunks left out as unreadable", stats.junk);
+    }
+    if stats.index_seconds > 0.1 {
+        println!("embed: index checked in {:.1} s", stats.index_seconds);
+    }
+    for name in &stats.pruned {
+        println!("embed: removed {name}");
+    }
+    if stats.stopped {
+        println!("embed: stopped by --minutes; run embed again to go on");
+    }
+    println!("embed: done in {:.1} s", stats.seconds);
+    Ok(ExitCode::SUCCESS)
+}
+
+pub async fn eval_embed(
+    config_dir: Option<&Path>,
+    options: &embed::eval::Options,
+) -> Result<ExitCode> {
+    let path = embed::eval::run(config_dir, database_url().as_deref(), options).await?;
+    println!("eval embed: report in {}", path.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+pub async fn resolve(config_dir: Option<&Path>) -> Result<ExitCode> {
+    let stats = resolve::run(config_dir, database_url().as_deref()).await?;
+    if let Some(reason) = &stats.embed_skipped {
+        println!("resolve: embedding matches skipped, {reason}");
+    }
+    for (method, count) in &stats.added {
+        if *count > 0 {
+            println!("resolve: {method}: {count} links added");
+        }
+    }
+    println!(
+        "resolve: {} links kept, {} removed; {} clusters, {} canonical ids changed; {} aliases added, {} removed; {:.1} s",
+        stats.kept,
+        stats.removed,
+        stats.clusters,
+        stats.canonical_changed,
+        stats.aliases_added,
+        stats.aliases_removed,
+        stats.seconds
+    );
+    if stats.written() == 0 {
+        println!("resolve: nothing changed");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub async fn review_merges(
+    config_dir: Option<&Path>,
+    options: &review::MergeOptions,
+) -> Result<ExitCode> {
+    let mut input = tokio::io::BufReader::new(tokio::io::stdin());
+    review::merges(config_dir, database_url().as_deref(), options, &mut input).await?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -327,7 +414,7 @@ pub async fn status(config_dir: Option<&Path>, all_errors: bool) -> Result<ExitC
 
 const STATUS_RUNS: i64 = 5;
 const STATUS_ERRORS: i64 = 20;
-const STAGES: [&str; 4] = ["walk", "extract", "chunk", "rules"];
+const STAGES: [&str; 5] = ["walk", "extract", "chunk", "rules", "embed"];
 
 fn run_details(stats: &serde_json::Value) -> Vec<String> {
     let number = |path: [&str; 2]| stats[path[0]][path[1]].as_u64().unwrap_or(0);
@@ -424,6 +511,9 @@ async fn print_status(
         let mut parts = Vec::new();
         for stage in STAGES {
             let stats = &run.stats.0[stage];
+            if stats.is_null() {
+                continue;
+            }
             let seconds = stats["seconds"].as_f64().unwrap_or(0.0);
             let items = stats["items"].as_u64().unwrap_or(0);
             let rate = if seconds > 0.0 && items > 0 {
@@ -505,7 +595,56 @@ async fn print_status(
         }
         println!("{line}");
     }
-    print_model_facts(pool, config).await
+    print_model_facts(pool, config).await?;
+    print_embeddings(pool).await
+}
+
+async fn print_embeddings(pool: &sqlx::PgPool) -> Result<()> {
+    for row in db::embed::counts(pool).await? {
+        let last = db::status::last_embed(pool, row.id).await?;
+        let eligible = |kind: &str| {
+            last.as_ref()
+                .and_then(|l| l[kind]["eligible"].as_u64())
+                .map_or("?".to_string(), |n| n.to_string())
+        };
+        let mut indexes = Vec::new();
+        for kind in [db::embed::CHUNK, db::embed::ENTITY] {
+            if db::embed::index_exists(pool, row.id, kind).await? {
+                indexes.push(kind);
+            }
+        }
+        let index = if indexes.is_empty() {
+            "no index".to_string()
+        } else {
+            format!("index on {}", indexes.join(" and "))
+        };
+        let current = if row.current { ", current" } else { "" };
+        let embedded = row.chunks + row.entities;
+        println!(
+            "embeddings {}{current}: {} of {} chunks, {} of {} entities, {} of {} classes; {:.1}% truncated; {index}",
+            row.name,
+            row.chunks,
+            eligible("chunks"),
+            row.entities,
+            eligible("entities"),
+            row.classes,
+            eligible("classes"),
+            100.0 * row.truncated as f64 / embedded.max(1) as f64
+        );
+    }
+    let links = db::status::resolve_links(pool).await?;
+    if !links.is_empty() {
+        let parts: Vec<String> = links
+            .iter()
+            .map(|(method, status, count)| format!("{count} {method} {status}"))
+            .collect();
+        println!("links: {}", parts.join(", "));
+    }
+    let (clusters, members) = db::status::clusters(pool).await?;
+    if clusters > 0 {
+        println!("canonical: {clusters} entities with duplicates, {members} entities in them");
+    }
+    Ok(())
 }
 
 async fn print_model_facts(pool: &sqlx::PgPool, config: &config::Config) -> Result<()> {

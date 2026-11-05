@@ -109,3 +109,34 @@ pub async fn errors(pool: &PgPool, limit: Option<i64>) -> Result<(i64, Vec<Error
     .await?;
     Ok((total, rows))
 }
+
+pub async fn resolve_links(pool: &PgPool) -> Result<Vec<(String, String, i64)>> {
+    let rows = sqlx::query_as(
+        "select method, status, count(*) from relations where method like 'resolve:%' \
+         group by 1, 2 order by 1, 2",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn clusters(pool: &PgPool) -> Result<(i64, i64)> {
+    let row = sqlx::query_as(
+        "select count(*), coalesce(sum(n), 0)::bigint from (select count(*) as n from entities \
+         where canonical_id is not null group by canonical_id having count(*) > 1) c",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
+pub async fn last_embed(pool: &PgPool, model_id: i64) -> Result<Option<serde_json::Value>> {
+    let row: Option<sqlx::types::Json<serde_json::Value>> = sqlx::query_scalar(
+        "select stats -> 'embed' from runs where status = 'finished' \
+         and (stats -> 'embed' ->> 'model_id')::bigint = $1 order by id desc limit 1",
+    )
+    .bind(model_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|j| j.0))
+}

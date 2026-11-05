@@ -27,6 +27,8 @@ pub struct Config {
     pub llm_extract: LlmExtractConfig,
     pub classify: ClassifyConfig,
     pub review: ReviewConfig,
+    pub embed: EmbedConfig,
+    pub resolve: ResolveConfig,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
 }
@@ -37,7 +39,94 @@ pub struct ModelsConfig {
     pub fit: String,
     pub extract: String,
     pub classify: String,
+    pub embed: String,
     pub chars_per_token: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbedConfig {
+    pub threads: usize,
+    pub batch_size: usize,
+    pub max_tokens: usize,
+    pub min_chars: usize,
+    pub min_letter_share: f64,
+    pub min_ocr_confidence: f64,
+    pub max_aliases: usize,
+    pub cache_dir: String,
+    pub out: String,
+    pub eval_sample: usize,
+    pub eval_max_expected: usize,
+    pub models: BTreeMap<String, EmbedModelConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveConfig {
+    pub strip_words: Vec<String>,
+    pub fuzzy_score: f64,
+    pub embed_score: f64,
+    pub max_candidates: usize,
+    pub max_block: usize,
+    pub block_chars: usize,
+    pub classes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EmbedModelConfig {
+    pub repo: String,
+    #[serde(default)]
+    pub revision: String,
+    #[serde(default = "default_model_file")]
+    pub file: String,
+    #[serde(default)]
+    pub data_files: Vec<String>,
+    #[serde(default = "default_tokenizer_file")]
+    pub tokenizer: String,
+    pub pooling: Pooling,
+    #[serde(default)]
+    pub output: String,
+    #[serde(default = "default_true")]
+    pub normalize: bool,
+    #[serde(default)]
+    pub passage_prefix: String,
+    #[serde(default)]
+    pub query_prefix: String,
+    #[serde(default)]
+    pub max_tokens: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Pooling {
+    Mean,
+    Cls,
+    Last,
+    None,
+}
+
+impl Pooling {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Pooling::Mean => "mean",
+            Pooling::Cls => "cls",
+            Pooling::Last => "last",
+            Pooling::None => "none",
+        }
+    }
+}
+
+fn default_model_file() -> String {
+    "onnx/model.onnx".to_string()
+}
+
+fn default_tokenizer_file() -> String {
+    "tokenizer.json".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -286,6 +375,14 @@ fn load_from(
     if config.scan.hash_threads == 0 {
         config.scan.hash_threads = cores;
     }
+    if config.embed.threads == 0 {
+        config.embed.threads = cores;
+    }
+    for model in config.embed.models.values_mut() {
+        if model.max_tokens == 0 {
+            model.max_tokens = config.embed.max_tokens;
+        }
+    }
     Ok(config)
 }
 
@@ -467,6 +564,7 @@ fn check_models(config: &Config) -> Result<(), String> {
             crate::llm::ModelName::parse(name).map_err(|error| format!("models.{key}: {error}"))?;
         }
     }
+    check_embed(config)?;
     if config.models.chars_per_token <= 0.0 {
         return Err("models.chars_per_token must be greater than 0".to_string());
     }
@@ -537,6 +635,38 @@ fn check_models(config: &Config) -> Result<(), String> {
             "budget.max_usd must be 0 or more and budget.calibration_calls greater than 0"
                 .to_string(),
         );
+    }
+    Ok(())
+}
+
+fn check_embed(config: &Config) -> Result<(), String> {
+    crate::embed::model::parse(&config.models.embed, &config.embed.models)
+        .map_err(|error| format!("models.embed: {error}"))?;
+    let embed = &config.embed;
+    if embed.batch_size == 0 || embed.max_tokens == 0 {
+        return Err("embed.batch_size and embed.max_tokens must be greater than 0".to_string());
+    }
+    for (key, value) in [
+        ("embed.min_letter_share", embed.min_letter_share),
+        ("embed.min_ocr_confidence", embed.min_ocr_confidence),
+        ("resolve.fuzzy_score", config.resolve.fuzzy_score),
+        ("resolve.embed_score", config.resolve.embed_score),
+    ] {
+        if !(0.0..=1.0).contains(&value) {
+            return Err(format!("{key} must be between 0 and 1"));
+        }
+    }
+    for (name, model) in &embed.models {
+        if model.repo.trim().is_empty() {
+            return Err(format!(
+                "embed.models.{name}.repo must name a Hugging Face repository"
+            ));
+        }
+        if model.file.trim().is_empty() || model.tokenizer.trim().is_empty() {
+            return Err(format!(
+                "embed.models.{name}: file and tokenizer must not be empty"
+            ));
+        }
     }
     Ok(())
 }
@@ -645,6 +775,84 @@ mod tests {
         let dir = dir_with("[llm_extract]\nconfidence = 1.5\n");
         let message = error(load_from(Some(dir.path()), vars(&[])));
         assert!(message.contains("llm_extract.confidence"), "{message}");
+    }
+
+    #[test]
+    fn embed_models_are_checked_and_merge_key_by_key() {
+        let config = load_from(None, vars(&[])).unwrap();
+        assert_eq!(config.models.embed, "local:arctic-embed-m-v2.0");
+        assert_eq!(config.embed.models.len(), 5);
+        assert!(config.embed.threads >= 1);
+        let e5 = &config.embed.models["multilingual-e5-base"];
+        assert_eq!(e5.pooling, Pooling::Mean);
+        assert_eq!(e5.passage_prefix, "passage: ");
+        let dir = dir_with("[models]\nembed = \"ollama:nomic\"\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(
+            message.contains("models.embed") && message.contains("locally only"),
+            "{message}"
+        );
+        let dir = dir_with("[models]\nembed = \"local:missing\"\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("missing"), "{message}");
+        let dir = dir_with("[embed.models.mine]\nrepo = \"\"\npooling = \"mean\"\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("embed.models.mine.repo"), "{message}");
+        let dir = dir_with("[embed.models.mine]\nrepo = \"a/b\"\npooling = \"max\"\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(
+            message.contains("pooling") && message.contains("mean"),
+            "{message}"
+        );
+        let dir = dir_with(
+            "[models]\nembed = \"local:mine\"\n[embed]\nmax_tokens = 256\n\
+             [embed.models.mine]\nrepo = \"a/b\"\npooling = \"cls\"\n\
+             [embed.models.multilingual-e5-small]\nmax_tokens = 128\n",
+        );
+        let config = load_from(Some(dir.path()), vars(&[])).unwrap();
+        let mine = &config.embed.models["mine"];
+        assert_eq!(mine.file, "onnx/model.onnx");
+        assert_eq!(mine.tokenizer, "tokenizer.json");
+        assert!(mine.normalize);
+        assert_eq!(mine.max_tokens, 256);
+        let small = &config.embed.models["multilingual-e5-small"];
+        assert_eq!(small.max_tokens, 128);
+        assert_eq!(small.passage_prefix, "passage: ");
+        assert_eq!(small.repo, "intfloat/multilingual-e5-small");
+    }
+
+    fn keys(table: &Table, path: &str, out: &mut Vec<(String, String)>) {
+        for (key, value) in table {
+            out.push((path.to_string(), key.clone()));
+            if let Value::Table(inner) = value {
+                keys(inner, &format!("{path}.{key}"), out);
+            }
+        }
+    }
+
+    #[test]
+    fn every_default_key_is_documented() {
+        let docs = include_str!("../docs/configuration.md");
+        let rules = include_str!("../defaults/rules.toml");
+        let mut missing = Vec::new();
+        for text in [DEFAULTS, rules] {
+            let table: Table = text.parse().unwrap();
+            let mut found = Vec::new();
+            keys(&table, "", &mut found);
+            for (path, key) in found {
+                let plain = format!("`{key}`");
+                let dotted = format!("`{}.{key}`", path.rsplit('.').next().unwrap_or(""));
+                let full = format!("{path}.{key}");
+                let section = format!("[{}", full.trim_start_matches('.'));
+                if !docs.contains(&plain) && !docs.contains(&dotted) && !docs.contains(&section) {
+                    missing.push(format!("{path}.{key}"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "not in docs/configuration.md: {missing:?}"
+        );
     }
 
     #[test]
