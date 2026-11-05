@@ -1,5 +1,6 @@
 pub mod documents;
 pub mod names;
+pub mod similar;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -247,7 +248,7 @@ fn new_same_as(key: (i64, i64), candidate: &Candidate) -> NewLink {
     NewLink {
         src_id: key.0,
         dst_id: key.1,
-        property: SAME_AS,
+        property: SAME_AS.to_string(),
         method: method(candidate.rule),
         status: candidate.status,
         confidence: candidate.score,
@@ -421,7 +422,7 @@ async fn document_links(
         .map(|r| NewLink {
             src_id: r.src_id,
             dst_id: r.dst_id,
-            property: REFERENCES,
+            property: REFERENCES.to_string(),
             method: method("references"),
             status: AUTO,
             confidence: r.confidence,
@@ -439,7 +440,7 @@ async fn document_links(
         .map(|(newer, older)| NewLink {
             src_id: documents[newer].entity_id,
             dst_id: documents[older].entity_id,
-            property: REPLACES,
+            property: REPLACES.to_string(),
             method: method("revisions"),
             status: AUTO,
             confidence: 1.0,
@@ -468,6 +469,7 @@ pub async fn run_with(
     write_same_as(pool, &pairs, &mut stats).await?;
     canonical(pool, &mut stats).await?;
     document_links(pool, ontology, rules, &mut stats).await?;
+    similar::write(pool, config, ontology, &mut stats).await?;
     stats.seconds = started.elapsed().as_secs_f64();
     Ok(stats)
 }

@@ -1,4 +1,5 @@
 pub mod api;
+pub mod attributes;
 pub mod classify;
 pub mod contents;
 pub mod documents;

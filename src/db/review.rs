@@ -37,7 +37,14 @@ pub async fn sample(
          t.name, coalesce(k.text, d0.path), r.span_start, r.span_end, \
          coalesce(k.content_id, d0.content_id), k.page_from \
          from relations r join entities s on s.id = r.src_id join entities t on t.id = r.dst_id \
-         left join chunks k on k.id = r.chunk_id left join documents d0 on d0.id = r.document_id) \
+         left join chunks k on k.id = r.chunk_id left join documents d0 on d0.id = r.document_id \
+         union all \
+         select 'attribute', a.id, e.class_iri, a.property_iri, a.method, a.confidence, e.name, \
+         concat_ws(' ', case when a.low is null and a.high is null then a.value_text \
+         when a.low = a.high then a.low::text \
+         else concat(coalesce(a.low::text, ''), '..', coalesce(a.high::text, '')) end, \
+         a.unit_text), k.text, a.span_start, a.span_end, k.content_id, k.page_from \
+         from attributes a join entities e on e.id = a.entity_id join chunks k on k.id = a.chunk_id) \
          select f.kind, f.id, f.class_iri, f.property_iri, f.method, f.confidence, f.subject, \
          f.object, f.text, f.span_start, f.span_end, f.page_from, d.path from facts f \
          join lateral (select path from documents d where d.content_id = f.content_id \

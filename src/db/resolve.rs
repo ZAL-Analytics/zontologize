@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 use sqlx::{FromRow, PgPool};
 
@@ -33,7 +35,7 @@ pub struct Link {
 pub struct NewLink {
     pub src_id: i64,
     pub dst_id: i64,
-    pub property: &'static str,
+    pub property: String,
     pub method: String,
     pub status: &'static str,
     pub confidence: f64,
@@ -88,7 +90,12 @@ pub async fn insert(pool: &PgPool, links: &[NewLink]) -> Result<()> {
          $6::text[], $7::float8[], $8::bigint[], $9::bigint[], $10::int[], $11::int[])",
     )
     .bind(column(|l| Some(l.src_id)))
-    .bind(links.iter().map(|l| l.property).collect::<Vec<_>>())
+    .bind(
+        links
+            .iter()
+            .map(|l| l.property.as_str())
+            .collect::<Vec<_>>(),
+    )
     .bind(column(|l| Some(l.dst_id)))
     .bind(links.iter().map(|l| l.props.clone()).collect::<Vec<_>>())
     .bind(links.iter().map(|l| l.method.clone()).collect::<Vec<_>>())
@@ -279,4 +286,40 @@ pub async fn document_entities(pool: &PgPool) -> Result<Vec<DocumentEntity>> {
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ValueRow {
+    pub cluster_id: i64,
+    pub cluster_class: String,
+    pub property_iri: String,
+    pub si_low: Option<f64>,
+    pub si_high: Option<f64>,
+    pub chunk_id: i64,
+    pub confidence: f64,
+}
+
+pub async fn values(pool: &PgPool) -> Result<Vec<ValueRow>> {
+    let rows = sqlx::query_as(
+        "select c.id as cluster_id, c.class_iri as cluster_class, a.property_iri, a.si_low, \
+         a.si_high, a.chunk_id, a.confidence from attributes a \
+         join entities e on e.id = a.entity_id \
+         join entities c on c.id = coalesce(e.canonical_id, e.id) \
+         join chunks k on k.id = a.chunk_id \
+         where (a.si_low is not null or a.si_high is not null) and exists (select 1 \
+         from documents d where d.content_id = k.content_id and d.status = 'present') \
+         order by c.id, a.id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn confidences(pool: &PgPool, property: &str) -> Result<HashMap<i64, f64>> {
+    let rows: Vec<(i64, f64)> =
+        sqlx::query_as("select id, confidence from relations where property_iri = $1")
+            .bind(property)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
 }

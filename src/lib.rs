@@ -1,3 +1,4 @@
+pub mod attributes;
 pub mod classify;
 pub mod config;
 pub mod db;
@@ -12,6 +13,7 @@ pub mod resolve;
 pub mod review;
 pub mod rules;
 pub mod scan;
+pub mod units;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -120,6 +122,17 @@ pub fn ontology_check(config_dir: Option<&Path>) -> Result<ExitCode> {
             let (classes, properties) = onto.selected_under(iri);
             println!("root {name}: {classes} classes, {properties} properties");
         }
+        for property in onto.properties.values().filter(|p| p.is_attribute()) {
+            match property.value {
+                Some(ontology::ValueKind::Number) if property.quantity_kind.is_some() => println!(
+                    "attribute {}: number, {} units fit",
+                    property.iri,
+                    onto.fitting_units(property).len()
+                ),
+                Some(kind) => println!("attribute {}: {}", property.iri, kind.as_str()),
+                None => {}
+            }
+        }
     }
     println!(
         "ontology: {} files, {} classes ({} selected), {} properties ({} selected), {errors} errors, {} warnings",
@@ -165,6 +178,14 @@ pub async fn ontology_fit(
 
 pub async fn extract(config_dir: Option<&Path>, options: &facts::run::Options) -> Result<ExitCode> {
     let outcome = facts::run::run(config_dir, database_url().as_deref(), options).await?;
+    Ok(exit_code(outcome))
+}
+
+pub async fn attributes(
+    config_dir: Option<&Path>,
+    options: &llm::job::Options,
+) -> Result<ExitCode> {
+    let outcome = attributes::run::run(config_dir, database_url().as_deref(), options).await?;
     Ok(exit_code(outcome))
 }
 
@@ -708,6 +729,22 @@ async fn print_model_facts(pool: &sqlx::PgPool, config: &config::Config) -> Resu
     }
     for (method, mentions, relations) in db::facts::method_counts(pool).await? {
         println!("model facts: {method}: {mentions} mentions, {relations} relations");
+    }
+    let sent = db::attributes::sent_chunks(pool).await?;
+    if sent > 0 {
+        let parts: Vec<String> = db::attributes::counts(pool)
+            .await?
+            .into_iter()
+            .map(|(iri, count)| format!("{count} {}", llm::shortlist::local_name(&iri)))
+            .collect();
+        println!(
+            "attributes: {sent} chunks answered; {}",
+            if parts.is_empty() {
+                "no values".to_string()
+            } else {
+                parts.join(", ")
+            }
+        );
     }
     let types: Vec<String> = db::classify::counts(pool)
         .await?

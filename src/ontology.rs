@@ -13,6 +13,28 @@ const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
 const OWL: &str = "http://www.w3.org/2002/07/owl#";
 const SKOS: &str = "http://www.w3.org/2004/02/skos/core#";
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+const QUDT: &str = "http://qudt.org/schema/qudt/";
+const ZONTOLOGIZE: &str = "urn:zontologize#";
+pub const TOLERANCE: &str = "urn:zontologize#similarityTolerance";
+const NUMBER_TYPES: [&str; 16] = [
+    "decimal",
+    "double",
+    "float",
+    "integer",
+    "int",
+    "long",
+    "short",
+    "byte",
+    "nonNegativeInteger",
+    "positiveInteger",
+    "nonPositiveInteger",
+    "negativeInteger",
+    "unsignedLong",
+    "unsignedInt",
+    "unsignedShort",
+    "unsignedByte",
+];
+const TEXT_TYPES: [&str; 3] = ["string", "normalizedString", "token"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -83,6 +105,27 @@ impl PropertyKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    Number,
+    Text,
+}
+
+impl ValueKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ValueKind::Number => "number",
+            ValueKind::Text => "text",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<ValueKind> {
+        [ValueKind::Number, ValueKind::Text]
+            .into_iter()
+            .find(|kind| kind.as_str() == text)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Property {
     pub iri: String,
@@ -91,7 +134,46 @@ pub struct Property {
     pub range: Vec<String>,
     pub parents: Vec<String>,
     pub labels: LangMap<String>,
+    pub alt_labels: LangMap<Vec<String>>,
+    pub value: Option<ValueKind>,
+    pub quantity_kind: Option<String>,
+    pub dimension: Option<String>,
+    pub tolerance: Option<f64>,
     pub selected: bool,
+}
+
+impl Property {
+    pub fn new(iri: &str, kind: PropertyKind) -> Property {
+        Property {
+            iri: iri.to_string(),
+            kind,
+            domain: Vec::new(),
+            range: Vec::new(),
+            parents: Vec::new(),
+            labels: LangMap::new(),
+            alt_labels: LangMap::new(),
+            value: None,
+            quantity_kind: None,
+            dimension: None,
+            tolerance: None,
+            selected: false,
+        }
+    }
+
+    pub fn is_attribute(&self) -> bool {
+        self.selected && self.value.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Unit {
+    pub iri: String,
+    pub symbols: Vec<String>,
+    pub labels: LangMap<String>,
+    pub alt_labels: LangMap<Vec<String>>,
+    pub dimension: String,
+    pub multiplier: f64,
+    pub offset: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -101,6 +183,8 @@ pub struct Ontology {
     pub languages: Vec<String>,
     pub classes: BTreeMap<String, Class>,
     pub properties: BTreeMap<String, Property>,
+    pub units: BTreeMap<String, Unit>,
+    pub quantity_kinds: BTreeMap<String, String>,
     pub prefixes: BTreeMap<String, String>,
     pub ontology_iris: BTreeSet<String>,
     pub imports: Vec<(String, String)>,
@@ -119,6 +203,13 @@ struct Node {
     alt_labels: Vec<(String, String)>,
     definitions: Vec<(String, String)>,
     comments: Vec<(String, String)>,
+    symbols: Vec<String>,
+    multiplier: Option<String>,
+    offset: Option<String>,
+    dimension: Option<String>,
+    quantity_kinds: Vec<String>,
+    deprecated: bool,
+    tolerance: Option<String>,
 }
 
 pub struct Loaded {
@@ -166,7 +257,7 @@ pub fn load_sources(sources: &[(String, Vec<u8>)], config: &OntologyConfig) -> L
     if !findings.is_empty() {
         return Loaded { ontology, findings };
     }
-    build(&mut ontology, nodes);
+    build(&mut ontology, nodes, &mut findings);
     check_references(&ontology, &mut findings);
     check_cycles(&ontology, &mut findings);
     check_imports(&ontology, &mut findings);
@@ -175,6 +266,7 @@ pub fn load_sources(sources: &[(String, Vec<u8>)], config: &OntologyConfig) -> L
         return Loaded { ontology, findings };
     }
     check_labels(&ontology, &mut findings);
+    check_attributes(&ontology, &mut findings);
     Loaded { ontology, findings }
 }
 
@@ -268,7 +360,7 @@ fn add_triple(
         _ => None,
     };
     let Some(local) = predicate.strip_prefix(RDF).map(|l| (RDF, l)).or_else(|| {
-        [RDFS, OWL, SKOS]
+        [RDFS, OWL, SKOS, QUDT, ZONTOLOGIZE]
             .into_iter()
             .find_map(|ns| predicate.strip_prefix(ns).map(|l| (ns, l)))
     }) else {
@@ -302,14 +394,42 @@ fn add_triple(
         ((SKOS, "altLabel"), _, Some(value)) => node.alt_labels.push(value),
         ((SKOS, "definition"), _, Some(value)) => node.definitions.push(value),
         ((RDFS, "comment"), _, Some(value)) => node.comments.push(value),
+        ((QUDT, "symbol" | "ucumCode"), _, Some((_, value))) => node.symbols.push(value),
+        ((QUDT, "conversionMultiplier"), _, Some((_, value))) => node.multiplier = Some(value),
+        ((QUDT, "conversionOffset"), _, Some((_, value))) => node.offset = Some(value),
+        ((QUDT, "hasDimensionVector"), Some(iri), _) => node.dimension = Some(iri),
+        ((QUDT, "hasQuantityKind"), Some(iri), _) => node.quantity_kinds.push(iri),
+        ((QUDT, "deprecated"), _, Some((_, value))) => node.deprecated = value == "true",
+        ((ZONTOLOGIZE, "similarityTolerance"), _, Some((_, value))) => node.tolerance = Some(value),
         _ => {}
     }
 }
 
-fn build(ontology: &mut Ontology, nodes: HashMap<String, Node>) {
+fn build(ontology: &mut Ontology, nodes: HashMap<String, Node>, findings: &mut Vec<Finding>) {
     let languages = ontology.languages.clone();
     let class_types = [format!("{OWL}Class"), format!("{RDFS}Class")];
+    let unit_type = format!("{QUDT}Unit");
+    let kind_type = format!("{QUDT}QuantityKind");
+    let mut incomplete_units = 0;
     for (iri, node) in nodes {
+        if node.types.contains(&kind_type) {
+            if let Some(dimension) = node.dimension {
+                ontology.quantity_kinds.insert(iri, dimension);
+            }
+            continue;
+        }
+        if node.types.contains(&unit_type) {
+            if node.deprecated {
+                continue;
+            }
+            match unit(&iri, &node, &languages) {
+                Some(unit) => {
+                    ontology.units.insert(iri, unit);
+                }
+                None => incomplete_units += 1,
+            }
+            continue;
+        }
         let kind = property_kind(&node.types);
         let is_class = node.types.iter().any(|t| class_types.contains(t));
         let preferred = if node.pref_labels.is_empty() {
@@ -341,16 +461,52 @@ fn build(ontology: &mut Ontology, nodes: HashMap<String, Node>) {
             };
             ontology.classes.insert(iri, class);
         } else if let Some(kind) = kind {
+            let tolerance = match node.tolerance.as_deref().map(str::parse::<f64>) {
+                None => None,
+                Some(Ok(value)) if value > 0.0 && value.is_finite() => Some(value),
+                Some(_) => {
+                    findings.push(Finding::error(format!(
+                        "property {iri}: similarityTolerance {:?} is not a positive number",
+                        node.tolerance.unwrap_or_default()
+                    )));
+                    None
+                }
+            };
+            if node.quantity_kinds.len() > 1 {
+                findings.push(Finding::warning(format!(
+                    "property {iri}: several quantity kinds, only {} is used",
+                    node.quantity_kinds[0]
+                )));
+            }
+            let range = dedup(node.range);
+            let quantity_kind = node.quantity_kinds.first().cloned();
+            let value = match kind {
+                PropertyKind::Datatype => value_kind(&range, quantity_kind.is_some()),
+                _ => None,
+            };
             let property = Property {
-                iri: iri.clone(),
-                kind,
                 domain: dedup(node.domain),
-                range: dedup(node.range),
+                range,
                 parents: dedup(node.super_properties),
                 labels,
-                selected: false,
+                alt_labels: all_per_language(&node.alt_labels, &languages),
+                value,
+                quantity_kind,
+                tolerance,
+                ..Property::new(&iri, kind)
             };
             ontology.properties.insert(iri, property);
+        }
+    }
+    if incomplete_units > 0 {
+        findings.push(Finding::warning(format!(
+            "{incomplete_units} units without a conversion multiplier or dimension vector are not used"
+        )));
+    }
+    let dimensions = ontology.quantity_kinds.clone();
+    for property in ontology.properties.values_mut() {
+        if let Some(kind) = &property.quantity_kind {
+            property.dimension = dimensions.get(kind).cloned();
         }
     }
     let metas: BTreeSet<String> = ontology
@@ -363,6 +519,50 @@ fn build(ontology: &mut Ontology, nodes: HashMap<String, Node>) {
             class.meta = true;
         }
     }
+}
+
+fn unit(iri: &str, node: &Node, languages: &[String]) -> Option<Unit> {
+    let multiplier: f64 = node.multiplier.as_deref()?.parse().ok()?;
+    let offset: f64 = match node.offset.as_deref() {
+        Some(text) => text.parse().ok()?,
+        None => 0.0,
+    };
+    if multiplier == 0.0 || !multiplier.is_finite() || !offset.is_finite() {
+        return None;
+    }
+    Some(Unit {
+        iri: iri.to_string(),
+        symbols: dedup(node.symbols.clone()),
+        labels: first_per_language(&node.labels, languages),
+        alt_labels: all_per_language(&node.alt_labels, languages),
+        dimension: node.dimension.clone()?,
+        multiplier,
+        offset,
+    })
+}
+
+fn value_kind(range: &[String], has_quantity_kind: bool) -> Option<ValueKind> {
+    if has_quantity_kind {
+        return Some(ValueKind::Number);
+    }
+    let Some(first) = range.first() else {
+        return Some(ValueKind::Text);
+    };
+    if range.len() > 1 {
+        return None;
+    }
+    if let Some(local) = first.strip_prefix(XSD) {
+        if NUMBER_TYPES.contains(&local) {
+            return Some(ValueKind::Number);
+        }
+        if TEXT_TYPES.contains(&local) {
+            return Some(ValueKind::Text);
+        }
+    }
+    if *first == format!("{RDF}langString") {
+        return Some(ValueKind::Text);
+    }
+    None
 }
 
 fn property_kind(types: &[String]) -> Option<PropertyKind> {
@@ -526,7 +726,54 @@ fn check_labels(ontology: &Ontology, findings: &mut Vec<Finding>) {
     }
 }
 
+fn check_attributes(ontology: &Ontology, findings: &mut Vec<Finding>) {
+    for property in ontology.properties.values().filter(|p| p.is_attribute()) {
+        let Some(kind) = &property.quantity_kind else {
+            continue;
+        };
+        if property.dimension.is_none() {
+            findings.push(Finding::error(format!(
+                "property {}: quantity kind {kind} is not loaded (add QUDT's quantitykind file or declare it)",
+                property.iri
+            )));
+            continue;
+        }
+        let units = ontology.fitting_units(property);
+        if units.is_empty() {
+            findings.push(Finding::error(format!(
+                "property {}: no loaded unit fits quantity kind {kind}",
+                property.iri
+            )));
+            continue;
+        }
+        let mut owners: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for unit in &units {
+            for text in &unit.symbols {
+                owners.entry(text).or_default().push(&unit.iri);
+            }
+        }
+        for (text, iris) in owners.iter().filter(|(_, iris)| iris.len() > 1) {
+            findings.push(Finding::warning(format!(
+                "property {}: symbol {text:?} belongs to {} units ({}); it is not used",
+                property.iri,
+                iris.len(),
+                iris.join(", ")
+            )));
+        }
+    }
+}
+
 impl Ontology {
+    pub fn fitting_units(&self, property: &Property) -> Vec<&Unit> {
+        let Some(dimension) = &property.dimension else {
+            return Vec::new();
+        };
+        self.units
+            .values()
+            .filter(|u| &u.dimension == dimension)
+            .collect()
+    }
+
     pub fn resolve(&self, name: &str) -> Result<String, String> {
         let name = name.trim();
         if let Some(inner) = name.strip_prefix('<').and_then(|n| n.strip_suffix('>')) {
@@ -681,10 +928,15 @@ fn select(ontology: &mut Ontology, config: &OntologyConfig) -> Result<(), String
         .map(|c| c.iri.clone())
         .collect();
     for property in ontology.properties.values_mut() {
-        let by_classes = !property.domain.is_empty()
-            && !property.range.is_empty()
-            && property.domain.iter().all(|d| selected_classes.contains(d))
-            && property.range.iter().all(|r| selected_classes.contains(r));
+        let domain_selected = !property.domain.is_empty()
+            && property.domain.iter().all(|d| selected_classes.contains(d));
+        let by_classes = if property.value.is_some() {
+            domain_selected
+        } else {
+            domain_selected
+                && !property.range.is_empty()
+                && property.range.iter().all(|r| selected_classes.contains(r))
+        };
         property.selected = (properties.contains(&property.iri) || by_classes)
             && !excluded_properties.contains(&property.iri);
     }
@@ -963,5 +1215,115 @@ mod tests {
         assert_eq!(a.ontology.version, b.ontology.version);
         assert_ne!(a.ontology.version, c.ontology.version);
         assert_ne!(a.ontology.version, d.ontology.version);
+    }
+
+    const UNITS: &str = "@prefix qudt: <http://qudt.org/schema/qudt/> .\n\
+        @prefix unit: <http://qudt.org/vocab/unit/> .\n\
+        @prefix qk: <http://qudt.org/vocab/quantitykind/> .\n\
+        @prefix qkdv: <http://qudt.org/vocab/dimensionvector/> .\n\
+        @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+        @prefix z: <urn:zontologize#> .\n\
+        qk:Pressure a qudt:QuantityKind ; qudt:hasDimensionVector qkdv:P .\n\
+        qk:Power a qudt:QuantityKind ; qudt:hasDimensionVector qkdv:W .\n\
+        unit:BAR a qudt:Unit ; qudt:symbol \"bar\" ; qudt:ucumCode \"bar\" ; \
+            qudt:conversionMultiplier 100000.0 ; qudt:hasDimensionVector qkdv:P ; \
+            rdfs:label \"Bar\"@en .\n\
+        unit:BAR_G a qudt:Unit ; qudt:symbol \"barg\" ; skos:altLabel \"bar(g)\" ; \
+            qudt:conversionMultiplier 100000.0 ; qudt:conversionOffset 1.01325 ; \
+            qudt:hasDimensionVector qkdv:P .\n\
+        unit:OLD a qudt:Unit ; qudt:symbol \"old\" ; qudt:deprecated true ; \
+            qudt:conversionMultiplier 1.0 ; qudt:hasDimensionVector qkdv:P .\n\
+        unit:NOFACTOR a qudt:Unit ; qudt:symbol \"nf\" ; qudt:hasDimensionVector qkdv:P .\n\
+        ex:pressure a owl:DatatypeProperty ; rdfs:domain ex:Pump ; rdfs:range xsd:decimal ; \
+            qudt:hasQuantityKind qk:Pressure ; z:similarityTolerance 0.1 ; \
+            skos:prefLabel \"pressure\"@en ; skos:altLabel \"druk\"@nl .\n\
+        ex:power a owl:DatatypeProperty ; rdfs:domain ex:Pump ; qudt:hasQuantityKind qk:Power .\n\
+        ex:stages a owl:DatatypeProperty ; rdfs:domain ex:Pump ; rdfs:range xsd:integer .\n\
+        ex:material a owl:DatatypeProperty ; rdfs:domain ex:Pump ; rdfs:range xsd:string .\n\
+        ex:built a owl:DatatypeProperty ; rdfs:domain ex:Pump ; rdfs:range xsd:date .\n\
+        ex:projectCode a owl:DatatypeProperty ; rdfs:domain ex:Project .\n";
+
+    fn property<'a>(loaded: &'a Loaded, name: &str) -> &'a Property {
+        &loaded.ontology.properties[&format!("http://example.org/onto#{name}")]
+    }
+
+    #[test]
+    fn units_and_quantity_kinds_load() {
+        let loaded = load_text(&[TREE, UNITS], &config(&["ex:Equipment"], &[]));
+        let units = &loaded.ontology.units;
+        assert_eq!(
+            units.keys().collect::<Vec<_>>(),
+            [
+                "http://qudt.org/vocab/unit/BAR",
+                "http://qudt.org/vocab/unit/BAR_G"
+            ]
+        );
+        let bar = &units["http://qudt.org/vocab/unit/BAR"];
+        assert_eq!(bar.symbols, ["bar"]);
+        assert_eq!(bar.multiplier, 100000.0);
+        assert_eq!(bar.offset, 0.0);
+        assert_eq!(bar.labels["en"], "Bar");
+        let gauge = &units["http://qudt.org/vocab/unit/BAR_G"];
+        assert_eq!(gauge.offset, 1.01325);
+        assert_eq!(gauge.alt_labels["nl"], ["bar(g)"]);
+        assert_eq!(loaded.ontology.quantity_kinds.len(), 2);
+        assert!(
+            messages(&loaded, Severity::Warning)
+                .iter()
+                .any(|m| m.starts_with("1 units without"))
+        );
+    }
+
+    #[test]
+    fn attribute_properties_get_kind_dimension_and_selection() {
+        let loaded = load_text(&[TREE, UNITS], &config(&["ex:Equipment"], &[]));
+        let pressure = property(&loaded, "pressure");
+        assert!(pressure.is_attribute());
+        assert_eq!(pressure.value, Some(ValueKind::Number));
+        assert_eq!(
+            pressure.dimension.as_deref(),
+            Some("http://qudt.org/vocab/dimensionvector/P")
+        );
+        assert_eq!(pressure.tolerance, Some(0.1));
+        assert_eq!(pressure.alt_labels["nl"], ["druk"]);
+        assert_eq!(loaded.ontology.fitting_units(pressure).len(), 2);
+        assert_eq!(property(&loaded, "power").value, Some(ValueKind::Number));
+        assert_eq!(property(&loaded, "stages").value, Some(ValueKind::Number));
+        assert!(property(&loaded, "stages").dimension.is_none());
+        assert_eq!(property(&loaded, "material").value, Some(ValueKind::Text));
+        assert_eq!(property(&loaded, "built").value, None);
+        assert!(!property(&loaded, "projectCode").selected);
+    }
+
+    #[test]
+    fn attribute_checks() {
+        let loaded = load_text(&[TREE, UNITS], &config(&["ex:Equipment"], &[]));
+        let errors = messages(&loaded, Severity::Error);
+        assert!(
+            errors
+                .iter()
+                .any(|m| m.contains("power: no loaded unit fits")),
+            "{errors:?}"
+        );
+        let missing = format!(
+            "{TREE}@prefix qudt: <http://qudt.org/schema/qudt/> .\n\
+             @prefix z: <urn:zontologize#> .\n\
+             ex:speed a owl:DatatypeProperty ; rdfs:domain ex:Pump ; \
+             qudt:hasQuantityKind ex:Speed ; z:similarityTolerance -1 ."
+        );
+        let loaded = load_text(&[&missing], &config(&["ex:Equipment"], &[]));
+        let errors = messages(&loaded, Severity::Error);
+        assert!(errors.iter().any(|m| m.contains("quantity kind")));
+        assert!(errors.iter().any(|m| m.contains("not a positive number")));
+        let shared = format!(
+            "{UNITS}unit:PSI a qudt:Unit ; qudt:symbol \"bar\" ; \
+             qudt:conversionMultiplier 6894.76 ; qudt:hasDimensionVector qkdv:P ."
+        );
+        let loaded = load_text(&[TREE, &shared], &config(&["ex:Equipment"], &[]));
+        assert!(
+            messages(&loaded, Severity::Warning)
+                .iter()
+                .any(|m| m.contains("symbol \"bar\" belongs to 2 units"))
+        );
     }
 }

@@ -6,7 +6,7 @@ between versions; `select zontologize_api.contract_version()` says which contrac
 A run after new files arrive, from cron or by hand:
 
 ```sh
-zontologize scan && zontologize extract && zontologize embed \
+zontologize scan && zontologize extract && zontologize attributes && zontologize embed \
   && zontologize resolve && zontologize graph sync
 ```
 
@@ -26,7 +26,9 @@ shows `running`, `running_since`, `last_scan_finished_at`, `ontology_version` an
 | `aliases` | Other names of an entity |
 | `mentions`, `class_mentions` | Where an entity or class is named: chunk or document, span, method, confidence |
 | `relations` | Facts between entities, without rejected ones; `status` is `auto`, `proposed` or `confirmed` |
-| `classes`, `properties` | The selected ontology the facts use |
+| `attributes` | Values of entities: `value_text` as found, `unit_text`, `unit_iri`, `low`/`high` as written and `si_low`/`si_high` in SI units, chunk, span, method, confidence; `superseded` when a newer revision replaces the document |
+| `units` | Units of the ontology: symbols, labels, `dimension`, `conversion_multiplier`, `conversion_offset` |
+| `classes`, `properties` | The selected ontology the facts use; attribute properties have `value_kind`, `quantity_kind`, `dimension` |
 | `class_ancestors` | `iri`, `ancestor`, `depth` (0 is the class itself) |
 | `embedding_models`, `embeddings`, `class_embeddings` | Vectors, see [embeddings.md](embeddings.md) |
 | `graph_labels` | Graph label of each class and property |
@@ -80,4 +82,47 @@ with recursive parts (id, depth) as (
   where r.property_iri = 'https://example.org/acme#partOf' and p.depth < 5
 )
 select e.name, p.depth from parts p join zontologize_api.entities e on e.id = p.id;
+```
+
+## Attributes
+
+A value is a range: `si_low` and `si_high` are equal for one number, and one is null for a limit
+("at most 50 bar"). SI is `(value + conversion_offset) * conversion_multiplier`, so pressure is in
+absolute pascal and temperature in kelvin. A question in bar converts with the `units` view:
+
+```sql
+with q as (
+  select (10 + conversion_offset) * conversion_multiplier as lo,
+         (15 + conversion_offset) * conversion_multiplier as hi
+  from zontologize_api.units where iri = 'http://qudt.org/vocab/unit/BAR'
+)
+select e.name, a.value_text
+from zontologize_api.attributes a
+join zontologize_api.entities e on e.id = a.entity_id, q
+where a.property_iri = 'https://example.org/acme#dischargePressure' and not a.superseded
+  and coalesce(a.si_low, a.si_high) <= q.hi and coalesce(a.si_high, a.si_low) >= q.lo;
+```
+
+`resolve` links stored entities of one class whose values are close with `similarTo` relations
+(always `proposed`, the score as `confidence`). To find stored equipment like a new request,
+score at question time the same way: 1 when the ranges overlap, otherwise falling with the
+ratio of the nearest values until the tolerance (default 0.2), averaged over the properties:
+
+```sql
+with request (property_iri, lo, hi) as (values
+  ('https://example.org/acme#ratedPower', 250000.0, 250000.0),
+  ('https://example.org/acme#dischargePressure', 1101325.0, 1101325.0)),
+scores as (
+  select coalesce(e.canonical_id, e.id) as id, r.property_iri,
+    max(case when coalesce(a.si_low, a.si_high) <= r.hi and coalesce(a.si_high, a.si_low) >= r.lo
+      then 1.0 else greatest(0, 1 - abs(ln(greatest(r.lo, coalesce(a.si_low, a.si_high))
+        / least(r.hi, coalesce(a.si_high, a.si_low)))) / ln(1.2)) end) as score
+  from request r
+  join zontologize_api.attributes a on a.property_iri = r.property_iri and not a.superseded
+  join zontologize_api.entities e on e.id = a.entity_id
+  where coalesce(a.si_low, a.si_high) > 0
+  group by 1, 2)
+select e.name, avg(s.score) as score, count(*) as shared
+from scores s join zontologize_api.entities e on e.id = s.id
+group by e.name having count(*) >= 2 order by score desc limit 10;
 ```

@@ -1,5 +1,5 @@
 create or replace function {api}.contract_version() returns integer
-    language sql immutable as 'select 1';
+    language sql immutable as 'select 2';
 
 create or replace view {api}.sources as
 select id, name, kind, root, dataset
@@ -54,9 +54,30 @@ from {schema}.classes c
 where c.selected and c.ontology_version_id = ({current});
 
 create or replace view {api}.properties as
-select p.iri, p.kind, p.domain, p.range, p.parents, p.labels
+select p.iri, p.kind, p.domain, p.range, p.parents, p.labels, p.alt_labels, p.value_kind,
+    p.quantity_kind, p.dimension, p.tolerance
 from {schema}.properties p
 where p.selected and p.ontology_version_id = ({current});
+
+create or replace view {api}.units as
+select u.iri, u.symbols, u.labels, u.alt_labels, u.dimension, u.conversion_multiplier,
+    u.conversion_offset
+from {schema}.units u
+where u.ontology_version_id = ({current});
+
+create or replace view {api}.attributes as
+select a.id, a.entity_id, a.property_iri, a.value_text, a.unit_text, a.unit_iri, a.low, a.high,
+    a.si_low, a.si_high, a.dimension, a.chunk_id, a.span_start, a.span_end, a.method,
+    a.confidence,
+    exists (select 1 from {schema}.documents d
+        join {schema}.entities de on de.document_id = d.id and de.key = d.id::text
+        join {schema}.relations r on r.dst_id = de.id
+            and r.property_iri = 'http://purl.org/dc/terms/replaces' and r.status <> 'rejected'
+        where d.content_id = k.content_id and d.status = 'present') as superseded
+from {schema}.attributes a
+join {schema}.chunks k on k.id = a.chunk_id
+where exists (select 1 from {schema}.documents d
+    where d.content_id = k.content_id and d.status = 'present');
 
 create or replace view {api}.class_ancestors as
 with recursive up (iri, ancestor, depth) as (

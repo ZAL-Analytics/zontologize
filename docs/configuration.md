@@ -78,6 +78,7 @@ local only (`local:<name>`, see [embeddings.md](embeddings.md)).
 | `models.fit` | `"claude-code:sonnet"` |
 | `models.extract` | `"claude-code:sonnet"` |
 | `models.classify` | `"claude-code:haiku"` |
+| `models.attributes` | `"claude-code:sonnet"` |
 | `models.embed` | `"local:arctic-embed-m-v2.0"` |
 
 Per provider (`[providers.claude-code]`, `[providers.openrouter]`, `[providers.ollama]`):
@@ -101,6 +102,10 @@ The defaults work for most data. Commonly changed:
 | `llm_extract.exclude` | `[]` | Paths never sent |
 | `llm_extract.min_chars` | `200` | Shortest chunk sent |
 | `llm_extract.confidence` | `0.7` | Confidence of model facts |
+| `attributes.confidence` | `0.7` | Confidence of model values until reviews set it |
+| `attributes.context_chars` | `400` | End of the previous chunk sent as context, for table headers |
+| `attributes.max_text_chars` | `120` | Longest text value kept |
+| `attributes.out` | `"attributes"` | Report folder |
 | `classify.head_chars` | `1500` | Text sent per part |
 | `review.sample` | `50` | Facts shown by `review sample` |
 | `embed.threads` / `batch_size` | `0` / `8` | Embedding throughput |
@@ -109,6 +114,46 @@ The defaults work for most data. Commonly changed:
 | `resolve.strip_words` | `[]` | Words ignored in names, such as legal forms |
 | `resolve.fuzzy_score` / `embed_score` | `0.92` / `0.9` | Match thresholds |
 | `resolve.classes` | `[]` | Limit to these classes |
+| `resolve.similar.property` | `"urn:zontologize#similarTo"` | IRI of similarity links |
+| `resolve.similar.tolerance` | `0.2` | Relative gap at which a value no longer counts as close |
+| `resolve.similar.min_shared` / `min_score` / `max_links` | `2` / `0.8` / `5` | Values two entities must share, lowest score, links per entity |
+| `resolve.similar.weights` | `{}` | Weight per property name, default 1 |
+
+`attributes` also uses `llm_extract.sources`, `doc_types`, `paths` and `min_chars`.
+
+## Units and attribute properties
+
+Attribute values need units with conversion factors. Download QUDT's vocabularies (CC BY 4.0)
+into the config directory and list them in `ontology.files`:
+
+```sh
+curl -L -H "Accept: text/turtle" -o ontology/qudt-unit.ttl https://qudt.org/vocab/unit/
+curl -L -H "Accept: text/turtle" -o ontology/qudt-quantitykind.ttl https://qudt.org/vocab/quantitykind/
+```
+
+A datatype property becomes an attribute when its domain is selected and its range is a number
+(`xsd:decimal`, `xsd:integer`, ...) or text (`xsd:string`, no range). A number with a unit names
+its quantity kind; a unit fits when it has the same dimension vector:
+
+```turtle
+ex:dischargePressure a owl:DatatypeProperty ;
+    rdfs:domain ex:Pump ; rdfs:range xsd:decimal ;
+    qudt:hasQuantityKind quantitykind:Pressure ;
+    zontologize:similarityTolerance 0.1 ;          # optional, see resolve.similar
+    skos:prefLabel "discharge pressure"@en, "persdruk"@nl .
+```
+
+Units are matched on `qudt:symbol`, `qudt:ucumCode`, `rdfs:label` and `skos:altLabel`, exact
+first, then case-insensitive when only one unit fits. Add the spellings your documents use as
+`skos:altLabel` in the local file (`unit:M3-PER-HR skos:altLabel "m3/hr" .`); the
+`attributes-report.md` lists the unit texts that matched nothing. Gauge pressure is a unit of
+its own with an offset of one atmosphere, so values convert to absolute pascal:
+
+```turtle
+ex:BAR_G a qudt:Unit ; qudt:symbol "barg" ; skos:altLabel "bar(g)" ;
+    qudt:conversionMultiplier 100000.0 ; qudt:conversionOffset 1.01325 ;
+    qudt:hasDimensionVector qkdv:A0E0L-1I0M1H0T-2D0 .
+```
 
 ## rules.toml
 
@@ -155,7 +200,7 @@ Names and aliases match as whole words, case-insensitive.
 
 ## Prompts
 
-`prompts/<name>.md` replaces a built-in prompt (`fit-*`, `extract-*`, `classify-*`, see
+`prompts/<name>.md` replaces a built-in prompt (`fit-*`, `extract-*`, `classify-*`, `attributes-*`, see
 `prompts/`). Variables are written `{name}`.
 
 ## questions.toml

@@ -2,6 +2,10 @@
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix qudt: <http://qudt.org/schema/qudt/> .
+@prefix quantitykind: <http://qudt.org/vocab/quantitykind/> .
+@prefix zontologize: <urn:zontologize#> .
 
 <https://example.org/acme> a owl:Ontology ;
     rdfs:label "Acme example ontology"@en .
@@ -116,3 +120,49 @@ acme:atSite a owl:ObjectProperty ;
     rdfs:domain acme:Project ;
     rdfs:range acme:Site ;
     skos:prefLabel "at site"@en, "op locatie"@nl .
+
+acme:ratedPower a owl:DatatypeProperty ;
+    rdfs:domain acme:Equipment ;
+    rdfs:range xsd:decimal ;
+    qudt:hasQuantityKind quantitykind:Power ;
+    zontologize:similarityTolerance 0.15 ;
+    skos:prefLabel "rated power"@en, "nominaal vermogen"@nl ;
+    skos:altLabel "power"@en, "motor power"@en, "vermogen"@nl .
+
+acme:dischargePressure a owl:DatatypeProperty ;
+    rdfs:domain acme:Equipment ;
+    rdfs:range xsd:decimal ;
+    qudt:hasQuantityKind quantitykind:Pressure ;
+    skos:prefLabel "discharge pressure"@en, "persdruk"@nl ;
+    skos:altLabel "outlet pressure"@en, "einddruk"@nl .
+
+acme:flowRate a owl:DatatypeProperty ;
+    rdfs:domain acme:Equipment ;
+    rdfs:range xsd:decimal ;
+    qudt:hasQuantityKind quantitykind:VolumeFlowRate ;
+    skos:prefLabel "flow rate"@en, "debiet"@nl ;
+    skos:altLabel "capacity"@en, "capaciteit"@nl .
+
+acme:speed a owl:DatatypeProperty ;
+    rdfs:domain acme:Equipment ;
+    rdfs:range xsd:decimal ;
+    qudt:hasQuantityKind quantitykind:RotationalVelocity ;
+    skos:prefLabel "speed"@en, "toerental"@nl .
+
+acme:stages a owl:DatatypeProperty ;
+    rdfs:domain acme:Equipment ;
+    rdfs:range xsd:integer ;
+    skos:prefLabel "number of stages"@en, "aantal trappen"@nl .
+
+acme:material a owl:DatatypeProperty ;
+    rdfs:domain acme:Equipment ;
+    rdfs:range xsd:string ;
+    skos:prefLabel "material"@en, "materiaal"@nl ;
+    skos:altLabel "casing material"@en, "huismateriaal"@nl .
+
+acme:testPressure a owl:DatatypeProperty ;
+    rdfs:domain acme:Certificate ;
+    rdfs:range xsd:decimal ;
+    qudt:hasQuantityKind quantitykind:Pressure ;
+    skos:prefLabel "test pressure"@en, "testdruk"@nl ;
+    skos:altLabel "beproevingsdruk"@nl .

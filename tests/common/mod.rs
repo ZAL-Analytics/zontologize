@@ -57,15 +57,17 @@ impl Env {
 
     pub fn write_config(&self, extra: &str) {
         let ontology = repo("examples/acme/ontology/acme.ttl");
+        let units = repo("examples/acme/ontology/units.ttl");
         let text = format!(
             "[database]\nschema = \"{0}\"\ngraph = \"{0}_graph\"\napi_schema = \"{0}_api\"\nmax_connections = 4\n\
              [extract]\nthreads = 2\ntimeout_secs = 60\n\
-             [ontology]\nfiles = [\"{1}\"]\nlanguages = [\"en\", \"nl\"]\n\
+             [ontology]\nfiles = [\"{1}\", \"{2}\"]\nlanguages = [\"en\", \"nl\"]\n\
              include = [\"acme:Organisation\", \"acme:Site\", \"acme:Project\", \
              \"acme:Equipment\", \"acme:Document\"]\n\
              document_class = \"acme:Document\"\n{extra}",
             self.schema,
-            ontology.display()
+            ontology.display(),
+            units.display()
         );
         std::fs::write(self.config().join("zontologize.toml"), text).unwrap();
     }

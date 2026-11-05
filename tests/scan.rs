@@ -247,7 +247,7 @@ async fn ontology_version_is_stored_once_per_content() {
     )
     .unwrap();
     let text = std::fs::read_to_string(env.config().join("zontologize.toml")).unwrap();
-    let text = text.replace("acme.ttl\"]", "acme.ttl\", \"local.ttl\"]");
+    let text = text.replace("units.ttl\"]", "units.ttl\", \"local.ttl\"]");
     std::fs::write(env.config().join("zontologize.toml"), text).unwrap();
     let stats = env.scan().await;
     assert_eq!(env.count("select count(*) from ontology_versions").await, 2);
