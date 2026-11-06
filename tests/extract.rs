@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use zontologize::config;
-use zontologize::scan::extract::{ExtractSettings, Method, extract_file};
+use zontologize::scan::extract::{ExtractSettings, Method, extract_pages};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -20,7 +20,7 @@ fn normalize(text: &str) -> String {
 
 #[tokio::test]
 async fn txt_is_one_layer_page() {
-    let pages = extract_file(&fixture("note.txt"), &settings())
+    let pages = extract_pages(&fixture("note.txt"), &settings())
         .await
         .unwrap();
     assert_eq!(pages.len(), 1);
@@ -35,7 +35,7 @@ async fn txt_is_one_layer_page() {
 
 #[tokio::test]
 async fn docx_text_is_extracted() {
-    let pages = extract_file(&fixture("letter.docx"), &settings())
+    let pages = extract_pages(&fixture("letter.docx"), &settings())
         .await
         .unwrap();
     assert_eq!(pages[0].page_no, 1);
@@ -45,7 +45,7 @@ async fn docx_text_is_extracted() {
 
 #[tokio::test]
 async fn text_pdf_uses_the_layer() {
-    let pages = extract_file(&fixture("report.pdf"), &settings())
+    let pages = extract_pages(&fixture("report.pdf"), &settings())
         .await
         .unwrap();
     assert_eq!(pages.len(), 1);
@@ -61,7 +61,7 @@ async fn text_pdf_uses_the_layer() {
 
 #[tokio::test]
 async fn missing_file_names_the_path() {
-    let error = extract_file(&fixture("missing.pdf"), &settings())
+    let error = extract_pages(&fixture("missing.pdf"), &settings())
         .await
         .unwrap_err();
     assert!(format!("{error:#}").contains("missing.pdf"), "{error:#}");
@@ -70,7 +70,7 @@ async fn missing_file_names_the_path() {
 #[tokio::test]
 #[ignore]
 async fn scan_pdf_goes_through_ocr() {
-    let pages = extract_file(&fixture("scan.pdf"), &settings())
+    let pages = extract_pages(&fixture("scan.pdf"), &settings())
         .await
         .unwrap();
     assert_eq!(pages.len(), 1);

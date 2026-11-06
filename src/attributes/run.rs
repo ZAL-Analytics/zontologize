@@ -1,82 +1,44 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::time::Instant;
 
 use anyhow::{Result, bail};
-use globset::{Glob, GlobSet, GlobSetBuilder};
-use sqlx::PgPool;
+use globset::GlobSet;
+use rayon::ThreadPool;
 
 use super::check::{Limits, check};
 use super::{
     Answer, Built, ChunkInput, Context, DOC, Hits, Matcher, Subject, TASK, USER_VARIABLES, build,
 };
-use crate::config::{self, Config};
+use crate::config;
 use crate::db;
 use crate::db::attributes::{ChunkValues, Eligible, Filter};
 use crate::db::facts::{ChunkRow, Confidence};
-use crate::db::llm::{Job, JobParams};
-use crate::facts::sample::{Candidate, Settings, first_folder, letter_share, select, text_hash};
-use crate::llm::job::{self, Handler, Runner, Work};
+use crate::llm::ModelName;
 use crate::llm::prompt::{self, Prompt};
-use crate::llm::{ModelName, Request};
+use crate::llm::stage::{self, Base, Chunk, Counts, Keys, Plan, Stage};
 use crate::ontology::{self, Ontology};
-use crate::scan::parallel_map;
 use crate::units::UnitIndex;
 
 pub use crate::llm::job::{Options, Outcome};
 
-const BATCH: i64 = 2000;
-const KEY_BATCH: usize = 10_000;
-
 struct Setup<'a> {
-    pool: &'a PgPool,
-    config: &'a Config,
+    base: Base<'a>,
     ontology: &'a Ontology,
     units: &'a UnitIndex<'a>,
     matcher: &'a Matcher,
     system: &'a Prompt,
     user: &'a Prompt,
-    name: &'a ModelName,
-    threads: usize,
+    threads: ThreadPool,
     check_key: String,
+    extracted: bool,
+    out: PathBuf,
 }
 
 struct Prepared {
     built: Built,
     chunk: ChunkRow,
     context: String,
-}
-
-struct Todo {
-    chunk_id: i64,
-    cache_key: String,
-    chars: usize,
-    resend: bool,
-    order: (usize, i64, i64),
-}
-
-#[derive(Default)]
-struct Plan {
-    scanned: usize,
-    eligible: usize,
-    done: usize,
-    todo: Vec<Todo>,
-}
-
-struct Row {
-    id: i64,
-    attr_key: Option<String>,
-    order: (usize, i64, i64),
-}
-
-struct Attributes<'a> {
-    setup: &'a Setup<'a>,
-    job: i64,
-    method: String,
-    confidence: Confidence,
-    out: PathBuf,
-    chunk_of: HashMap<i32, i64>,
-    pending: Mutex<HashMap<i32, Prepared>>,
 }
 
 pub async fn run(
@@ -90,32 +52,30 @@ pub async fn run(
             "[models] attributes is empty; set it to provider:model, for example claude-code:sonnet"
         );
     }
-    let name = ModelName::parse(&config.models.attributes)
+    let name = ModelName::configured(&config.models.attributes, &config.providers)
         .map_err(|e| anyhow::anyhow!("models.attributes: {e}"))?;
     if config.ontology.files.is_empty() {
         bail!("[ontology] files is empty");
     }
-    let loaded = ontology::load(config_dir, &config.ontology)?;
-    if let Some(error) = loaded.first_error() {
-        bail!("ontology: {error}; run zontologize ontology check");
-    }
+    let loaded = ontology::load_checked(config_dir, &config.ontology)?;
     let ontology = loaded.ontology;
     if !ontology.properties.values().any(|p| p.is_attribute()) {
         bail!("the ontology selects no datatype property with a number or text range");
     }
     let rules = crate::rules::load(config_dir, &ontology, &config.ontology.document_class)?;
-    for doc_type in &config.llm_extract.doc_types {
+    for doc_type in &config.attributes.doc_types {
         if !rules.doc_types.contains_key(doc_type) {
-            bail!("llm_extract.doc_types: {doc_type:?} is not a key of [doc_types] in rules.toml");
+            bail!("attributes.doc_types: {doc_type:?} is not a key of [doc_types] in rules.toml");
         }
     }
     let system = prompt::load(config_dir, "attributes-system")?;
     system.check(&[])?;
     let user = prompt::load(config_dir, "attributes-user")?;
     user.check(&USER_VARIABLES)?;
+    user.require("chunk")?;
     let units = UnitIndex::new(&ontology);
     let matcher = Matcher::new(&ontology, &units)?;
-    let _lock = match options.dry_run {
+    let lock = match options.dry_run {
         true => None,
         false => Some(db::runs::lock(url, &config.database.schema).await?),
     };
@@ -125,20 +85,36 @@ pub async fn run(
         config.database.max_connections,
     )
     .await?;
+    let attributes = &config.attributes;
     let setup = Setup {
-        pool: &pool,
-        config: &config,
+        base: Base {
+            pool: &pool,
+            config: &config,
+            name: &name,
+            task: TASK,
+            ontology_version: &ontology.version,
+            sources: &attributes.sources,
+            paths: &attributes.paths,
+            read_batch: attributes.read_batch as usize,
+            seed: &attributes.seed,
+            resend_share: attributes
+                .resend_share
+                .unwrap_or(config.llm_extract.resend_share),
+            confidence: attributes.confidence,
+        },
         ontology: &ontology,
         units: &units,
         matcher: &matcher,
         system: &system,
         user: &user,
-        name: &name,
-        threads: config.scan.hash_threads,
-        check_key: super::check_key(&units, config.attributes.max_text_chars),
+        threads: crate::cpu::pool(attributes.threads)?,
+        check_key: super::check_key(&units, attributes.max_text_chars),
+        extracted: options.extracted,
+        out: PathBuf::from(&attributes.out),
     };
-    let result = run_with(&setup, options).await;
+    let result = stage::run(&setup, options).await;
     pool.close().await;
+    db::runs::release(lock).await;
     result
 }
 
@@ -151,10 +127,11 @@ fn hits(matcher: &Matcher, text: &str, context: &str) -> Hits {
 }
 
 async fn prepare(setup: &Setup<'_>, ids: &[i64]) -> Result<Vec<Prepared>> {
-    let pool = setup.pool;
+    let pool = setup.base.pool;
     let rows = db::facts::chunks(pool, ids).await?;
     let mut contexts =
-        db::attributes::contexts(pool, ids, setup.config.attributes.context_chars as i32).await?;
+        db::attributes::contexts(pool, ids, setup.base.config.attributes.context_chars as i32)
+            .await?;
     let mut known: HashMap<i64, Vec<Subject>> = HashMap::new();
     for row in db::attributes::known(pool, ids).await? {
         let list = known.entry(row.chunk_id).or_default();
@@ -191,20 +168,24 @@ async fn prepare(setup: &Setup<'_>, ids: &[i64]) -> Result<Vec<Prepared>> {
             (input, row)
         })
         .collect();
-    let config = setup.config;
+    let config = setup.base.config;
     let context = Context {
         ontology: setup.ontology,
         units: setup.units,
         languages: &config.ontology.languages,
         max_properties: config.attributes.max_properties,
+        max_subjects: config.attributes.max_subjects,
+        unit_symbols: config.attributes.unit_symbols,
         check_key: &setup.check_key,
         system: setup.system,
         user: setup.user,
-        model: setup.name,
+        model: setup.base.name,
     };
     let matcher = setup.matcher;
-    let built = parallel_map(&inputs, setup.threads, |(input, _)| {
-        build(&context, input, &hits(matcher, &input.text, &input.context))
+    let built = crate::cpu::blocking(|| {
+        crate::cpu::map(&setup.threads, &inputs, |(input, _)| {
+            build(&context, input, &hits(matcher, &input.text, &input.context))
+        })
     });
     Ok(built
         .into_iter()
@@ -219,84 +200,78 @@ async fn prepare(setup: &Setup<'_>, ids: &[i64]) -> Result<Vec<Prepared>> {
         .collect())
 }
 
-fn path_filter(patterns: &[String]) -> Result<Option<GlobSet>> {
-    if patterns.is_empty() {
-        return Ok(None);
-    }
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        builder.add(Glob::new(pattern)?);
-    }
-    Ok(Some(builder.build()?))
-}
-
-async fn compare(setup: &Setup<'_>, rows: &[Row], plan: &mut Plan) -> Result<()> {
-    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
-    let by_id: HashMap<i64, &Row> = rows.iter().map(|r| (r.id, r)).collect();
-    for item in prepare(setup, &ids).await? {
-        let Some(row) = by_id.get(&item.chunk.id) else {
-            continue;
-        };
-        plan.eligible += 1;
-        if row.attr_key.as_deref() == Some(item.built.key.as_str()) {
-            plan.done += 1;
-            continue;
-        }
-        plan.todo.push(Todo {
-            chunk_id: row.id,
-            cache_key: item.built.cache_key,
-            chars: item.built.request.chars(),
-            resend: row.attr_key.is_some(),
-            order: row.order,
-        });
-    }
-    Ok(())
-}
-
 fn text_hit(setup: &Setup<'_>, chunk: &Eligible) -> bool {
     !hits(setup.matcher, &chunk.text, &chunk.context).is_empty()
 }
 
-async fn plan(setup: &Setup<'_>, options: &Options, seed: &str) -> Result<Plan> {
-    let config = setup.config;
-    let extract = &config.llm_extract;
-    let source_order: Vec<&String> = if extract.sources.is_empty() {
-        config.sources.iter().map(|s| &s.name).collect()
-    } else {
-        extract.sources.iter().collect()
-    };
-    let paths = path_filter(&extract.paths)?;
-    let filter = Filter {
-        sources: &extract.sources,
-        doc_types: &extract.doc_types,
-        min_chars: extract.min_chars as i32,
-        extracted: options.extracted,
-        context_chars: config.attributes.context_chars as i32,
-    };
-    let mut plan = Plan::default();
-    let mut candidates = Vec::new();
-    let mut rows: HashMap<i64, Row> = HashMap::new();
-    let mut after = 0;
-    loop {
-        let eligible = db::attributes::eligible(setup.pool, &filter, after, BATCH).await?;
-        let Some(last) = eligible.last() else {
-            break;
+impl Stage for Setup<'_> {
+    type Item = Prepared;
+    type Answer = Answer;
+    type Checked = ChunkValues;
+    const SAMPLED: &'static str = "chunks with a value and a subject";
+    const WRITES: &'static str = "values";
+
+    fn base(&self) -> &Base<'_> {
+        &self.base
+    }
+
+    fn keys(item: &Prepared) -> Keys<'_> {
+        Keys {
+            chunk_id: item.chunk.id,
+            key: &item.built.key,
+            cache_key: &item.built.cache_key,
+            request: &item.built.request,
+        }
+    }
+
+    fn drops(checked: &ChunkValues) -> &BTreeMap<String, i64> {
+        &checked.checked.drops
+    }
+
+    async fn read(
+        &self,
+        after: i64,
+        paths: Option<&GlobSet>,
+        sampling: bool,
+        plan: &mut Plan,
+    ) -> Result<Option<(i64, Vec<Chunk>)>> {
+        let config = self.base.config;
+        let attributes = &config.attributes;
+        let filter = Filter {
+            sources: &attributes.sources,
+            doc_types: &attributes.doc_types,
+            min_chars: config.llm_extract.min_chars as i32,
+            extracted: self.extracted,
+            context_chars: attributes.context_chars as i32,
         };
-        after = last.id;
+        let eligible =
+            db::attributes::eligible(self.base.pool, &filter, after, attributes.read_batch).await?;
+        let Some(last) = eligible.last().map(|c| c.id) else {
+            return Ok(None);
+        };
         plan.scanned += eligible.len();
         let eligible: Vec<Eligible> = eligible
             .into_iter()
-            .filter(|c| paths.as_ref().is_none_or(|set| set.is_match(&c.path)))
+            .filter(|c| paths.is_none_or(|set| set.is_match(&c.path)))
             .collect();
-        let hit = parallel_map(&eligible, setup.threads, |c| text_hit(setup, c));
+        let hit = crate::cpu::blocking(|| {
+            crate::cpu::map(&self.threads, &eligible, |c| text_hit(self, c))
+        });
+        let mut stale = Vec::new();
         let eligible: Vec<Eligible> = eligible
             .into_iter()
             .zip(hit)
-            .filter_map(|(chunk, hit)| hit.then_some(chunk))
+            .filter_map(|(chunk, hit)| {
+                if !hit && chunk.attr_key.is_some() {
+                    stale.push(chunk.id);
+                }
+                hit.then_some(chunk)
+            })
             .collect();
-        let with_subject: HashSet<i64> = if options.sample.is_some() {
+        plan.stale.extend(stale);
+        let with_subject: HashSet<i64> = if sampling {
             let ids: Vec<i64> = eligible.iter().map(|c| c.id).collect();
-            prepare(setup, &ids)
+            prepare(self, &ids)
                 .await?
                 .into_iter()
                 .map(|p| p.chunk.id)
@@ -304,353 +279,105 @@ async fn plan(setup: &Setup<'_>, options: &Options, seed: &str) -> Result<Plan> 
         } else {
             HashSet::new()
         };
-        let mut batch = Vec::new();
+        let mut chunks = Vec::new();
         for chunk in eligible {
-            let source = source_order
-                .iter()
-                .position(|s| **s == chunk.source)
-                .unwrap_or(source_order.len());
-            let row = Row {
-                id: chunk.id,
-                attr_key: chunk.attr_key.clone(),
-                order: (source, chunk.document_id, chunk.id),
-            };
-            if options.sample.is_some() {
-                if !with_subject.contains(&chunk.id) {
-                    continue;
+            if sampling && !with_subject.contains(&chunk.id) {
+                if chunk.attr_key.is_some() {
+                    plan.stale.push(chunk.id);
                 }
-                candidates.push(Candidate {
-                    id: chunk.id,
-                    document_id: chunk.document_id,
-                    stratum: format!(
-                        "{}\u{1f}{}\u{1f}{}",
-                        chunk.source,
-                        chunk.doc_type.as_deref().unwrap_or(""),
-                        first_folder(&chunk.path)
-                    ),
-                    text_hash: text_hash(&chunk.text),
-                    letters: letter_share(&chunk.text),
-                    ocr_confidence: chunk.ocr_confidence,
-                    matched: chunk.matched,
-                });
-                rows.insert(chunk.id, row);
-            } else {
-                batch.push(row);
-            }
-        }
-        compare(setup, &batch, &mut plan).await?;
-    }
-    if let Some(size) = options.sample {
-        let settings = Settings {
-            size,
-            seed,
-            max_per_document: extract.max_per_document,
-            unmatched_share: extract.unmatched_share,
-            min_letter_share: extract.min_letter_share,
-            min_ocr_confidence: extract.min_ocr_confidence,
-        };
-        let selected = select(&candidates, &settings);
-        println!(
-            "attributes: sample of {} from {} chunks with a value and a subject ({} repeated \
-             texts and {} unreadable or mostly numbers left out)",
-            selected.ids.len(),
-            candidates.len(),
-            selected.duplicates,
-            selected.junk
-        );
-        let mut picked = Vec::new();
-        for (rank, id) in selected.ids.iter().enumerate() {
-            if let Some(mut row) = rows.remove(id) {
-                row.order = (rank, 0, 0);
-                picked.push(row);
-            }
-        }
-        for part in picked.chunks(BATCH as usize) {
-            compare(setup, part, &mut plan).await?;
-        }
-    }
-    plan.todo.sort_by_key(|t| t.order);
-    Ok(plan)
-}
-
-async fn split_known(pool: &PgPool, todo: &[Todo]) -> Result<(HashSet<String>, HashSet<String>)> {
-    let mut cached = HashSet::new();
-    let mut invalid = HashSet::new();
-    for part in todo.chunks(KEY_BATCH) {
-        let keys: Vec<String> = part.iter().map(|t| t.cache_key.clone()).collect();
-        let (hit, bad) = db::llm::known_keys(pool, &keys).await?;
-        cached.extend(hit);
-        invalid.extend(bad);
-    }
-    Ok((cached, invalid))
-}
-
-fn chunk_values(setup: &Setup<'_>, prepared: Prepared, response: &str) -> Option<ChunkValues> {
-    let answer: Answer = serde_json::from_str(response).ok()?;
-    let checked = check(
-        answer,
-        &prepared.built,
-        &prepared.chunk.text,
-        &prepared.context,
-        setup.ontology,
-        setup.units,
-        &Limits {
-            max_text_chars: setup.config.attributes.max_text_chars,
-        },
-    );
-    Some(ChunkValues {
-        chunk_id: prepared.chunk.id,
-        key: prepared.built.key,
-        scale: prepared.chunk.ocr_scale(),
-        checked,
-    })
-}
-
-async fn write_cached(
-    setup: &Setup<'_>,
-    ids: &[i64],
-    method: &str,
-    confidence: &Confidence,
-) -> Result<usize> {
-    let mut written = 0;
-    for part in ids.chunks(BATCH as usize) {
-        let prepared = prepare(setup, part).await?;
-        let keys: Vec<String> = prepared.iter().map(|p| p.built.cache_key.clone()).collect();
-        let cache = db::llm::cached(setup.pool, &keys).await?;
-        let mut values = Vec::new();
-        for item in prepared {
-            let Some(response) = cache.get(&item.built.cache_key) else {
                 continue;
-            };
-            if let Some(chunk) = chunk_values(setup, item, response) {
-                values.push(chunk);
             }
+            chunks.push(Chunk {
+                id: chunk.id,
+                key: chunk.attr_key,
+                source: chunk.source,
+                document_id: chunk.document_id,
+                doc_type: chunk.doc_type,
+                path: chunk.path,
+                text: chunk.text,
+                ocr_confidence: chunk.ocr_confidence,
+                matched: chunk.matched,
+            });
         }
-        written += values.len();
-        db::attributes::write(setup.pool, &values, method, confidence).await?;
+        Ok(Some((last, chunks)))
     }
-    Ok(written)
-}
 
-async fn open_job(setup: &Setup<'_>, options: &Options, version_id: i64) -> Result<Option<Job>> {
-    let Some(open) = db::llm::open_job(setup.pool, TASK).await? else {
-        return Ok(None);
-    };
-    let name = setup.name;
-    let changed = open.provider != name.provider.as_str()
-        || open.model != name.model
-        || open.ontology_version_id != Some(version_id);
-    if !(options.new || changed) {
-        return Ok(Some(open));
+    async fn prepare(&self, ids: &[i64]) -> Result<Vec<Prepared>> {
+        prepare(self, ids).await
     }
-    if !options.dry_run {
-        let reason = if options.new {
-            "abandoned by --new"
-        } else {
-            "model or ontology changed"
-        };
-        db::llm::set_job(setup.pool, open.id, "abandoned", Some(reason), None).await?;
-        println!("attributes job {}: abandoned, {reason}", open.id);
-    }
-    Ok(None)
-}
 
-async fn run_with(setup: &Setup<'_>, options: &Options) -> Result<Outcome> {
-    let pool = setup.pool;
-    let config = setup.config;
-    let Some(version_id) = db::fit::ontology_version(pool, &setup.ontology.version).await? else {
-        bail!("the ontology changed since the last scan; run zontologize scan first");
-    };
-    let seed = options
-        .seed
-        .clone()
-        .unwrap_or_else(|| config.llm_extract.seed.clone());
-    let started = std::time::Instant::now();
-    let plan = plan(setup, options, &seed).await?;
-    let (cached, invalid) = split_known(pool, &plan.todo).await?;
-    let resend = plan
-        .todo
-        .iter()
-        .filter(|t| t.resend && !cached.contains(&t.cache_key))
-        .count();
-    let hits: Vec<i64> = plan
-        .todo
-        .iter()
-        .filter(|t| cached.contains(&t.cache_key))
-        .map(|t| t.chunk_id)
-        .collect();
-    let to_send: Vec<&Todo> = plan
-        .todo
-        .iter()
-        .filter(|t| !cached.contains(&t.cache_key) && !invalid.contains(&t.cache_key))
-        .collect();
-    println!(
-        "attributes: {} chunks read, {} with a value and a subject, {} done before, {} from the \
-         cache, {} to send, {} invalid before, {resend} to send again after a change ({:.1} s)",
-        plan.scanned,
-        plan.eligible,
-        plan.done,
-        hits.len(),
-        to_send.len(),
-        plan.todo.len() - hits.len() - to_send.len(),
-        started.elapsed().as_secs_f64()
-    );
-    let share = config.llm_extract.resend_share;
-    if plan.eligible > 0 && resend as f64 > share * plan.eligible as f64 && !options.yes {
+    fn check(&self, item: Prepared, answer: Answer) -> ChunkValues {
+        let checked = check(
+            answer,
+            &item.built,
+            &item.chunk.text,
+            &item.context,
+            self.ontology,
+            self.units,
+            &Limits {
+                max_text_chars: self.base.config.attributes.max_text_chars,
+            },
+        );
+        ChunkValues {
+            chunk_id: item.chunk.id,
+            key: item.built.key,
+            scale: item.chunk.ocr_scale(),
+            checked,
+        }
+    }
+
+    async fn write(
+        &self,
+        checked: &[ChunkValues],
+        method: &str,
+        confidence: &Confidence,
+        _version_id: i64,
+    ) -> Result<()> {
+        db::attributes::write(self.base.pool, checked, method, confidence).await
+    }
+
+    fn summary(&self, plan: &Plan, counts: &Counts, started: Instant) {
         println!(
-            "attributes: {resend} of {} chunks would be sent again, more than resend_share \
-             {:.0}%; run with --yes to go on",
+            "attributes: {} chunks read, {} with a value and a subject, {} done before, {} from \
+             the cache, {} to send, {} invalid before, {} to send again after a change ({:.1} s)",
+            plan.scanned,
             plan.eligible,
-            share * 100.0
+            plan.done,
+            counts.hits,
+            counts.send,
+            counts.invalid,
+            counts.resend,
+            started.elapsed().as_secs_f64()
         );
-        if !options.dry_run {
-            bail!("attributes stopped before sending {resend} chunks again; run with --yes");
+    }
+
+    async fn clear(&self, stale: &[i64], dry_run: bool) -> Result<()> {
+        if !dry_run {
+            db::attributes::clear(self.base.pool, stale).await?;
         }
-    }
-    let method = setup.name.method();
-    let precision = db::review::precision(pool).await?;
-    let confidence = Confidence {
-        base: config.attributes.confidence,
-        measured: crate::review::measured(&precision, &method, config.review.min_verdicts),
-    };
-    let mut job = open_job(setup, options, version_id).await?;
-    if !options.dry_run && !hits.is_empty() {
-        let written = write_cached(setup, &hits, &method, &confidence).await?;
-        println!("attributes: values written from the cache for {written} chunks");
-    }
-    let out = PathBuf::from(&config.attributes.out);
-    if to_send.is_empty() && !options.dry_run {
-        if let Some(open) = &job {
-            db::llm::set_job(pool, open.id, "finished", None, None).await?;
-        }
-        super::report::write_report(pool, setup.ontology, config, &out, None).await?;
-        println!("attributes: nothing to send");
-        return Ok(Outcome::Finished);
-    }
-    if job.is_none() && !options.dry_run {
-        let created = db::llm::create_job(
-            pool,
-            TASK,
-            setup.name.provider.as_str(),
-            &setup.name.model,
-            version_id,
-            &JobParams::default(),
-            &[],
-        )
-        .await?;
-        println!("attributes job {}: new", created.id);
-        job = Some(created);
-    }
-    let job_id = job.as_ref().map_or(0, |j| j.id);
-    let mut lock = pool.acquire().await?;
-    if job_id > 0 && !db::llm::lock(&mut lock, job_id).await? {
-        bail!("attributes job {job_id} is running in another process");
-    }
-    let (queue, chunk_of) = if job_id > 0 {
-        let ids: Vec<i64> = to_send.iter().map(|t| t.chunk_id).collect();
-        let keys: Vec<String> = to_send.iter().map(|t| t.cache_key.clone()).collect();
-        let ords = db::llm::replace_items(pool, job_id, &ids, &keys).await?;
-        let queue: VecDeque<Work> = ords
-            .iter()
-            .zip(&to_send)
-            .map(|(ord, t)| Work {
-                ord: *ord,
-                chars: t.chars,
-            })
-            .collect();
-        let chunk_of = ords.iter().copied().zip(ids).collect();
-        (queue, chunk_of)
-    } else {
-        let queue = to_send
-            .iter()
-            .enumerate()
-            .map(|(i, t)| Work {
-                ord: i as i32 + 1,
-                chars: t.chars,
-            })
-            .collect();
-        (queue, HashMap::new())
-    };
-    let handler = Attributes {
-        setup,
-        job: job_id,
-        method,
-        confidence,
-        out,
-        chunk_of,
-        pending: Mutex::new(HashMap::new()),
-    };
-    let runner = Runner {
-        pool,
-        config,
-        name: setup.name,
-        job_id,
-        resume_after: job.as_ref().and_then(|j| j.resume_after),
-    };
-    let limits = options.limits();
-    job::run(&runner, &handler, queue, &limits).await
-}
-
-impl Attributes<'_> {
-    fn take(&self, ord: i32) -> Option<Prepared> {
-        self.pending.lock().ok()?.remove(&ord)
-    }
-}
-
-impl Handler for Attributes<'_> {
-    fn task(&self) -> &'static str {
-        TASK
-    }
-
-    fn label(&self) -> String {
-        format!("attributes job {}", self.job)
-    }
-
-    async fn request(&self, ord: i32) -> Result<Option<(String, Request)>> {
-        let Some(chunk_id) = self.chunk_of.get(&ord) else {
-            return Ok(None);
-        };
-        let Some(prepared) = prepare(self.setup, &[*chunk_id]).await?.pop() else {
-            return Ok(None);
-        };
-        let pair = (
-            prepared.built.cache_key.clone(),
-            prepared.built.request.clone(),
+        println!(
+            "attributes: values of {} chunks that no longer have a value and a subject {}",
+            stale.len(),
+            if dry_run {
+                "would be removed"
+            } else {
+                "removed"
+            }
         );
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.insert(ord, prepared);
-        }
-        Ok(Some(pair))
+        Ok(())
     }
 
-    fn accepts(&self, _ord: i32, response: &str) -> Result<(), String> {
-        serde_json::from_str::<Answer>(response)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+    async fn tidy(&self) -> Result<()> {
+        Ok(())
     }
 
-    async fn answered(&self, ord: i32, response: &str) -> Result<()> {
-        let Some(prepared) = self.take(ord) else {
-            return Ok(());
-        };
-        let Some(values) = chunk_values(self.setup, prepared, response) else {
-            return Ok(());
-        };
-        let drops = values.checked.drops.clone();
-        db::attributes::write(self.setup.pool, &[values], &self.method, &self.confidence).await?;
-        db::llm::add_stats(self.setup.pool, self.job, &drops).await
-    }
-
-    async fn report(&self) -> Result<()> {
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.clear();
-        }
+    async fn report(&self, job: Option<i64>) -> Result<()> {
         super::report::write_report(
-            self.setup.pool,
-            self.setup.ontology,
-            self.setup.config,
+            self.base.pool,
+            self.ontology,
+            self.base.config,
             &self.out,
-            Some(self.job),
+            job,
         )
         .await
     }

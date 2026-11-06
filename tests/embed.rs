@@ -226,7 +226,8 @@ async fn eval_report_lists_every_model_and_the_questions() {
     )
     .unwrap();
     let config = zontologize::config::load(Some(&env.config())).unwrap();
-    let ontology = zontologize::embed::run::load_ontology(Some(&env.config()), &config).unwrap();
+    let ontology =
+        zontologize::ontology::load_or_empty(Some(&env.config()), &config.ontology).unwrap();
     let questions = zontologize::embed::eval::read_questions(Some(&env.config())).unwrap();
     let sample =
         zontologize::embed::eval::sample(&env.pool, &config, &ontology, &questions, 50, "s")

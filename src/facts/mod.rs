@@ -6,13 +6,16 @@ pub mod sample;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::hash::hex;
 use crate::llm::prompt::Prompt;
-use crate::llm::shortlist::{label, local_name, shortlist, shortlist_lines};
+use crate::llm::shortlist::{label, shortlist, shortlist_lines};
 use crate::llm::{ModelName, Request};
-use crate::ontology::{Ontology, PropertyKind, hex};
+use crate::ns::local_name;
+use crate::ontology::{Ontology, PropertyKind};
 
 pub const TASK: &str = "extract";
-pub const STAGE_VERSION: u32 = 1;
+pub const CACHE_VERSION: u32 = 1;
+pub const CHECK_VERSION: u32 = 2;
 pub const DOC: &str = "doc";
 pub const USER_VARIABLES: [&str; 7] = [
     "path",
@@ -84,6 +87,7 @@ pub struct Built {
     pub known: Vec<Known>,
     pub doc_class: Option<String>,
     pub request: Request,
+    pub cache_key: String,
     pub key: String,
 }
 
@@ -91,19 +95,17 @@ pub struct Context<'a> {
     pub ontology: &'a Ontology,
     pub languages: &'a [String],
     pub max_shortlist: usize,
+    pub max_known: usize,
+    pub definition_chars: usize,
     pub exclude: &'a [String],
+    pub check_key: &'a str,
     pub system: &'a Prompt,
     pub user: &'a Prompt,
     pub model: &'a ModelName,
 }
 
-pub fn allowed_properties(ontology: &Ontology, available: &[&str]) -> Vec<String> {
-    let fits = |bounds: &[String]| {
-        bounds.is_empty()
-            || available
-                .iter()
-                .any(|class| bounds.iter().any(|bound| ontology.is_a(class, bound)))
-    };
+fn allowed_properties(ontology: &Ontology, available: &[&str]) -> Vec<String> {
+    let fits = |bounds: &[String]| available.iter().any(|class| ontology.fits(class, bounds));
     ontology
         .properties
         .values()
@@ -121,9 +123,6 @@ fn class_name(ontology: &Ontology, iri: &str, languages: &[String]) -> String {
 }
 
 fn bound_names(ontology: &Ontology, bounds: &[String], languages: &[String]) -> String {
-    if bounds.is_empty() {
-        return "anything".to_string();
-    }
     bounds
         .iter()
         .map(|b| class_name(ontology, b, languages))
@@ -151,7 +150,7 @@ pub fn property_lines(ontology: &Ontology, properties: &[String], languages: &[S
     out
 }
 
-pub fn known_lines(known: &[Known], doc_class: Option<&str>) -> String {
+fn known_lines(known: &[Known], doc_class: Option<&str>) -> String {
     let mut out = String::new();
     if let Some(class) = doc_class {
         out.push_str(&format!("- {DOC} | {class} | this document\n"));
@@ -247,11 +246,17 @@ pub fn schema(
     })
 }
 
-pub fn key(request: &Request, model: &ModelName) -> String {
+pub fn check_key(ontology: &Ontology) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(TASK.as_bytes());
-    hasher.update(STAGE_VERSION.to_le_bytes());
-    hasher.update(request.key(model).as_bytes());
+    hasher.update(CHECK_VERSION.to_le_bytes());
+    hasher.update(ontology.version.as_bytes());
+    hex(&hasher.finalize())
+}
+
+pub fn state_key(cache_key: &str, check_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(cache_key.as_bytes());
+    hasher.update(check_key.as_bytes());
     hex(&hasher.finalize())
 }
 
@@ -268,7 +273,7 @@ pub fn build(context: &Context, input: &ChunkInput) -> Built {
     let known: Vec<Known> = input
         .known
         .iter()
-        .take(context.max_shortlist)
+        .take(context.max_known)
         .cloned()
         .collect();
     let mut available: Vec<&str> = list.iter().map(String::as_str).collect();
@@ -283,7 +288,7 @@ pub fn build(context: &Context, input: &ChunkInput) -> Built {
         ("languages", &languages.join(", ")),
         (
             "shortlist",
-            shortlist_lines(ontology, &list, languages).trim_end(),
+            shortlist_lines(ontology, &list, languages, context.definition_chars).trim_end(),
         ),
         (
             "properties",
@@ -301,13 +306,15 @@ pub fn build(context: &Context, input: &ChunkInput) -> Built {
         user,
         schema: schema(&list, &properties, languages),
     };
-    let key = key(&request, context.model);
+    let cache_key = request.stage_key(context.model, CACHE_VERSION);
+    let key = state_key(&cache_key, context.check_key);
     Built {
         shortlist: list,
         properties,
         known,
         doc_class: input.doc_class.clone(),
         request,
+        cache_key,
         key,
     }
 }
@@ -340,7 +347,7 @@ pub mod tests {
         format!("{EX}{name}")
     }
 
-    pub fn ontology_from(ttl: &str) -> Ontology {
+    fn ontology_from(ttl: &str) -> Ontology {
         let config = OntologyConfig {
             files: vec!["a.ttl".to_string()],
             languages: vec!["en".to_string()],
@@ -395,7 +402,10 @@ pub mod tests {
             ontology,
             languages: &languages,
             max_shortlist: 10,
+            max_known: 10,
+            definition_chars: 200,
             exclude: &[],
+            check_key: "check",
             system: &system,
             user: &user,
             model: &model,
@@ -412,6 +422,30 @@ pub mod tests {
         assert_eq!(allowed, [iri("installedAt")]);
         allowed = allowed_properties(&onto, &[&iri("Pump"), &iri("Report")]);
         assert_eq!(allowed, [iri("mentions")]);
+        let config = OntologyConfig {
+            files: vec![],
+            languages: languages(),
+            include: vec![iri("Asset"), iri("Site"), iri("near"), iri("about")],
+            exclude: vec![],
+            document_class: String::new(),
+        };
+        let text = format!(
+            "{TTL} ex:near a owl:ObjectProperty ; rdfs:domain ex:Asset .\n\
+             ex:about a owl:ObjectProperty ; rdfs:range ex:Site .\n"
+        );
+        let loaded = crate::ontology::load_sources(&[("a.ttl".to_string(), text.into())], &config);
+        let open = &loaded.ontology;
+        assert!(open.properties[&iri("near")].selected);
+        assert!(open.properties[&iri("about")].selected);
+        allowed = allowed_properties(open, &[&iri("Pump"), &iri("Site")]);
+        assert_eq!(allowed, [iri("installedAt")]);
+        let warnings: Vec<&str> = loaded.findings.iter().map(|f| f.message.as_str()).collect();
+        assert!(
+            warnings
+                .iter()
+                .any(|m| m.contains("near: no domain or range")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
@@ -457,16 +491,31 @@ pub mod tests {
     fn key_follows_what_the_request_shows() {
         let onto = ontology();
         let chunk = input(&[("Pump", 1)]);
-        let before = built(&onto, &chunk).key;
+        let before = built(&onto, &chunk).cache_key;
         let alias = TTL.replace(
             r#"ex:Site a owl:Class ; skos:prefLabel "Site"@en ."#,
             r#"ex:Site a owl:Class ; skos:prefLabel "Site"@en ; skos:altLabel "Plant"@en ."#,
         );
-        assert_eq!(built(&ontology_from(&alias), &chunk).key, before);
+        assert_eq!(built(&ontology_from(&alias), &chunk).cache_key, before);
         let property = format!(
             "{TTL} ex:checks a owl:ObjectProperty ; rdfs:domain ex:Pump ; rdfs:range ex:Asset ."
         );
-        assert_ne!(built(&ontology_from(&property), &chunk).key, before);
+        assert_ne!(built(&ontology_from(&property), &chunk).cache_key, before);
+    }
+
+    #[test]
+    fn check_changes_move_the_state_key_but_not_the_cache_key() {
+        let onto = ontology();
+        let alias = ontology_from(&TTL.replace(
+            r#"ex:Site a owl:Class ; skos:prefLabel "Site"@en ."#,
+            r#"ex:Site a owl:Class ; skos:prefLabel "Site"@en ; skos:altLabel "Plant"@en ."#,
+        ));
+        assert_ne!(check_key(&onto), check_key(&alias));
+        let request = built(&onto, &input(&[("Pump", 1)]));
+        let same = state_key(&request.cache_key, &check_key(&onto));
+        let other = state_key(&request.cache_key, &check_key(&alias));
+        assert_ne!(same, other);
+        assert_eq!(request.key, state_key(&request.cache_key, "check"));
     }
 
     pub fn recorded<T: serde::de::DeserializeOwned>(name: &str) -> T {

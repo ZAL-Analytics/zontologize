@@ -5,6 +5,7 @@ pub mod ollama;
 pub mod openrouter;
 pub mod prompt;
 pub mod shortlist;
+pub mod stage;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -14,10 +15,31 @@ use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 use sqlx::types::chrono::{DateTime, Utc};
 
-use crate::config::Config;
+use crate::config::{Config, ProvidersConfig};
 
 pub const RETRIES: u32 = 3;
 pub const METHOD_PREFIX: &str = "llm:";
+
+#[derive(Debug, serde::Serialize)]
+pub struct ChatMessage<'a> {
+    role: &'static str,
+    content: &'a str,
+}
+
+pub fn messages(request: &Request) -> [ChatMessage<'_>; 2] {
+    [
+        ChatMessage {
+            role: "system",
+            content: &request.system,
+        },
+        ChatMessage {
+            role: "user",
+            content: &request.user,
+        },
+    ]
+}
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
+const JITTER_SHARE: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -27,11 +49,63 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
+    pub const ALL: [ProviderKind; 3] = [
+        ProviderKind::ClaudeCode,
+        ProviderKind::OpenRouter,
+        ProviderKind::Ollama,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             ProviderKind::ClaudeCode => "claude-code",
             ProviderKind::OpenRouter => "openrouter",
             ProviderKind::Ollama => "ollama",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<ProviderKind> {
+        ProviderKind::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == name)
+    }
+
+    pub fn expected() -> String {
+        let names: Vec<&str> = ProviderKind::ALL.iter().map(|k| k.as_str()).collect();
+        match names.split_last() {
+            Some((last, [])) => last.to_string(),
+            Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+            None => String::new(),
+        }
+    }
+
+    pub fn concurrency(self, providers: &ProvidersConfig) -> usize {
+        match self {
+            ProviderKind::ClaudeCode => providers.claude_code.concurrency,
+            ProviderKind::OpenRouter => providers.openrouter.concurrency,
+            ProviderKind::Ollama => providers.ollama.concurrency,
+        }
+    }
+
+    pub fn has_windows(self) -> bool {
+        self == ProviderKind::ClaudeCode
+    }
+
+    fn key_parts(self, providers: &ProvidersConfig) -> Vec<String> {
+        match self {
+            ProviderKind::ClaudeCode => Vec::new(),
+            ProviderKind::OpenRouter => {
+                let base_url = providers.openrouter.base_url.trim_end_matches('/');
+                if base_url == openrouter::DEFAULT_BASE_URL {
+                    return Vec::new();
+                }
+                vec![format!("base_url={base_url}")]
+            }
+            ProviderKind::Ollama => {
+                if providers.ollama.think == ollama::DEFAULT_THINK {
+                    return Vec::new();
+                }
+                vec![format!("think={}", providers.ollama.think)]
+            }
         }
     }
 }
@@ -40,6 +114,7 @@ impl ProviderKind {
 pub struct ModelName {
     pub provider: ProviderKind,
     pub model: String,
+    pub key_parts: Vec<String>,
 }
 
 impl ModelName {
@@ -47,15 +122,11 @@ impl ModelName {
         let Some((provider, model)) = name.split_once(':') else {
             return Err(format!("{name:?} must be provider:model"));
         };
-        let provider = match provider {
-            "claude-code" => ProviderKind::ClaudeCode,
-            "openrouter" => ProviderKind::OpenRouter,
-            "ollama" => ProviderKind::Ollama,
-            other => {
-                return Err(format!(
-                    "unknown provider {other:?} in {name:?}, expected claude-code, openrouter or ollama"
-                ));
-            }
+        let Some(provider) = ProviderKind::parse(provider) else {
+            return Err(format!(
+                "unknown provider {provider:?} in {name:?}, expected {}",
+                ProviderKind::expected()
+            ));
         };
         if model.trim().is_empty() {
             return Err(format!("{name:?} has no model after the provider"));
@@ -63,7 +134,14 @@ impl ModelName {
         Ok(ModelName {
             provider,
             model: model.to_string(),
+            key_parts: Vec::new(),
         })
+    }
+
+    pub fn configured(name: &str, providers: &ProvidersConfig) -> Result<ModelName, String> {
+        let mut model = ModelName::parse(name)?;
+        model.key_parts = model.provider.key_parts(providers);
+        Ok(model)
     }
 }
 
@@ -100,7 +178,15 @@ impl Request {
             hasher.update(part.as_bytes());
             hasher.update([0]);
         }
-        crate::ontology::hex(&hasher.finalize())
+        for part in &model.key_parts {
+            hasher.update(part.as_bytes());
+            hasher.update([0]);
+        }
+        crate::hash::hex(&hasher.finalize())
+    }
+
+    pub fn stage_key(&self, model: &ModelName, version: u32) -> String {
+        crate::hash::stage_hash(&[self.task.as_bytes()], version, self.key(model).as_bytes())
     }
 
     pub fn chars(&self) -> usize {
@@ -154,8 +240,20 @@ pub enum CallError {
         resume: Resume,
         reason: String,
     },
-    Invalid(String),
+    Invalid {
+        message: String,
+        usage: Usage,
+    },
     Fatal(String),
+}
+
+impl CallError {
+    pub fn invalid(message: String) -> CallError {
+        CallError::Invalid {
+            message,
+            usage: Usage::default(),
+        }
+    }
 }
 
 impl fmt::Display for CallError {
@@ -163,7 +261,7 @@ impl fmt::Display for CallError {
         match self {
             CallError::Retry { message, .. } => write!(f, "{message}"),
             CallError::Pause { reason, .. } => write!(f, "{reason}"),
-            CallError::Invalid(message) => write!(f, "invalid answer: {message}"),
+            CallError::Invalid { message, .. } => write!(f, "invalid answer: {message}"),
             CallError::Fatal(message) => write!(f, "{message}"),
         }
     }
@@ -214,20 +312,34 @@ impl Provider {
             Provider::Ollama(provider) => provider.send(request).await,
         }
     }
+
+    pub async fn prices(&self) -> Result<Option<openrouter::Prices>> {
+        Ok(match self {
+            Provider::OpenRouter(provider) => Some(provider.prices().await?),
+            Provider::Ollama(_) => Some(openrouter::Prices {
+                input: 0.0,
+                output: 0.0,
+            }),
+            Provider::ClaudeCode(_) => None,
+        })
+    }
+
+    pub async fn credit(&self) -> Result<Option<openrouter::Credit>> {
+        match self {
+            Provider::OpenRouter(provider) => Ok(Some(provider.credit().await?)),
+            Provider::ClaudeCode(_) | Provider::Ollama(_) => Ok(None),
+        }
+    }
+
+    pub fn has_credit(&self) -> bool {
+        matches!(self, Provider::OpenRouter(_))
+    }
 }
 
 pub fn claude_program() -> PathBuf {
     std::env::var_os(claude_code::BIN_VARIABLE)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(claude_code::DEFAULT_BIN))
-}
-
-pub fn concurrency(name: &ModelName, config: &Config) -> usize {
-    match name.provider {
-        ProviderKind::ClaudeCode => config.providers.claude_code.concurrency,
-        ProviderKind::OpenRouter => config.providers.openrouter.concurrency,
-        ProviderKind::Ollama => config.providers.ollama.concurrency,
-    }
 }
 
 pub async fn send_with_retries(
@@ -240,13 +352,34 @@ pub async fn send_with_retries(
         let result = provider.send(request).await;
         match result {
             Err(CallError::Retry { after, .. }) if attempt < RETRIES => {
-                let wait = after.unwrap_or(backoff * 2u32.pow(attempt));
+                let wait = retry_wait(after, backoff, attempt);
                 attempt += 1;
-                tokio::time::sleep(wait).await;
+                tokio::time::sleep(with_jitter(wait)).await;
             }
             result => return (result, attempt),
         }
     }
+}
+
+pub(crate) fn random() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+fn retry_wait(after: Option<Duration>, backoff: Duration, attempt: u32) -> Duration {
+    after.map_or(backoff * 2u32.pow(attempt), |after| {
+        after.min(MAX_RETRY_AFTER)
+    })
+}
+
+fn with_jitter(wait: Duration) -> Duration {
+    let spread = wait.as_millis() as u64 / JITTER_SHARE;
+    if spread == 0 {
+        return wait;
+    }
+    wait + Duration::from_millis(random() % spread)
 }
 
 pub fn retry_after(value: Option<&str>) -> Option<Duration> {
@@ -270,11 +403,13 @@ mod tests {
                 .unwrap_err()
                 .contains("provider:model")
         );
-        assert!(
-            ModelName::parse("openai:gpt")
-                .unwrap_err()
-                .contains("unknown provider")
+        assert_eq!(
+            ModelName::parse("openai:gpt").unwrap_err(),
+            "unknown provider \"openai\" in \"openai:gpt\", expected claude-code, openrouter or ollama"
         );
+        for kind in ProviderKind::ALL {
+            assert_eq!(ProviderKind::parse(kind.as_str()), Some(kind));
+        }
         assert!(ModelName::parse("claude-code:").is_err());
     }
 
@@ -306,6 +441,49 @@ mod tests {
         assert_eq!(retry_after(Some("7")), Some(Duration::from_secs(7)));
         assert_eq!(retry_after(Some("soon")), None);
         assert_eq!(retry_after(None), None);
+    }
+
+    #[test]
+    fn retry_after_is_capped_and_jittered() {
+        let backoff = Duration::from_secs(2);
+        assert_eq!(retry_wait(None, backoff, 2), Duration::from_secs(8));
+        assert_eq!(
+            retry_wait(Some(Duration::from_secs(5)), backoff, 0),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            retry_wait(Some(Duration::from_secs(86_400)), backoff, 0),
+            MAX_RETRY_AFTER
+        );
+        let wait = Duration::from_secs(100);
+        let waits: Vec<Duration> = (0..20).map(|_| with_jitter(wait)).collect();
+        assert!(waits.iter().all(|w| *w >= wait && *w < wait + wait / 4));
+        assert!(waits.iter().any(|w| *w != waits[0]));
+    }
+
+    #[test]
+    fn key_parts_only_when_not_default() {
+        let config = crate::config::load(None).unwrap();
+        assert_eq!(
+            config.providers.openrouter.base_url,
+            openrouter::DEFAULT_BASE_URL
+        );
+        assert_eq!(config.providers.ollama.think, ollama::DEFAULT_THINK);
+        let mut providers = config.providers.clone();
+        providers.openrouter.base_url = format!("{}/", openrouter::DEFAULT_BASE_URL);
+        providers.ollama.think = ollama::DEFAULT_THINK;
+        for name in ["claude-code:sonnet", "ollama:qwen3.5:4b", "openrouter:x/y"] {
+            let plain = ModelName::parse(name).unwrap();
+            let configured = ModelName::configured(name, &providers).unwrap();
+            assert_eq!(request("a").key(&plain), request("a").key(&configured));
+        }
+        providers.ollama.think = !ollama::DEFAULT_THINK;
+        providers.openrouter.base_url = "http://localhost:9999/api/v1".to_string();
+        for name in ["ollama:qwen3.5:4b", "openrouter:x/y"] {
+            let plain = ModelName::parse(name).unwrap();
+            let configured = ModelName::configured(name, &providers).unwrap();
+            assert_ne!(request("a").key(&plain), request("a").key(&configured));
+        }
     }
 
     #[tokio::test]

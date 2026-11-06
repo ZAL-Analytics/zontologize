@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,16 +10,13 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use super::budget::{self, Defaults, Estimate};
-use super::openrouter::Prices;
-use super::{CallError, ModelName, Provider, ProviderKind, Reply, Request, Resume, Windows};
+use super::{CallError, ModelName, Provider, Reply, Request, Resume, Windows};
 use crate::config::Config;
 use crate::db;
-use crate::db::llm::Call;
+use crate::db::llm::{Call, Job, JobParams};
 
-const PROGRESS_SECONDS: u64 = 60;
 pub const GONE: &str = "the item no longer exists";
-const WAIT_MARGIN_SECONDS: u64 = 60;
-const UNKNOWN_RESET_WAIT_MINUTES: u64 = 30;
+const MAX_PAUSES_PER_ITEM: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -39,7 +36,7 @@ pub struct Options {
     pub sample: Option<usize>,
     pub seed: Option<String>,
     pub extracted: bool,
-    pub backoff: Duration,
+    pub backoff: Option<Duration>,
 }
 
 impl Options {
@@ -55,31 +52,9 @@ impl Options {
             sample: None,
             seed: None,
             extracted: false,
-            backoff: Duration::from_secs(2),
+            backoff: None,
         }
     }
-}
-
-impl Options {
-    pub fn limits(&self) -> Limits {
-        Limits {
-            claude_program: self.claude_program.clone(),
-            max_usd: self.max_usd,
-            max_requests: self.max_requests,
-            dry_run: self.dry_run,
-            no_wait: self.no_wait,
-            backoff: self.backoff,
-        }
-    }
-}
-
-pub struct Limits {
-    pub claude_program: PathBuf,
-    pub max_usd: Option<f64>,
-    pub max_requests: Option<u64>,
-    pub dry_run: bool,
-    pub no_wait: bool,
-    pub backoff: Duration,
 }
 
 pub struct Work {
@@ -123,6 +98,7 @@ struct Sender {
     concurrency: usize,
     caps: Caps,
     backoff: Duration,
+    next_cost: f64,
 }
 
 enum Stop {
@@ -133,11 +109,58 @@ enum Stop {
     Fatal(String),
 }
 
-pub fn percent(value: f64) -> String {
+pub(crate) async fn reopen(
+    pool: &PgPool,
+    task: &str,
+    name: &ModelName,
+    version_id: i64,
+    params: &JobParams,
+    options: &Options,
+    abandon_changed: bool,
+) -> Result<Option<Job>> {
+    let Some(open) = db::llm::open_job(pool, task).await? else {
+        return Ok(None);
+    };
+    let mut differences = Vec::new();
+    if open.provider != name.provider.as_str() || open.model != name.model {
+        differences.push(format!("model {}:{}", open.provider, open.model));
+    }
+    if open.params.0 != *params {
+        differences.push(format!(
+            "sample {} with seed {:?}",
+            open.params.0.sample, open.params.0.seed
+        ));
+    }
+    if open.ontology_version_id != Some(version_id) {
+        differences.push("another ontology version".to_string());
+    }
+    if !options.new && differences.is_empty() {
+        return Ok(Some(open));
+    }
+    if !options.new && !abandon_changed {
+        bail!(
+            "{task} job {} is unfinished and was started with {}; run with --new to abandon it and start over",
+            open.id,
+            differences.join(", ")
+        );
+    }
+    if !options.dry_run {
+        let reason = if options.new {
+            "abandoned by --new"
+        } else {
+            "model or ontology changed"
+        };
+        db::llm::set_job(pool, open.id, "abandoned", Some(reason), None).await?;
+        println!("{task} job {}: abandoned, {reason}", open.id);
+    }
+    Ok(None)
+}
+
+fn percent(value: f64) -> String {
     format!("{:.0}%", value * 100.0)
 }
 
-pub fn utc(time: DateTime<Utc>) -> String {
+fn utc(time: DateTime<Utc>) -> String {
     time.format("%Y-%m-%d %H:%M UTC").to_string()
 }
 
@@ -145,21 +168,15 @@ pub(crate) async fn run<H: Handler>(
     runner: &Runner<'_>,
     handler: &H,
     queue: VecDeque<Work>,
-    limits: &Limits,
+    limits: &Options,
 ) -> Result<Outcome> {
     let pool = runner.pool;
     let config = runner.config;
     let name = runner.name;
     let provider = Provider::new(name, config, limits.claude_program.clone())?;
-    let concurrency = super::concurrency(name, config);
-    let prices = match &provider {
-        Provider::OpenRouter(openrouter) => Some(openrouter.prices().await?),
-        Provider::Ollama(_) => Some(Prices {
-            input: 0.0,
-            output: 0.0,
-        }),
-        Provider::ClaudeCode(_) => None,
-    };
+    let concurrency = name.provider.concurrency(&config.providers);
+    let prices = provider.prices().await?;
+    let min_calls = budget::MIN_CALLS.min(config.budget.calibration_calls);
     let calibration = db::llm::calibration(
         pool,
         name.provider.as_str(),
@@ -177,6 +194,7 @@ pub(crate) async fn run<H: Handler>(
         Defaults {
             chars_per_token: config.models.chars_per_token,
             output_tokens: config.budget.default_output_tokens as f64,
+            min_calls,
         },
         concurrency,
     );
@@ -185,26 +203,26 @@ pub(crate) async fn run<H: Handler>(
         max_usd: limits.max_usd.unwrap_or(config.budget.max_usd),
         max_requests: limits.max_requests.unwrap_or(config.budget.max_requests),
     };
-    print_estimate(runner, &provider, &estimate, (spent, sent), caps).await?;
+    print_estimate(runner, &provider, &estimate, (spent, sent), caps, min_calls).await?;
     if limits.dry_run {
         return Ok(Outcome::DryRun);
     }
     let (stop_tx, mut stop_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = stop_tx.send(true);
-        }
-    });
+    tokio::spawn(watch_stop(tokio::signal::ctrl_c(), stop_tx));
+    let next_cost = estimate
+        .usd
+        .map_or(0.0, |usd| usd / estimate.requests.max(1) as f64);
     let sender = Sender {
         provider: Arc::new(provider),
         concurrency,
         caps,
-        backoff: limits.backoff,
+        backoff: limits
+            .backoff
+            .unwrap_or(Duration::from_secs(config.llm.retry_backoff_secs)),
+        next_cost,
     };
-    let next_cost = estimate
-        .usd
-        .map_or(0.0, |usd| usd / estimate.requests.max(1) as f64);
     let mut queue = queue;
+    let mut pauses = HashMap::new();
     let mut first = Some(runner.resume_after);
     loop {
         if let Some(resume_after) = first.take() {
@@ -212,7 +230,7 @@ pub(crate) async fn run<H: Handler>(
             if let Some(at) = resume_after.filter(|at| *at > Utc::now()) {
                 waits.push(at);
             }
-            if name.provider == ProviderKind::ClaudeCode
+            if name.provider.has_windows()
                 && let Some(windows) = db::llm::last_windows(pool).await?
                 && let Some(at) = budget::window_full(
                     &windows,
@@ -241,7 +259,27 @@ pub(crate) async fn run<H: Handler>(
             }
         }
         db::llm::set_job(pool, runner.job_id, "running", None, None).await?;
-        let stop = send_all(runner, handler, &sender, &mut queue, &mut stop_rx).await?;
+        let sent = send_all(
+            runner,
+            handler,
+            &sender,
+            &mut queue,
+            &mut pauses,
+            &mut stop_rx,
+        )
+        .await;
+        let stop = match sent {
+            Ok(stop) => stop,
+            Err(error) => {
+                let message = format!("{error:#}");
+                if let Err(set) =
+                    db::llm::set_job(pool, runner.job_id, "paused", Some(&message), None).await
+                {
+                    eprintln!("{}: cannot mark the job paused: {set:#}", handler.label());
+                }
+                return Err(error);
+            }
+        };
         if let Stop::Done = stop {
             db::llm::set_job(pool, runner.job_id, "finished", None, None).await?;
             handler.report().await?;
@@ -270,6 +308,7 @@ async fn print_estimate(
     estimate: &Estimate,
     (spent, sent): (f64, i64),
     caps: Caps,
+    min_calls: i64,
 ) -> Result<()> {
     let Caps {
         max_usd,
@@ -277,9 +316,9 @@ async fn print_estimate(
     } = caps;
     let name = runner.name;
     let basis = if estimate.calibrated {
-        "learned from recorded calls"
+        "learned from recorded calls".to_string()
     } else {
-        "from defaults until 20 calls are recorded"
+        format!("from defaults until {min_calls} calls are recorded")
     };
     println!(
         "estimate ({basis}): {} requests, {:.0} input and {:.0} output tokens",
@@ -311,30 +350,26 @@ async fn print_estimate(
             "stops at"
         }
     );
-    match provider {
-        Provider::ClaudeCode(_) => {
-            let max_use = runner.config.providers.claude_code.max_window_use;
-            match db::llm::last_windows(runner.pool).await? {
-                Some(windows) => print_windows(&windows, estimate, max_use),
-                None => println!(
-                    "windows: no reading yet; run zontologize models check to see the usage windows"
-                ),
-            }
+    if name.provider.has_windows() {
+        let max_use = runner.config.providers.claude_code.max_window_use;
+        match db::llm::last_windows(runner.pool).await? {
+            Some(windows) => print_windows(&windows, estimate, max_use),
+            None => println!(
+                "windows: no reading yet; run zontologize models check to see the usage windows"
+            ),
         }
-        Provider::OpenRouter(openrouter) => {
-            let credit = openrouter.credit().await?;
-            match credit.remaining_usd {
-                Some(remaining) => println!(
-                    "openrouter: ${remaining:.4} left on the key{}",
-                    match estimate.usd {
-                        Some(usd) if usd > remaining => "; the job needs more and waits for funds",
-                        _ => "",
-                    }
-                ),
-                None => println!("openrouter: no limit on the key"),
-            }
+    }
+    if let Some(credit) = provider.credit().await? {
+        match credit.remaining_usd {
+            Some(remaining) => println!(
+                "openrouter: ${remaining:.4} left on the key{}",
+                match estimate.usd {
+                    Some(usd) if usd > remaining => "; the job needs more and waits for funds",
+                    _ => "",
+                }
+            ),
+            None => println!("openrouter: no limit on the key"),
         }
-        Provider::Ollama(_) => {}
     }
     Ok(())
 }
@@ -376,6 +411,7 @@ async fn send_all<H: Handler>(
     handler: &H,
     sender: &Sender,
     queue: &mut VecDeque<Work>,
+    pauses: &mut HashMap<i32, u32>,
     stop_rx: &mut watch::Receiver<bool>,
 ) -> Result<Stop> {
     let caps = sender.caps;
@@ -388,9 +424,16 @@ async fn send_all<H: Handler>(
     let mut last_progress = Instant::now();
     let (mut ok, mut invalid, mut failed) = (0usize, 0usize, 0usize);
     let max_use = runner.config.providers.claude_code.max_window_use;
+    let mut subscription = runner.name.provider.has_windows();
     loop {
         while stop.is_none() && set.len() < sender.concurrency && !queue.is_empty() {
-            if let Some(reason) = budget::cap_reached(spent, sent, caps.max_usd, caps.max_requests)
+            let in_flight = if subscription {
+                0.0
+            } else {
+                set.len() as f64 * sender.next_cost
+            };
+            if let Some(reason) =
+                budget::cap_reached(spent, in_flight, sent, caps.max_usd, caps.max_requests)
             {
                 stop = Some(Stop::Cap(reason));
                 break;
@@ -457,6 +500,7 @@ async fn send_all<H: Handler>(
                 call.usage = reply.usage;
                 call.subscription = reply.subscription;
                 call.windows = reply.windows;
+                subscription = reply.subscription;
                 if !reply.subscription {
                     spent += reply.usage.cost_usd;
                 }
@@ -488,14 +532,27 @@ async fn send_all<H: Handler>(
             Err(CallError::Pause { resume, reason }) => {
                 call.status = "pause";
                 call.error = Some(&reason);
+                let count = pauses.entry(ord).or_insert(0);
+                *count += 1;
+                if *count > MAX_PAUSES_PER_ITEM {
+                    failed += 1;
+                    let message =
+                        format!("paused {MAX_PAUSES_PER_ITEM} times on this item: {reason}");
+                    call.status = "error";
+                    call.error = Some(&message);
+                    db::llm::record(pool, &call, None, Some((ord, "error"))).await?;
+                    continue;
+                }
                 db::llm::record(pool, &call, None, None).await?;
                 queue.push_front(Work { ord, chars });
                 if stop.is_none() {
                     stop = Some(Stop::Pause(resume, reason.clone()));
                 }
             }
-            Err(CallError::Invalid(message)) => {
+            Err(CallError::Invalid { message, usage }) => {
                 invalid += 1;
+                spent += usage.cost_usd;
+                call.usage = usage;
                 call.status = "invalid";
                 call.error = Some(&message);
                 db::llm::record(pool, &call, None, Some((ord, "invalid"))).await?;
@@ -517,7 +574,7 @@ async fn send_all<H: Handler>(
                 return Ok(Stop::Fatal(message));
             }
         }
-        if last_progress.elapsed() >= Duration::from_secs(PROGRESS_SECONDS) {
+        if last_progress.elapsed() >= Duration::from_secs(runner.config.llm.progress_secs) {
             last_progress = Instant::now();
             println!(
                 "{}: {ok} answered, {invalid} invalid, {failed} errors, {} left, ${spent:.4}",
@@ -532,7 +589,7 @@ async fn pause<H: Handler>(
     runner: &Runner<'_>,
     handler: &H,
     stop: Stop,
-    limits: &Limits,
+    limits: &Options,
     provider: &Provider,
     next_cost: f64,
     stop_rx: &mut watch::Receiver<bool>,
@@ -552,7 +609,7 @@ async fn pause<H: Handler>(
         Stop::Pause(resume, reason) => (reason, Some(resume)),
     };
     let resume_after = match &resume {
-        Some(Resume::At(at)) => Some(*at + Duration::from_secs(WAIT_MARGIN_SECONDS)),
+        Some(Resume::At(at)) => Some(*at + Duration::from_secs(runner.config.llm.wait_margin_secs)),
         _ => None,
     };
     db::llm::set_job(pool, job, "paused", Some(&reason), resume_after).await?;
@@ -586,6 +643,21 @@ async fn pause<H: Handler>(
     Ok(None)
 }
 
+async fn watch_stop<F>(signal: F, stop_tx: watch::Sender<bool>)
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    match signal.await {
+        Ok(()) => {
+            let _ = stop_tx.send(true);
+        }
+        Err(error) => {
+            eprintln!("cannot listen for Ctrl+C: {error}; stop the run with a signal instead");
+            stop_tx.closed().await;
+        }
+    }
+}
+
 async fn sleep_until(at: DateTime<Utc>, stop_rx: &mut watch::Receiver<bool>) -> bool {
     let wait = (at - Utc::now()).to_std().unwrap_or_default();
     tokio::select! {
@@ -602,14 +674,14 @@ async fn wait_for_funds(
     reason: &str,
     stop_rx: &mut watch::Receiver<bool>,
 ) -> Result<bool> {
-    let Provider::OpenRouter(openrouter) = provider else {
-        let at = Utc::now() + Duration::from_secs(UNKNOWN_RESET_WAIT_MINUTES * 60);
+    if !provider.has_credit() {
+        let at = Utc::now() + Duration::from_secs(config.llm.unknown_reset_wait_minutes * 60);
         println!(
             "{label}: {reason}; no reset time given, trying again at {}",
             utc(at)
         );
         return Ok(sleep_until(at, stop_rx).await);
-    };
+    }
     let poll = config.providers.openrouter.poll_minutes.max(1);
     println!("{label}: {reason}; checking the key every {poll} minutes until funds are added");
     loop {
@@ -617,10 +689,32 @@ async fn wait_for_funds(
         if !sleep_until(at, stop_rx).await {
             return Ok(false);
         }
-        match openrouter.credit().await {
-            Ok(credit) if credit.remaining_usd.is_none_or(|r| r > next_cost) => return Ok(true),
+        match provider.credit().await {
+            Ok(Some(credit)) if credit.remaining_usd.is_none_or(|r| r > next_cost) => {
+                return Ok(true);
+            }
             Ok(_) => {}
             Err(error) => println!("{label}: cannot read the key: {error:#}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failed_signal_listener_does_not_stop_the_run() {
+        let (tx, mut rx) = watch::channel(false);
+        tokio::spawn(watch_stop(
+            async { Err(std::io::Error::other("no signal handler")) },
+            tx,
+        ));
+        let changed = tokio::time::timeout(Duration::from_millis(100), rx.changed()).await;
+        assert!(changed.is_err(), "{changed:?}");
+        let (tx, mut rx) = watch::channel(false);
+        tokio::spawn(watch_stop(async { Ok(()) }, tx));
+        rx.changed().await.unwrap();
+        assert!(*rx.borrow());
     }
 }

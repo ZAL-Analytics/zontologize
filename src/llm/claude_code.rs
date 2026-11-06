@@ -1,6 +1,7 @@
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ffi::OsString;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -15,11 +16,42 @@ pub const DEFAULT_BIN: &str = "claude";
 const SUBSCRIPTION_KEY_SOURCE: &str = "none";
 const ALLOWED: [&str; 2] = ["allowed", "allowed_warning"];
 const STDERR_TAIL: usize = 500;
-
-static COUNTER: AtomicUsize = AtomicUsize::new(0);
+const SYSTEM_FILE: &str = "system-prompt.txt";
+const MAX_ARG_BYTES: usize = 128 * 1024 - 1;
+const WORK_DIR_MODE: u32 = 0o700;
+const WORK_DIR_ATTEMPTS: u32 = 16;
+const ENV_ALLOWED: [&str; 22] = [
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "TZ",
+    "TMPDIR",
+    "CLAUDE_CONFIG_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+];
+const ENV_ALLOWED_PREFIX: &str = "LC_";
+const AUTH_STATUSES: [u16; 2] = [401, 403];
+const REJECTED_STATUSES: [u16; 2] = [400, 413];
+const RATE_LIMIT_STATUS: u16 = 429;
 
 pub struct ClaudeCode {
     program: PathBuf,
+    #[cfg(test)]
     args: Option<Vec<String>>,
     model: String,
     timeout: Duration,
@@ -29,12 +61,14 @@ impl ClaudeCode {
     pub fn new(program: PathBuf, model: &str, timeout: Duration) -> ClaudeCode {
         ClaudeCode {
             program,
+            #[cfg(test)]
             args: None,
             model: model.to_string(),
             timeout,
         }
     }
 
+    #[cfg(test)]
     pub fn with_args(program: PathBuf, args: Vec<String>, timeout: Duration) -> ClaudeCode {
         ClaudeCode {
             program,
@@ -44,7 +78,8 @@ impl ClaudeCode {
         }
     }
 
-    pub fn args(&self, request: &Request) -> Vec<String> {
+    pub fn args(&self, request: &Request, system_file: &Path) -> Vec<String> {
+        #[cfg(test)]
         if let Some(args) = &self.args {
             return args.clone();
         }
@@ -61,8 +96,8 @@ impl ClaudeCode {
             "--setting-sources",
             "",
             "--strict-mcp-config",
-            "--system-prompt",
-            &request.system,
+            "--system-prompt-file",
+            &system_file.to_string_lossy(),
             "--json-schema",
             &request.schema.to_string(),
         ]
@@ -72,9 +107,30 @@ impl ClaudeCode {
     }
 
     pub async fn send(&self, request: &Request) -> Result<Reply, CallError> {
+        let schema = request.schema.to_string().len();
+        if schema > MAX_ARG_BYTES {
+            return Err(CallError::invalid(format!(
+                "the JSON schema is {schema} bytes, above the {MAX_ARG_BYTES} byte limit for one \
+                 claude argument; select fewer classes or properties"
+            )));
+        }
+        let first = self.send_once(request).await?;
+        if !first.missing_output() {
+            return first.finish();
+        }
+        self.send_once(request).await?.finish()
+    }
+
+    async fn send_once(&self, request: &Request) -> Result<Outcome, CallError> {
         let dir = WorkDir::new().map_err(|error| CallError::Fatal(error.to_string()))?;
+        let system_file = dir.path.join(SYSTEM_FILE);
+        std::fs::write(&system_file, &request.system).map_err(|error| {
+            CallError::Fatal(format!("cannot write {}: {error}", system_file.display()))
+        })?;
         let mut child = Command::new(&self.program)
-            .args(self.args(request))
+            .args(self.args(request, &system_file))
+            .env_clear()
+            .envs(allowed_env(std::env::vars_os()))
             .current_dir(&dir.path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -87,23 +143,18 @@ impl ClaudeCode {
                     self.program.display()
                 ))
             })?;
-        let mut stdin = child.stdin.take();
-        let mut stdout = child.stdout.take();
-        let mut stderr = child.stderr.take();
-        let input = request.user.clone();
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let input = request.user.as_bytes();
         let run = async {
-            if let Some(mut stdin) = stdin.take() {
-                let _ = stdin.write_all(input.as_bytes()).await;
-                let _ = stdin.shutdown().await;
-            }
-            let mut out = String::new();
-            let mut err = String::new();
-            if let Some(stdout) = stdout.as_mut() {
-                let _ = stdout.read_to_string(&mut out).await;
-            }
-            if let Some(stderr) = stderr.as_mut() {
-                let _ = stderr.read_to_string(&mut err).await;
-            }
+            let write = async {
+                if let Some(mut stdin) = stdin {
+                    let _ = stdin.write_all(input).await;
+                    let _ = stdin.shutdown().await;
+                }
+            };
+            let ((), out, err) = tokio::join!(write, read_all(stdout), read_all(stderr));
             let status = child.wait().await;
             (out, err, status)
         };
@@ -113,15 +164,58 @@ impl ClaudeCode {
                 message: format!("claude timed out after {} s", self.timeout.as_secs()),
             });
         };
-        let parsed = parse(&out);
-        if parsed.result.is_none() {
-            let code = status.map(|s| s.to_string()).unwrap_or_default();
-            return Err(CallError::Retry {
-                after: None,
-                message: format!("claude exited without a result ({code}): {}", tail(&err)),
-            });
-        }
-        parsed.into_reply()
+        Ok(Outcome {
+            parsed: parse(&out),
+            stderr: err,
+            status: status.ok(),
+        })
+    }
+}
+
+async fn read_all<R: AsyncReadExt + Unpin>(reader: Option<R>) -> String {
+    let mut text = String::new();
+    if let Some(mut reader) = reader {
+        let _ = reader.read_to_string(&mut text).await;
+    }
+    text
+}
+
+fn allowed_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
+    vars.filter(|(name, _)| {
+        let name = name.to_string_lossy();
+        ENV_ALLOWED.contains(&name.as_ref()) || name.starts_with(ENV_ALLOWED_PREFIX)
+    })
+    .collect()
+}
+
+struct Outcome {
+    parsed: Parsed,
+    stderr: String,
+    status: Option<ExitStatus>,
+}
+
+impl Outcome {
+    fn missing_output(&self) -> bool {
+        self.parsed
+            .result
+            .as_ref()
+            .is_some_and(|r| r.is_error != Some(true) && r.structured_output.is_none())
+    }
+
+    fn finish(self) -> Result<Reply, CallError> {
+        let no_result = self.parsed.result.is_none();
+        let status = self.status.map(|s| s.to_string()).unwrap_or_default();
+        let stderr = self.stderr;
+        self.parsed.into_reply().map_err(|error| match error {
+            CallError::Retry { after, .. } if no_result => CallError::Retry {
+                after,
+                message: format!(
+                    "claude exited without a result ({status}): {}",
+                    tail(&stderr)
+                ),
+            },
+            other => other,
+        })
     }
 }
 
@@ -131,12 +225,26 @@ struct WorkDir {
 
 impl WorkDir {
     fn new() -> std::io::Result<WorkDir> {
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path =
-            std::env::temp_dir().join(format!("zontologize-claude-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path)?;
-        Ok(WorkDir { path })
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(WORK_DIR_MODE);
+        let mut attempt = 0;
+        loop {
+            let path = std::env::temp_dir().join(format!(
+                "zontologize-claude-{}-{:016x}",
+                std::process::id(),
+                super::random()
+            ));
+            match builder.create(&path) {
+                Ok(()) => return Ok(WorkDir { path }),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists
+                        && attempt < WORK_DIR_ATTEMPTS =>
+                {
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 
@@ -165,6 +273,7 @@ struct Line {
     api_key_source: Option<String>,
     rate_limit_info: Option<RateLimitInfo>,
     is_error: Option<bool>,
+    api_error_status: Option<u16>,
     result: Option<String>,
     structured_output: Option<Box<serde_json::value::RawValue>>,
     usage: Option<ClaudeUsage>,
@@ -278,10 +387,18 @@ impl Parsed {
         let text = result.result.clone().unwrap_or_default();
         if result.is_error == Some(true) {
             let lower = text.to_lowercase();
-            if lower.contains("login") || lower.contains("log in") || lower.contains("api key") {
+            let status = result.api_error_status;
+            if status.is_some_and(|s| AUTH_STATUSES.contains(&s))
+                || lower.contains("login")
+                || lower.contains("log in")
+                || lower.contains("api key")
+            {
                 return Err(CallError::Fatal(format!("claude: {text}")));
             }
-            if lower.contains("limit") {
+            if status.is_some_and(|s| REJECTED_STATUSES.contains(&s)) {
+                return Err(CallError::invalid(format!("claude: {text}")));
+            }
+            if status == Some(RATE_LIMIT_STATUS) {
                 return Err(CallError::Pause {
                     resume: latest_reset(&windows).map_or(Resume::Funded, Resume::At),
                     reason: format!("Claude Code usage limit: {text}"),
@@ -292,23 +409,27 @@ impl Parsed {
                 message: format!("claude: {text}"),
             });
         }
-        let Some(output) = result.structured_output else {
-            return Err(CallError::Invalid(format!(
-                "claude returned no structured output: {}",
-                tail(&text)
-            )));
+        let raw = result.usage.unwrap_or_default();
+        let usage = Usage {
+            input_tokens: raw.input_tokens
+                + raw.cache_creation_input_tokens
+                + raw.cache_read_input_tokens,
+            cached_input_tokens: raw.cache_read_input_tokens,
+            output_tokens: raw.output_tokens,
+            cost_usd: result.total_cost_usd.unwrap_or(0.0),
         };
-        let usage = result.usage.unwrap_or_default();
+        let Some(output) = result.structured_output else {
+            return Err(CallError::Invalid {
+                message: format!("claude returned no structured output: {}", tail(&text)),
+                usage: Usage {
+                    cost_usd: if subscription { 0.0 } else { usage.cost_usd },
+                    ..usage
+                },
+            });
+        };
         Ok(Reply {
             response: output.get().to_string(),
-            usage: Usage {
-                input_tokens: usage.input_tokens
-                    + usage.cache_creation_input_tokens
-                    + usage.cache_read_input_tokens,
-                cached_input_tokens: usage.cache_read_input_tokens,
-                output_tokens: usage.output_tokens,
-                cost_usd: result.total_cost_usd.unwrap_or(0.0),
-            },
+            usage,
             windows,
             subscription,
         })
@@ -377,11 +498,13 @@ mod tests {
 
     #[test]
     fn missing_output_is_invalid_and_errors_map() {
-        let no_output = r#"{"type":"result","is_error":false,"result":"plain text"}"#;
-        assert!(matches!(
-            parse(no_output).into_reply(),
-            Err(CallError::Invalid(_))
-        ));
+        let no_output = r#"{"type":"result","is_error":false,"result":"plain text","total_cost_usd":0.5,"usage":{"input_tokens":7}}"#;
+        let error = parse(no_output).into_reply().unwrap_err();
+        let CallError::Invalid { usage, .. } = error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.cost_usd, 0.5);
         let login =
             r#"{"type":"result","is_error":true,"result":"Not logged in. Please run /login"}"#;
         assert!(matches!(
@@ -415,17 +538,151 @@ mod tests {
             user: "user text".to_string(),
             schema: serde_json::json!({"type": "object"}),
         };
-        let args = provider.args(&request);
+        let args = provider.args(&request, Path::new("/private/system.txt"));
         for flag in [
             "--no-session-persistence",
             "--strict-mcp-config",
             "--setting-sources",
-            "--system-prompt",
+            "--system-prompt-file",
+            "/private/system.txt",
             "--json-schema",
         ] {
             assert!(args.iter().any(|a| a == flag), "{flag}");
         }
-        assert!(!args.iter().any(|a| a.contains("user text")));
+        assert!(!args.iter().any(|a| a.contains("user text") || a == "sys"));
+    }
+
+    #[test]
+    fn error_codes_decide_not_the_text() {
+        let line = |status: &str, text: &str| {
+            format!(
+                "{{\"type\":\"result\",\"is_error\":true,\"api_error_status\":{status},\"result\":\"{text}\"}}"
+            )
+        };
+        let context = line("400", "prompt is too long: context limit reached");
+        assert!(matches!(
+            parse(&context).into_reply(),
+            Err(CallError::Invalid { .. })
+        ));
+        let other = line("null", "token limit hit while streaming");
+        assert!(matches!(
+            parse(&other).into_reply(),
+            Err(CallError::Retry { .. })
+        ));
+        let rate = line("429", "slow down");
+        assert!(matches!(
+            parse(&rate).into_reply(),
+            Err(CallError::Pause { .. })
+        ));
+        let auth = line("401", "bad credentials");
+        assert!(matches!(
+            parse(&auth).into_reply(),
+            Err(CallError::Fatal(_))
+        ));
+    }
+
+    #[test]
+    fn only_allowed_variables_reach_the_child() {
+        let vars = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/acme"),
+            ("LC_ALL", "C"),
+            ("CLAUDE_CONFIG_DIR", "/home/acme/.claude"),
+            ("ANTHROPIC_API_KEY", "sk-test"),
+            ("DATABASE_URL", "postgres://x"),
+            ("PGPASSWORD", "secret"),
+            ("OPENROUTER_API_KEY", "sk-or"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "token"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let kept: Vec<String> = allowed_env(vars.into_iter())
+            .into_iter()
+            .map(|(k, _)| k.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(kept, ["PATH", "HOME", "LC_ALL", "CLAUDE_CONFIG_DIR"]);
+    }
+
+    #[test]
+    fn work_dirs_are_private_and_unique() {
+        use std::os::unix::fs::PermissionsExt;
+        let a = WorkDir::new().unwrap();
+        let b = WorkDir::new().unwrap();
+        assert_ne!(a.path, b.path);
+        let mode = std::fs::metadata(&a.path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, WORK_DIR_MODE);
+        let path = a.path.clone();
+        drop(a);
+        assert!(!path.exists());
+    }
+
+    fn request() -> Request {
+        Request {
+            task: "fit".to_string(),
+            system: "s".to_string(),
+            user: "u".to_string(),
+            schema: serde_json::json!({}),
+        }
+    }
+
+    fn script(body: String) -> ClaudeCode {
+        ClaudeCode::with_args(
+            PathBuf::from("sh"),
+            vec!["-c".to_string(), body],
+            Duration::from_secs(10),
+        )
+    }
+
+    #[tokio::test]
+    async fn large_stderr_does_not_block() {
+        let fake = script(format!(
+            "cat >/dev/null; head -c 300000 /dev/zero | tr '\\0' x >&2; cat '{}'",
+            fixture("answer.jsonl").display()
+        ));
+        assert!(fake.send(&request()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejected_window_without_a_result_still_pauses() {
+        let fake = script(format!(
+            "cat >/dev/null; head -n 2 '{}'; exit 1",
+            fixture("rejected.jsonl").display()
+        ));
+        let error = fake.send(&request()).await.unwrap_err();
+        assert!(matches!(error, CallError::Pause { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn missing_output_is_tried_once_more() {
+        let marker = std::env::temp_dir().join(format!(
+            "zontologize-claude-retry-{:016x}",
+            crate::llm::random()
+        ));
+        let counted = script(format!(
+            "cat >/dev/null; echo x >> '{}'; \
+             printf '{{\"type\":\"result\",\"is_error\":false,\"result\":\"x\"}}\\n'",
+            marker.display()
+        ));
+        assert!(counted.send(&request()).await.is_err());
+        let calls = std::fs::read_to_string(&marker).unwrap().lines().count();
+        let _ = std::fs::remove_file(&marker);
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn the_system_prompt_goes_in_a_private_file_and_big_schemas_stop() {
+        let provider = ClaudeCode::new(PathBuf::from("claude"), "haiku", Duration::from_secs(1));
+        let mut big = request();
+        big.schema = serde_json::json!({ "description": "x".repeat(MAX_ARG_BYTES) });
+        let error = provider.send(&big).await.unwrap_err();
+        assert!(
+            matches!(&error, CallError::Invalid { message, .. } if message.contains("131071")),
+            "{error:?}"
+        );
+        let fake = script(format!(
+            "cat >/dev/null; test \"$(cat {SYSTEM_FILE})\" = s && cat '{}'",
+            fixture("answer.jsonl").display()
+        ));
+        assert!(fake.send(&request()).await.is_ok());
     }
 
     #[tokio::test]

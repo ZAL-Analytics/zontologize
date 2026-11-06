@@ -13,7 +13,7 @@ fn options() -> Options {
     let mut options = Options::new(common::repo(
         "tests/fixtures/llm/claude-code/fake-claude-extract.sh",
     ));
-    options.backoff = std::time::Duration::from_millis(1);
+    options.backoff = Some(std::time::Duration::from_millis(1));
     options.no_wait = true;
     options
 }
@@ -68,5 +68,47 @@ async fn classify_types_only_what_rules_left_open() {
     env.scan().await;
     let (doc_type, ..) = doc(&env, "misc/order.txt").await;
     assert_eq!(doc_type.as_deref(), Some("work_order"));
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn dry_run_with_new_leaves_the_open_job_alone() {
+    let env = Env::new("classify_dry_new").await;
+    env.file("misc/order.txt", ORDER);
+    env.file("misc/order-18.txt", &ORDER.replace("17", "18"));
+    env.copy_acme_rules();
+    env.write_config(&format!(
+        "[models]\nclassify = \"claude-code:haiku\"\n\
+         [providers.claude-code]\nconcurrency = 1\n{}",
+        folder_source("docs", &env.data(), "current")
+    ));
+    env.scan().await;
+    let mut capped = options();
+    capped.max_requests = Some(1);
+    let url = common::test_url();
+    let outcome = run(Some(&env.config()), Some(&url), &capped).await;
+    assert_eq!(outcome.unwrap(), Outcome::Paused);
+    let items = "select coalesce(string_agg(ord || ':' || status || ':' || xmin, ',' order by ord), '') \
+                 from llm_job_items";
+    let before: String = sqlx::query_scalar(items)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    let mut dry = options();
+    dry.dry_run = true;
+    dry.new = true;
+    let outcome = run(Some(&env.config()), Some(&url), &dry).await;
+    assert_eq!(outcome.unwrap(), Outcome::DryRun);
+    let after: String = sqlx::query_scalar(items)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        env.count("select count(*) from llm_jobs where status = 'paused'")
+            .await,
+        1
+    );
     env.finish().await;
 }

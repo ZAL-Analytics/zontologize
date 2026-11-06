@@ -82,7 +82,10 @@ enum GraphCommand {
 enum OntologyCommand {
     #[command(about = "Load the ontology files and report errors, warnings and the selection")]
     Check,
-    #[command(about = "Ask the fit model which shortlisted classes a sample of chunks is about")]
+    #[command(
+        about = "Ask the fit model which shortlisted classes a sample of chunks is about",
+        mut_arg("new", |arg| arg.help("Abandon the unfinished fit job and start a new one"))
+    )]
     Fit(FitArgs),
     #[command(about = "Write the selected ontology the facts use as one Turtle file")]
     Export {
@@ -110,28 +113,8 @@ struct FitArgs {
         help = "Seed of the sample (default [fit] seed)"
     )]
     seed: Option<String>,
-    #[arg(
-        long,
-        value_name = "USD",
-        help = "Stop the job when it has spent this much"
-    )]
-    max_usd: Option<f64>,
-    #[arg(
-        long,
-        value_name = "N",
-        value_parser = clap::value_parser!(u64).range(1..),
-        help = "Stop the job after this many requests (at least 1)"
-    )]
-    max_requests: Option<u64>,
-    #[arg(long, help = "Print the estimate and send nothing")]
-    dry_run: bool,
-    #[arg(
-        long,
-        help = "Exit on a usage window or credit pause instead of waiting"
-    )]
-    no_wait: bool,
-    #[arg(long, help = "Abandon the unfinished fit job and start a new one")]
-    new: bool,
+    #[command(flatten)]
+    job: JobArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -370,15 +353,9 @@ fn main() -> ExitCode {
                 zontologize::ontology_export(config, &out).await
             }
             Command::Ontology(OntologyCommand::Fit(args)) => {
-                let mut options =
-                    zontologize::fit::run::Options::new(zontologize::llm::claude_program());
+                let mut options = args.job.options();
                 options.sample = args.sample;
                 options.seed = args.seed;
-                options.max_usd = args.max_usd;
-                options.max_requests = args.max_requests;
-                options.dry_run = args.dry_run;
-                options.no_wait = args.no_wait;
-                options.new = args.new;
                 zontologize::ontology_fit(config, &options).await
             }
             Command::Graph(GraphCommand::Sync) => zontologize::graph_sync(config).await,
@@ -541,8 +518,8 @@ mod tests {
             panic!("not fit");
         };
         assert_eq!(args.sample, Some(50));
-        assert_eq!(args.max_usd, Some(0.5));
-        assert!(args.dry_run && args.no_wait && !args.new);
+        assert_eq!(args.job.max_usd, Some(0.5));
+        assert!(args.job.dry_run && args.job.no_wait && !args.job.new);
         let cli = Cli::try_parse_from(["zontologize", "models", "check"]).unwrap();
         assert!(matches!(cli.command, Command::Models(ModelsCommand::Check)));
     }

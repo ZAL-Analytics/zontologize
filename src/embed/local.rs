@@ -10,7 +10,7 @@ use tokenizers::{Tokenizer, TruncationParams};
 use super::model::Model;
 use super::{Embed, Embedded};
 use crate::config::Pooling;
-use crate::ontology::hex;
+use crate::hash::hex;
 
 const INPUT_IDS: &str = "input_ids";
 const ATTENTION_MASK: &str = "attention_mask";
@@ -29,6 +29,14 @@ pub struct Files {
 }
 
 pub fn fetch(model: &Model, cache_dir: &str) -> Result<Files> {
+    files(model, cache_dir, false)
+}
+
+pub fn cached(model: &Model, cache_dir: &str) -> Result<Files> {
+    files(model, cache_dir, true)
+}
+
+fn files(model: &Model, cache_dir: &str, local_only: bool) -> Result<Files> {
     let settings = &model.settings;
     let mut builder = hf_hub::HFClientBuilder::new();
     if !cache_dir.is_empty() {
@@ -45,6 +53,7 @@ pub fn fetch(model: &Model, cache_dir: &str) -> Result<Files> {
             .download_file()
             .filename(file)
             .maybe_revision(revision.clone())
+            .local_files_only(local_only)
             .send()
             .map_err(|e| anyhow!("cannot get {file} of {}: {e}", settings.repo))
     };

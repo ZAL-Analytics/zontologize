@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use anyhow::Result;
 use sqlx::{FromRow, PgConnection, PgPool};
 
-use super::copy_row;
+use super::{MODEL_METHODS, RESOLVE_METHODS, copy_row};
 use crate::rules::pages::Segment;
 use crate::rules::{ClassHit, DocumentFacts, Endpoint, EntityHit, TextFacts};
 
@@ -192,12 +192,41 @@ pub async fn chunks_of(pool: &PgPool, content_ids: &[i64]) -> Result<Vec<ChunkWo
     Ok(rows)
 }
 
+fn better_method(new: &NewEntity, old: &NewEntity) -> bool {
+    let rank = |e: &NewEntity| {
+        (
+            e.confidence,
+            !e.method.starts_with(crate::llm::METHOD_PREFIX),
+        )
+    };
+    rank(new) > rank(old)
+}
+
+fn best_entities(entities: Vec<NewEntity>) -> Vec<NewEntity> {
+    let mut best: Vec<NewEntity> = Vec::new();
+    let mut index: HashMap<(String, String), usize> = HashMap::new();
+    for entity in entities {
+        match index.get(&(entity.class.clone(), entity.key.clone())) {
+            Some(&i) => {
+                if better_method(&entity, &best[i]) {
+                    best[i].method = entity.method;
+                    best[i].confidence = entity.confidence;
+                }
+            }
+            None => {
+                index.insert((entity.class.clone(), entity.key.clone()), best.len());
+                best.push(entity);
+            }
+        }
+    }
+    best
+}
+
 pub(super) async fn upsert_entities(
     conn: &mut PgConnection,
     entities: Vec<NewEntity>,
     version_id: i64,
 ) -> Result<HashMap<(String, String), i64>> {
-    let mut seen = BTreeSet::new();
     let mut classes = Vec::new();
     let mut keys = Vec::new();
     let mut names = Vec::new();
@@ -205,10 +234,7 @@ pub(super) async fn upsert_entities(
     let mut methods = Vec::new();
     let mut confidences = Vec::new();
     let mut documents = Vec::new();
-    for entity in entities {
-        if !seen.insert((entity.class.clone(), entity.key.clone())) {
-            continue;
-        }
+    for entity in best_entities(entities) {
         classes.push(entity.class);
         keys.push(entity.key);
         names.push(entity.name);
@@ -229,6 +255,10 @@ pub(super) async fn upsert_entities(
          as n(class_iri, key, name, dataset, method, confidence, document_id) \
          on conflict (class_iri, key) do update set \
          name = case when entities.name = entities.key then excluded.name else entities.name end, \
+         method = case when (excluded.confidence, excluded.method not like $9) \
+         > (entities.confidence, entities.method not like $9) \
+         then excluded.method else entities.method end, \
+         confidence = greatest(entities.confidence, excluded.confidence), \
          ontology_version_id = excluded.ontology_version_id \
          returning id, class_iri, key",
     )
@@ -240,6 +270,7 @@ pub(super) async fn upsert_entities(
     .bind(&confidences)
     .bind(&documents)
     .bind(version_id)
+    .bind(MODEL_METHODS)
     .fetch_all(&mut *conn)
     .await?;
     Ok(rows
@@ -342,7 +373,10 @@ pub async fn write_document_rules(
     let ids: Vec<i64> = outputs.iter().map(|o| o.id).collect();
     let mut tx = pool.begin().await?;
     for table in ["mentions", "relations", "class_mentions"] {
-        let sql = format!("delete from {table} where document_id = any($1) and method not like $2");
+        let sql = format!(
+            "delete from {table} where document_id = any($1) and method not like $2{}",
+            open_only(table)
+        );
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(&ids)
             .bind(RESOLVE_METHODS)
@@ -363,7 +397,7 @@ pub async fn write_document_rules(
                 method: output
                     .type_method
                     .clone()
-                    .unwrap_or_else(|| "path".to_string()),
+                    .unwrap_or_else(|| crate::rules::PATH_METHOD.to_string()),
                 confidence: output.type_confidence,
                 document_id: Some(output.id),
             });
@@ -405,7 +439,7 @@ pub async fn write_document_rules(
                 &owner,
                 0,
                 output.path.chars().count(),
-                "path",
+                crate::rules::PATH_METHOD,
                 1.0,
             );
         }
@@ -455,7 +489,10 @@ pub async fn write_document_rules(
             "insert into relations (src_id, property_iri, dst_id, method, confidence, document_id) \
              select src, property, dst, 'path', 1.0, document \
              from unnest($1::bigint[], $2::text[], $3::bigint[], $4::bigint[]) \
-             as r(src, property, dst, document)",
+             as r(src, property, dst, document) \
+             where not exists (select 1 from relations v where v.src_id = r.src \
+             and v.property_iri = r.property and v.dst_id = r.dst \
+             and v.status in ('confirmed', 'rejected'))",
         )
         .bind(&sources)
         .bind(&properties)
@@ -486,8 +523,14 @@ pub async fn write_document_rules(
 }
 
 pub const SEGMENT_METHOD: &str = "page_rule";
-const MODEL_METHODS: &str = "llm:%";
-const RESOLVE_METHODS: &str = "resolve:%";
+
+fn open_only(table: &str) -> &'static str {
+    if table == "relations" {
+        " and status in ('auto', 'proposed')"
+    } else {
+        ""
+    }
+}
 
 pub async fn write_text_rules(
     pool: &PgPool,
@@ -503,7 +546,8 @@ pub async fn write_text_rules(
         let sql = format!(
             "delete from {table} where chunk_id in \
              (select id from chunks where content_id = any($1)) \
-             and method not like $2 and method not like $3"
+             and method not like $2 and method not like $3{}",
+            open_only(table)
         );
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(content_ids)
@@ -595,7 +639,10 @@ pub async fn write_text_rules(
              from unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::float8[]) \
              as u(src, content, chunk, confidence) \
              join documents d on d.content_id = u.content and d.status = 'present' \
-             join entities e on e.document_id = d.id and e.key = d.id::text",
+             join entities e on e.document_id = d.id and e.key = d.id::text \
+             where not exists (select 1 from relations v where v.src_id = u.src \
+             and v.property_iri = $5 and v.dst_id = e.id \
+             and v.status in ('confirmed', 'rejected'))",
         )
         .bind(&sources)
         .bind(&source_contents)
@@ -720,7 +767,8 @@ pub async fn clear_unlisted_contents(pool: &PgPool) -> Result<u64> {
     ] {
         let sql = format!(
             "delete from {table} where chunk_id in \
-             (select id from chunks where content_id = any($1))"
+             (select id from chunks where content_id = any($1)){}",
+            open_only(table)
         );
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(&ids)
@@ -782,13 +830,17 @@ pub async fn delete_unselected(pool: &PgPool, version_id: i64, keep: &str) -> Re
     Ok(mentions + relations + attributes)
 }
 
+pub const ORPHAN: &str = "not exists (select 1 from mentions m where m.entity_id = e.id) \
+                          and not exists (select 1 from relations r \
+                          where (r.src_id = e.id or r.dst_id = e.id) \
+                          and r.status in ('confirmed', 'rejected'))";
+
 pub async fn delete_orphans(pool: &PgPool) -> Result<u64> {
-    let count = sqlx::query(
-        "delete from entities e where not exists (select 1 from mentions m where m.entity_id = e.id)",
-    )
-    .execute(pool)
-    .await?
-    .rows_affected();
+    let sql = format!("delete from entities e where {ORPHAN}");
+    let count = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .execute(pool)
+        .await?
+        .rows_affected();
     Ok(count)
 }
 
@@ -806,29 +858,80 @@ pub async fn sync_aliases(pool: &PgPool, entries: &[crate::rules::gazetteer::Ent
         }
     }
     let mut tx = pool.begin().await?;
-    sqlx::query("delete from aliases where method = 'gazetteer'")
-        .execute(&mut *tx)
-        .await?;
-    if !classes.is_empty() {
-        sqlx::query(
-            "insert into aliases (entity_id, alias, lang, method) \
-             select e.id, a.alias, a.lang, 'gazetteer' \
-             from unnest($1::text[], $2::text[], $3::text[], $4::text[]) \
-             as a(class_iri, key, alias, lang) \
-             join entities e on e.class_iri = a.class_iri and e.key = a.key \
-             on conflict do nothing",
-        )
-        .bind(&classes)
-        .bind(&keys)
-        .bind(&aliases)
-        .bind(&langs)
-        .execute(&mut *tx)
-        .await?;
-    }
+    sqlx::query(
+        "create temporary table wanted_aliases on commit drop as \
+         select distinct on (e.id, a.alias) e.id as entity_id, a.alias, a.lang \
+         from unnest($1::text[], $2::text[], $3::text[], $4::text[]) \
+         with ordinality as a(class_iri, key, alias, lang, n) \
+         join entities e on e.class_iri = a.class_iri and e.key = a.key \
+         order by e.id, a.alias, a.n",
+    )
+    .bind(&classes)
+    .bind(&keys)
+    .bind(&aliases)
+    .bind(&langs)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "delete from aliases x where x.method = 'gazetteer' and not exists \
+         (select 1 from wanted_aliases w where w.entity_id = x.entity_id \
+         and w.alias = x.alias and w.lang = x.lang)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "insert into aliases (entity_id, alias, lang, method) \
+         select entity_id, alias, lang, 'gazetteer' from wanted_aliases \
+         on conflict do nothing",
+    )
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }
 
 fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entity(key: &str, method: &str, confidence: f64) -> NewEntity {
+        NewEntity {
+            class: "c".to_string(),
+            key: key.to_string(),
+            name: key.to_string(),
+            dataset: String::new(),
+            method: method.to_string(),
+            confidence,
+            document_id: None,
+        }
+    }
+
+    #[test]
+    fn the_best_method_wins_and_rules_win_ties() {
+        let best = best_entities(vec![
+            entity("a", "ocr", 0.6),
+            entity("a", "regex", 1.0),
+            entity("a", "llm:m", 1.0),
+            entity("b", "llm:m", 0.8),
+            entity("b", "gazetteer", 0.8),
+            entity("c", "regex", 1.0),
+            entity("c", "ocr", 0.5),
+        ]);
+        let found: Vec<(&str, &str, f64)> = best
+            .iter()
+            .map(|e| (e.key.as_str(), e.method.as_str(), e.confidence))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("a", "regex", 1.0),
+                ("b", "gazetteer", 0.8),
+                ("c", "regex", 1.0)
+            ]
+        );
+    }
 }

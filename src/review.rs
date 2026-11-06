@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use crate::config;
 use crate::db;
 use crate::db::review::{Fact, Precision};
-use crate::llm::shortlist::local_name;
+use crate::ns::local_name;
 
 pub const CONTEXT_CHARS: usize = 100;
 const WILSON_Z: f64 = 1.96;
@@ -40,13 +40,19 @@ pub fn context(text: &str, start: Option<i32>, end: Option<i32>) -> String {
     let after: String = chars[end..(end + CONTEXT_CHARS).min(chars.len())]
         .iter()
         .collect();
-    let flat = |s: String| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = |s: String| crate::text::squash(&s);
     format!("{} «{}» {}", flat(before), flat(found), flat(after))
         .trim()
         .to_string()
 }
 
-pub fn describe(fact: &Fact) -> String {
+fn printable(text: &str) -> String {
+    text.chars()
+        .filter(|c| *c == '\n' || !c.is_control())
+        .collect()
+}
+
+fn describe(fact: &Fact) -> String {
     let page = fact
         .page_from
         .map_or(String::new(), |p| format!(", page {p}"));
@@ -93,7 +99,7 @@ pub fn measured(rows: &[Precision], method: &str, min_verdicts: usize) -> HashMa
         .collect()
 }
 
-pub async fn ask<R: AsyncBufRead + Unpin>(
+async fn ask<R: AsyncBufRead + Unpin>(
     pool: &sqlx::PgPool,
     facts: &[Fact],
     input: &mut R,
@@ -102,7 +108,7 @@ pub async fn ask<R: AsyncBufRead + Unpin>(
     let mut lines = input.lines();
     for (i, fact) in facts.iter().enumerate() {
         let snapshot = describe(fact);
-        println!("[{}/{}] {snapshot}", i + 1, facts.len());
+        println!("[{}/{}] {}", i + 1, facts.len(), printable(&snapshot));
         println!("right? y = right, n = wrong, s = skip, q = quit");
         let Some(line) = lines.next_line().await? else {
             break;
@@ -139,8 +145,13 @@ pub async fn sample<R: AsyncBufRead + Unpin>(
             .resolve(&options.class)
             .map_err(|e| anyhow::anyhow!("--class: {e}"))?
     };
-    let _lock = db::runs::lock(url, &config.database.schema).await?;
-    let pool = db::pool::connect(url, &config.database.schema, 2).await?;
+    let lock = db::runs::lock(url, &config.database.schema).await?;
+    let pool = db::pool::connect(
+        url,
+        &config.database.schema,
+        config.database.max_connections,
+    )
+    .await?;
     let n = options.n.unwrap_or(config.review.sample);
     let result = async {
         let facts =
@@ -158,6 +169,7 @@ pub async fn sample<R: AsyncBufRead + Unpin>(
     }
     .await;
     pool.close().await;
+    lock.release().await;
     result
 }
 
@@ -199,7 +211,7 @@ async fn card(pool: &sqlx::PgPool, id: i64, name: &str, class: &str) -> Result<S
     Ok(out)
 }
 
-pub async fn ask_merges<R: AsyncBufRead + Unpin>(
+async fn ask_merges<R: AsyncBufRead + Unpin>(
     pool: &sqlx::PgPool,
     merges: &[db::review::Merge],
     input: &mut R,
@@ -215,14 +227,10 @@ pub async fn ask_merges<R: AsyncBufRead + Unpin>(
             merge.method,
             merge.confidence
         );
-        println!(
-            "{}",
-            card(pool, merge.a_id, &merge.a_name, &merge.a_class).await?
-        );
-        println!(
-            "{}",
-            card(pool, merge.b_id, &merge.b_name, &merge.b_class).await?
-        );
+        let a = card(pool, merge.a_id, &merge.a_name, &merge.a_class).await?;
+        println!("{}", printable(&a));
+        let b = card(pool, merge.b_id, &merge.b_name, &merge.b_class).await?;
+        println!("{}", printable(&b));
         println!("same thing? y = yes, n = no, s = skip, q = quit");
         let Some(line) = lines.next_line().await? else {
             break;
@@ -259,8 +267,13 @@ pub async fn merges<R: AsyncBufRead + Unpin>(
             .resolve(&options.class)
             .map_err(|e| anyhow::anyhow!("--class: {e}"))?
     };
-    let _lock = db::runs::lock(url, &config.database.schema).await?;
-    let pool = db::pool::connect(url, &config.database.schema, 2).await?;
+    let lock = db::runs::lock(url, &config.database.schema).await?;
+    let pool = db::pool::connect(
+        url,
+        &config.database.schema,
+        config.database.max_connections,
+    )
+    .await?;
     let n = options.n.unwrap_or(config.review.sample);
     let result = async {
         let merges = db::review::proposed_merges(&pool, &iri, &options.seed, n as i64).await?;
@@ -279,12 +292,18 @@ pub async fn merges<R: AsyncBufRead + Unpin>(
     }
     .await;
     pool.close().await;
+    lock.release().await;
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printable_drops_control_characters() {
+        assert_eq!(printable("a\u{1b}[2Jb\r\nc\u{7}"), "a[2Jb\nc");
+    }
 
     #[test]
     fn context_marks_the_span_and_cuts_around_it() {

@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use sqlx::migrate::Migrator;
 use sqlx::postgres::PgConnection;
 
-use super::{EXTENSIONS, extension_version, quote_identifier, schema_exists};
+use super::{EXTENSIONS, extension_version, identifier, schema_exists};
 
 pub static MIGRATOR: Migrator = sqlx::migrate!();
 
@@ -13,7 +13,7 @@ pub struct MigrationState {
 }
 
 pub async fn applied_versions(conn: &mut PgConnection, schema: &str) -> Result<Vec<i64>> {
-    let table = format!("{}._sqlx_migrations", quote_identifier(schema));
+    let table = format!("{}._sqlx_migrations", identifier(schema)?);
     let exists: bool = sqlx::query_scalar("select to_regclass($1) is not null")
         .bind(&table)
         .fetch_one(&mut *conn)
@@ -58,7 +58,7 @@ pub async fn run(conn: &mut PgConnection, schema: &str) -> Result<Vec<i64>> {
         );
     }
     if !schema_exists(conn, schema).await? {
-        let sql = format!("create schema {}", quote_identifier(schema));
+        let sql = format!("create schema {}", identifier(schema)?);
         sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
             .execute(&mut *conn)
             .await

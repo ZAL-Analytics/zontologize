@@ -97,26 +97,27 @@ async fn a_job_is_locked_by_one_process_only() {
         .fetch_one(&env.pool)
         .await
         .unwrap();
+    sqlx::query("insert into contents (sha256) values ('c')")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let chunks: Vec<i64> = sqlx::query_scalar(
+        "insert into chunks (content_id, ord, text, ts_config) \
+         select (select id from contents), n, 'text', 'simple' from generate_series(1, 3) n \
+         returning id",
+    )
+    .fetch_all(&env.pool)
+    .await
+    .unwrap();
     let params = JobParams {
         sample: 3,
         seed: "s".to_string(),
     };
-    let job = llm::create_job(
-        &env.pool,
-        "fit",
-        "ollama",
-        "m",
-        version,
-        &params,
-        &[11, 12, 13],
-    )
-    .await
-    .unwrap();
+    let job = llm::create_job(&env.pool, "fit", "ollama", "m", version, &params, &chunks)
+        .await
+        .unwrap();
     let items = llm::items(&env.pool, job.id).await.unwrap();
-    assert_eq!(
-        items.iter().map(|i| i.chunk_id).collect::<Vec<_>>(),
-        [11, 12, 13]
-    );
+    assert_eq!(items.iter().map(|i| i.chunk_id).collect::<Vec<_>>(), chunks);
     assert_eq!(items[0].ord, 1);
     assert_eq!(
         llm::open_job(&env.pool, "fit").await.unwrap().unwrap().id,
@@ -126,6 +127,7 @@ async fn a_job_is_locked_by_one_process_only() {
     let mut second = env.pool.acquire().await.unwrap();
     assert!(llm::lock(&mut first, job.id).await.unwrap());
     assert!(!llm::lock(&mut second, job.id).await.unwrap());
+    assert!(llm::lock(&mut second, job.id + (1i64 << 32)).await.unwrap());
     drop(first);
     drop(second);
     env.finish().await;

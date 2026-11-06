@@ -12,7 +12,7 @@ const OTHER: &str = "Meeting notes about the yearly budget. The team talked abou
 
 fn options(script: &str) -> Options {
     let mut options = Options::new(repo(&format!("tests/fixtures/llm/claude-code/{script}")));
-    options.backoff = std::time::Duration::from_millis(1);
+    options.backoff = Some(std::time::Duration::from_millis(1));
     options.no_wait = true;
     options
 }
@@ -184,5 +184,79 @@ async fn missing_claude_binary_stops_the_job_with_its_path() {
             .await,
         1
     );
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn an_item_that_keeps_pausing_is_given_up() {
+    let env = setup("fit_pause_cap").await;
+    let mut options = options("fake-claude-rejected.sh");
+    options.no_wait = false;
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), fit(&env, &options))
+        .await
+        .expect("the job keeps pausing on the same item")
+        .unwrap();
+    assert_eq!(outcome, Outcome::Finished);
+    assert_eq!(
+        env.count("select count(*) from llm_job_items where error like '%paused 3 times%'")
+            .await,
+        4
+    );
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_database_error_does_not_leave_the_job_running() {
+    let env = setup("fit_db_error").await;
+    for sql in [
+        "create function fail_call() returns trigger language plpgsql as \
+         $$ begin raise exception 'acme write failed'; end $$",
+        "create trigger fail_call before insert on llm_calls \
+         for each row execute function fail_call()",
+    ] {
+        sqlx::query(sql).execute(&env.pool).await.unwrap();
+    }
+    let error = fit(&env, &options("fake-claude.sh")).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("acme write failed"),
+        "{error:#}"
+    );
+    assert_eq!(
+        env.count("select count(*) from llm_jobs where status = 'running'")
+            .await,
+        0
+    );
+    assert_eq!(
+        env.count(
+            "select count(*) from llm_jobs where status = 'paused' \
+             and pause_reason like '%acme write failed%'"
+        )
+        .await,
+        1
+    );
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn max_usd_stops_a_billed_job_but_not_a_subscription() {
+    let env = setup("fit_max_usd").await;
+    let mut billed = options("fake-claude-billed.sh");
+    billed.max_usd = Some(0.002);
+    assert_eq!(fit(&env, &billed).await.unwrap(), Outcome::Paused);
+    assert_eq!(env.count("select count(*) from llm_calls").await, 2);
+    assert_eq!(
+        env.count("select count(*) from llm_jobs where pause_reason like '%--max-usd%'")
+            .await,
+        1
+    );
+    env.finish().await;
+    let env = setup("fit_max_usd_subscription").await;
+    let mut subscription = options("fake-claude.sh");
+    subscription.max_usd = Some(0.002);
+    assert_eq!(fit(&env, &subscription).await.unwrap(), Outcome::Finished);
+    assert_eq!(env.count("select count(*) from llm_calls").await, 4);
     env.finish().await;
 }

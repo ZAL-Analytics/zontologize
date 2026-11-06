@@ -6,26 +6,20 @@ use anyhow::{Context, Result};
 use oxrdf::{Literal, NamedNode, Triple};
 use oxttl::TurtleSerializer;
 
-use super::{Checked, NONE, local_name, normalise};
+use super::{Checked, NONE};
 use crate::db::fit::Chunk;
+use crate::ns::local_name;
+use crate::ns::{
+    OWL_CLASS, RDF_TYPE, RDFS_COMMENT, RDFS_SUBCLASS_OF, SKOS_ALT_LABEL, SKOS_PREF_LABEL,
+    STANDARD_PREFIXES,
+};
 use crate::ontology::Ontology;
+use crate::text::fold;
 
 const EXAMPLES: usize = 5;
 const NEVER_LISTED: usize = 50;
 const REPORT_FILE: &str = "fit-report.md";
 const PROPOSALS_FILE: &str = "proposals.ttl";
-pub(crate) const RDFS_COMMENT: &str = "http://www.w3.org/2000/01/rdf-schema#comment";
-const RDFS_SUBCLASS: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
-pub(crate) const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-const OWL_CLASS: &str = "http://www.w3.org/2002/07/owl#Class";
-pub(crate) const SKOS_PREF: &str = "http://www.w3.org/2004/02/skos/core#prefLabel";
-const SKOS_ALT: &str = "http://www.w3.org/2004/02/skos/core#altLabel";
-pub(crate) const STANDARD_PREFIXES: [(&str, &str); 4] = [
-    ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
-    ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
-    ("owl", "http://www.w3.org/2002/07/owl#"),
-    ("skos", "http://www.w3.org/2004/02/skos/core#"),
-];
 
 pub struct Entry<'a> {
     pub chunk: &'a Chunk,
@@ -122,7 +116,7 @@ pub fn write(
         }
         let mut grouped = BTreeSet::new();
         for term in &entry.checked.terms {
-            let key = (normalise(&term.term), term.near.clone(), term.kind.clone());
+            let key = (fold(&term.term), term.near.clone(), term.kind.clone());
             if !grouped.insert(key.clone()) {
                 continue;
             }
@@ -348,7 +342,7 @@ fn turtle(
             summary.job, proposal.chunks, proposal.documents
         );
         if proposal.kind == "alias" {
-            writer.serialize_triple(&Triple::new(near.clone(), node(SKOS_ALT)?, label))?;
+            writer.serialize_triple(&Triple::new(near.clone(), node(SKOS_ALT_LABEL)?, label))?;
             let note = format!(
                 "Proposed skos:altLabel \"{}\"@{} for {}: {evidence}",
                 proposal.term,
@@ -377,8 +371,8 @@ fn turtle(
             node(RDF_TYPE)?,
             node(OWL_CLASS)?,
         ))?;
-        writer.serialize_triple(&Triple::new(class.clone(), node(RDFS_SUBCLASS)?, near))?;
-        writer.serialize_triple(&Triple::new(class.clone(), node(SKOS_PREF)?, label))?;
+        writer.serialize_triple(&Triple::new(class.clone(), node(RDFS_SUBCLASS_OF)?, near))?;
+        writer.serialize_triple(&Triple::new(class.clone(), node(SKOS_PREF_LABEL)?, label))?;
         writer.serialize_triple(&Triple::new(
             class,
             node(RDFS_COMMENT)?,

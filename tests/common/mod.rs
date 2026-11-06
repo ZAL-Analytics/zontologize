@@ -338,7 +338,7 @@ impl Env {
     ) -> zontologize::embed::run::Stats {
         let config = zontologize::config::load(Some(&self.config())).unwrap();
         let ontology =
-            zontologize::embed::run::load_ontology(Some(&self.config()), &config).unwrap();
+            zontologize::ontology::load_or_empty(Some(&self.config()), &config.ontology).unwrap();
         let model = zontologize::embed::model::parse(model, &config.embed.models).unwrap();
         zontologize::embed::run::run_with(
             &self.pool,

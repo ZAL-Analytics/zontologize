@@ -14,7 +14,7 @@ fn options() -> Options {
     let mut options = Options::new(common::repo(
         "tests/fixtures/llm/claude-code/fake-claude-extract.sh",
     ));
-    options.backoff = std::time::Duration::from_millis(1);
+    options.backoff = Some(std::time::Duration::from_millis(1));
     options.no_wait = true;
     options
 }
@@ -117,6 +117,39 @@ async fn attributes_are_written_with_si_bounds_and_a_rerun_sends_nothing() {
     );
     assert_eq!(env.count("select count(*) from llm_calls").await, 2);
     assert_eq!(env.count("select count(*) from attributes").await, 4);
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn values_go_when_a_chunk_no_longer_builds_a_request() {
+    let env = setup("attributes_stale").await;
+    assert_eq!(
+        attributes(&env, &options()).await.unwrap(),
+        Outcome::Finished
+    );
+    assert_eq!(env.count("select count(*) from attributes").await, 4);
+    sqlx::query(
+        "update chunks set text = repeat('plain words ', 10) where text like 'Data sheet%'",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    let mut dry = options();
+    dry.dry_run = true;
+    assert_eq!(attributes(&env, &dry).await.unwrap(), Outcome::DryRun);
+    assert_eq!(env.count("select count(*) from attributes").await, 4);
+    assert_eq!(
+        attributes(&env, &options()).await.unwrap(),
+        Outcome::Finished
+    );
+    assert_eq!(env.count("select count(*) from attributes").await, 0);
+    assert_eq!(
+        env.count("select count(*) from chunks where attr_key is not null")
+            .await,
+        0
+    );
+    assert_eq!(env.count("select count(*) from llm_calls").await, 1);
     env.finish().await;
 }
 

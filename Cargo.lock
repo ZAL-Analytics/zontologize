@@ -7091,11 +7091,12 @@ dependencies = [
  "csv",
  "globset",
  "hf-hub",
- "ndarray",
  "ort",
  "oxrdf",
  "oxttl",
+ "rayon",
  "regex",
+ "regex-syntax",
  "reqwest",
  "serde",
  "serde_json",
@@ -7107,7 +7108,6 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "unicode-normalization",
  "walkdir",
- "whoami",
  "xberg",
 ]
 

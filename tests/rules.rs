@@ -128,6 +128,49 @@ async fn rule_change_reruns_rules_only() {
 
 #[tokio::test]
 #[ignore]
+async fn rules_rerun_keeps_relation_verdicts() {
+    let env = two_sources("rule_verdicts").await;
+    env.scan().await;
+    sqlx::query(
+        "insert into relations (src_id, property_iri, dst_id, method, confidence, chunk_id, \
+         status) select e.id, 'https://example.org/acme#partOf', e.id, 'regex', 1.0, \
+         (select min(id) from chunks), 'confirmed' from entities e limit 1",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "update relations set status = case when id % 2 = 0 then 'confirmed' else 'rejected' end",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    let total = env.count("select count(*) from relations").await;
+    let rejected = env
+        .count("select count(*) from relations where status = 'rejected'")
+        .await;
+    assert!(total > 2 && rejected > 0, "{total} {rejected}");
+    sqlx::query("update documents set rules_key = null")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    sqlx::query("update contents set rules_key = null")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let stats = env.scan().await;
+    assert!(stage(&stats, "rules") > 0);
+    assert_eq!(env.count("select count(*) from relations").await, total);
+    assert_eq!(
+        env.count("select count(*) from relations where status = 'rejected'")
+            .await,
+        rejected
+    );
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn deleted_document_loses_its_facts() {
     let env = two_sources("deleted_facts").await;
     env.scan().await;
@@ -331,5 +374,52 @@ async fn bundle_with_two_headers_becomes_two_segments() {
         .await,
         2
     );
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_quiet_scan_skips_cleanup_and_a_better_method_wins() {
+    let env = two_sources("quiet").await;
+    env.scan().await;
+    sqlx::query(
+        "insert into entities (class_iri, key, name, method, confidence, ontology_version_id) \
+         select 'https://example.org/acme#Drawing', 'DWG-999-Z9', 'DWG-999-Z9', 'regex', 1.0, \
+         max(id) from ontology_versions",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    sqlx::query("update entities set method = 'ocr', confidence = 0.3 where key = 'DWG-410-C2'")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let aliases = "select coalesce(string_agg(xmin::text, ',' order by entity_id, alias), '') \
+                   from aliases where method = 'gazetteer'";
+    let before: String = sqlx::query_scalar(aliases)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    assert!(!before.is_empty());
+    let orphan = "select count(*) from entities where key = 'DWG-999-Z9'";
+    env.scan().await;
+    assert_eq!(env.count(orphan).await, 1);
+    let after: String = sqlx::query_scalar(aliases)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    assert_eq!(after, before);
+    env.file(
+        "projects/Projects/2023/P-2023-0311 Northwind Pumps - Eastport/04 Reports/Inspection report P-2023-0311 0001.txt",
+        "The heat exchanger at Eastport was replaced again. NW Pumps approved drawing DWG-410-C2.",
+    );
+    env.scan().await;
+    assert_eq!(env.count(orphan).await, 0);
+    let method: (String, f64) =
+        sqlx::query_as("select method, confidence from entities where key = 'DWG-410-C2'")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(method, ("regex".to_string(), 1.0));
     env.finish().await;
 }

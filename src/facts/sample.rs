@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use sha2::{Digest, Sha256};
 
 use crate::facts::check::MARKUP;
-use crate::llm::shortlist::normalise;
+use crate::text::fold;
 
 #[derive(Debug, Clone)]
 pub struct Candidate {
@@ -36,7 +36,7 @@ pub struct Selected {
 
 pub fn text_hash(text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
-    normalise(text).hash(&mut hasher);
+    fold(text).hash(&mut hasher);
     hasher.finish()
 }
 

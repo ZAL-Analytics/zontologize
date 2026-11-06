@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -41,7 +40,6 @@ pub struct Page {
 #[derive(Debug, Clone)]
 pub struct ExtractSettings {
     xberg: ExtractionConfig,
-    timeout: Duration,
     pub key: String,
 }
 
@@ -82,21 +80,26 @@ impl ExtractSettings {
         };
         ExtractSettings {
             xberg,
-            timeout: Duration::from_secs(extract.timeout_secs),
             key: extract_key(extract, ocr),
         }
     }
 }
 
 pub fn extract_key(extract: &config::ExtractConfig, ocr: &config::OcrConfig) -> String {
-    format!(
-        "extract-v{STAGE_VERSION} xberg-{XBERG_VERSION} {OCR_BACKEND} {} {} {} embedded-{}-{}mb-ocr-{}",
-        tier_name(ocr.model_tier),
-        ocr.languages.join("+"),
-        extract.format.as_str(),
-        extract.embedded_depth,
-        extract.max_embedded_mb,
-        extract.ocr_embedded_images
+    crate::hash::stage_key(
+        "extract",
+        STAGE_VERSION,
+        &[
+            &format!("xberg-{XBERG_VERSION}"),
+            OCR_BACKEND,
+            tier_name(ocr.model_tier),
+            &ocr.languages.join("+"),
+            extract.format.as_str(),
+            &format!(
+                "embedded-{}-{}mb-ocr-{}",
+                extract.embedded_depth, extract.max_embedded_mb, extract.ocr_embedded_images
+            ),
+        ],
     )
 }
 
@@ -107,20 +110,12 @@ pub fn tier_name(tier: ModelTier) -> &'static str {
     }
 }
 
-pub async fn extract_file(path: &Path, settings: &ExtractSettings) -> Result<Vec<Page>> {
-    tokio::time::timeout(settings.timeout, extract_pages(path, settings))
-        .await
-        .with_context(|| {
-            format!(
-                "extraction timed out after {:?}: {}",
-                settings.timeout,
-                path.display()
-            )
-        })?
-}
-
 pub async fn extract_pages(path: &Path, settings: &ExtractSettings) -> Result<Vec<Page>> {
-    let input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
+    let uri = path.to_string_lossy().into_owned();
+    if uri.contains("://") {
+        bail!("not a file path: {uri}");
+    }
+    let input = ExtractInput::from_uri(uri);
     let result = xberg::extract(input, &settings.xberg)
         .await
         .with_context(|| format!("extraction failed: {}", path.display()))?;
@@ -147,12 +142,6 @@ pub async fn extract_pages(path: &Path, settings: &ExtractSettings) -> Result<Ve
         }));
     }
     Ok(pages)
-}
-
-pub fn is_timeout(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<tokio::time::error::Elapsed>()
-        .is_some()
 }
 
 fn document_pages(
@@ -222,6 +211,18 @@ mod tests {
     use xberg::{OcrBoundingGeometry, OcrConfidence, OcrElementLevel, PageOcrConfidence};
 
     use super::*;
+
+    #[test]
+    fn xberg_version_matches_cargo_lock() {
+        let lock =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.lock")).unwrap();
+        let version = lock
+            .split("[[package]]")
+            .find(|block| block.contains("\nname = \"xberg\"\n"))
+            .and_then(|block| block.lines().find_map(|l| l.strip_prefix("version = ")))
+            .unwrap();
+        assert_eq!(version.trim_matches('"'), XBERG_VERSION);
+    }
 
     fn page_content(page_number: u32, ocr: Option<PageOcrConfidence>) -> PageContent {
         PageContent {

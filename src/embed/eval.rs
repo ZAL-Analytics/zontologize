@@ -80,7 +80,7 @@ pub struct ModelReport {
     pub missed: Vec<String>,
 }
 
-pub fn first_rank(
+fn first_rank(
     scores: &[f32],
     expected: &HashSet<usize>,
     skip: impl Fn(usize) -> bool,
@@ -111,11 +111,14 @@ pub fn score(ranks: &[Option<usize>]) -> Score {
     }
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let length = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let lengths = length(a) * length(b);
+    if lengths > 0.0 { dot / lengths } else { 0.0 }
 }
 
-pub fn rank_queries(
+fn rank_queries(
     queries: &[Query],
     query_vectors: &[Vec<f32>],
     chunk_vectors: &[Vec<f32>],
@@ -125,7 +128,7 @@ pub fn rank_queries(
         .iter()
         .zip(query_vectors)
         .map(|(q, vector)| {
-            let scores: Vec<f32> = chunk_vectors.iter().map(|c| dot(vector, c)).collect();
+            let scores: Vec<f32> = chunk_vectors.iter().map(|c| cosine(vector, c)).collect();
             let own = q.own.map(|i| contents[i]);
             first_rank(&scores, &q.expected, |i| Some(contents[i]) == own)
         })
@@ -153,10 +156,7 @@ pub fn read_questions(config_dir: Option<&Path>) -> Result<Vec<Question>> {
     Ok(file.questions)
 }
 
-pub fn match_questions(
-    questions: &[Question],
-    paths: &[(String, i64)],
-) -> Result<Vec<BTreeSet<i64>>> {
+fn match_questions(questions: &[Question], paths: &[(String, i64)]) -> Result<Vec<BTreeSet<i64>>> {
     let mut out = Vec::new();
     for question in questions {
         let mut contents = BTreeSet::new();
@@ -386,7 +386,13 @@ pub async fn evaluate(
     let question_vectors = embed_all(&shared, question_texts, batch_size)
         .await?
         .vectors;
-    let question_ranks = rank_queries(&sample.questions, &question_vectors, &vectors, &contents);
+    let (question_ranks, neighbour_ranks, class_ranks) = crate::cpu::blocking(|| {
+        (
+            rank_queries(&sample.questions, &question_vectors, &vectors, &contents),
+            rank_queries(&sample.neighbours, &neighbour_vectors, &vectors, &contents),
+            rank_queries(&sample.classes, &class_vectors, &vectors, &contents),
+        )
+    });
     let missed = sample
         .questions
         .iter()
@@ -400,18 +406,8 @@ pub async fn evaluate(
         dimensions,
         rate,
         truncated: truncated.iter().filter(|t| **t).count() as f64 / truncated.len().max(1) as f64,
-        neighbours: score(&rank_queries(
-            &sample.neighbours,
-            &neighbour_vectors,
-            &vectors,
-            &contents,
-        )),
-        classes: score(&rank_queries(
-            &sample.classes,
-            &class_vectors,
-            &vectors,
-            &contents,
-        )),
+        neighbours: score(&neighbour_ranks),
+        classes: score(&class_ranks),
         questions: score(&question_ranks),
         missed,
     })
@@ -509,14 +505,14 @@ pub async fn run(
                 .map_err(|e| anyhow!("--models: {e}"))?,
         );
     }
-    let ontology = super::run::load_ontology(config_dir, &config)?;
+    let ontology = crate::ontology::load_or_empty(config_dir, &config.ontology)?;
     let questions = read_questions(config_dir)?;
     let seed = options
         .seed
         .clone()
         .unwrap_or_else(|| config.llm_extract.seed.clone());
     let size = options.sample.unwrap_or(config.embed.eval_sample);
-    let _lock = db::runs::lock(url, &config.database.schema).await?;
+    let lock = db::runs::lock(url, &config.database.schema).await?;
     let pool = db::pool::connect(url, &config.database.schema, 2).await?;
     let result = async {
         let sample = sample(&pool, &config, &ontology, &questions, size, &seed).await?;
@@ -542,6 +538,7 @@ pub async fn run(
     }
     .await;
     pool.close().await;
+    lock.release().await;
     result
 }
 
@@ -615,6 +612,19 @@ mod tests {
         }];
         let ranks = rank_queries(&questions, &[vec![1.0, 0.0]], &chunks, &[1, 2, 2]);
         assert_eq!(ranks, [Some(2)]);
+    }
+
+    #[test]
+    fn ranking_uses_cosine_not_dot_product() {
+        let chunks = vec![vec![0.0, 10.0, 1.0], vec![1.0, 0.0, 0.0]];
+        let questions = vec![Query {
+            label: "q".to_string(),
+            text: String::new(),
+            expected: set(&[1]),
+            own: None,
+        }];
+        let ranks = rank_queries(&questions, &[vec![1.0, 0.2, 0.0]], &chunks, &[1, 2]);
+        assert_eq!(ranks, [Some(1)]);
     }
 
     #[test]

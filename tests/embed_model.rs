@@ -1,15 +1,23 @@
 use zontologize::embed::{self, Embed};
 
+const MODELS: &str = "ZONTOLOGIZE_TEST_EMBED_MODEL";
+const CACHE: &str = "ZONTOLOGIZE_TEST_EMBED_CACHE";
+
 #[test]
 #[ignore]
 fn real_model_gives_stable_normalised_vectors() {
-    let Ok(names) = std::env::var("ZONTOLOGIZE_TEST_EMBED_MODEL") else {
+    let (Ok(names), Ok(cache)) = (std::env::var(MODELS), std::env::var(CACHE)) else {
+        eprintln!(
+            "skipped: set {MODELS} to model names and {CACHE} to a Hugging Face cache folder \
+             that already holds their files"
+        );
         return;
     };
     let config = zontologize::config::load(None).unwrap();
     for name in names.split(',') {
         let model = embed::model::parse(name.trim(), &config.embed.models).unwrap();
-        let files = embed::local::fetch(&model, &config.embed.cache_dir).unwrap();
+        let files = embed::local::cached(&model, &cache)
+            .unwrap_or_else(|e| panic!("{name} is not in {cache}: {e}"));
         let mut local = embed::local::Local::new(model.clone(), files, 4);
         let texts = vec![
             embed::passage(&model, "The pump P-101 was serviced in March."),

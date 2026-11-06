@@ -16,6 +16,7 @@ pub mod resolve;
 pub mod review;
 pub mod runs;
 pub mod status;
+pub mod table;
 
 use std::str::FromStr;
 
@@ -24,6 +25,13 @@ use sqlx::postgres::{PgConnectOptions, PgConnection};
 use sqlx::{ConnectOptions, Connection};
 
 pub const EXTENSIONS: [&str; 2] = ["vector", "age"];
+
+pub const MODEL_METHODS: &str = "llm:%";
+pub const RESOLVE_METHODS: &str = "resolve:%";
+
+pub const OCR_CONFIDENCE: &str = "(select min(p.ocr_confidence) from pages p \
+    where p.content_id = k.content_id and p.method = 'ocr' \
+    and p.page_no between coalesce(k.page_from, 0) and coalesce(k.page_to, 2147483647))";
 
 const VECTOR_PATH: &str = "select set_config('search_path', \
     current_setting('search_path') || ', ' || quote_ident(n.nspname), false) \
@@ -80,11 +88,18 @@ pub async fn schema_exists_in(pool: &sqlx::PgPool, schema: &str) -> Result<bool>
     Ok(exists)
 }
 
+pub fn identifier(name: &str) -> Result<String> {
+    if !crate::config::is_identifier(name) {
+        anyhow::bail!("{name:?} is not a valid name, it must match ^[a-z_][a-z0-9_]*$");
+    }
+    Ok(quote_identifier(name))
+}
+
 pub fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-pub fn copy_field(out: &mut String, value: Option<&str>) {
+fn copy_field(out: &mut String, value: Option<&str>) {
     let Some(value) = value else {
         out.push_str("\\N");
         return;
@@ -130,5 +145,8 @@ mod tests {
     fn quotes_identifiers() {
         assert_eq!(quote_identifier("zontologize"), "\"zontologize\"");
         assert_eq!(quote_identifier("a\"b"), "\"a\"\"b\"");
+        assert_eq!(identifier("my_schema").unwrap(), "\"my_schema\"");
+        assert!(identifier("a\"b").is_err());
+        assert!(identifier("x'; drop table y; --").is_err());
     }
 }

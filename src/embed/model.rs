@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use sha2::{Digest, Sha256};
 
 use crate::config::EmbedModelConfig;
-use crate::ontology::hex;
+use crate::hash::hex;
 
 pub const PROVIDER: &str = "local";
 
@@ -67,12 +67,11 @@ pub fn parse(name: &str, models: &BTreeMap<String, EmbedModelConfig>) -> Result<
 }
 
 pub fn text_key(fingerprint: &str, stage_version: u32, text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(fingerprint.as_bytes());
-    hasher.update([0]);
-    hasher.update(stage_version.to_le_bytes());
-    hasher.update(text.as_bytes());
-    hex(&hasher.finalize())
+    crate::hash::stage_hash(
+        &[fingerprint.as_bytes(), &[0]],
+        stage_version,
+        text.as_bytes(),
+    )
 }
 
 #[cfg(test)]

@@ -2,8 +2,76 @@ use anyhow::{Context, Result, bail};
 use sqlx::PgConnection;
 use sqlx::PgPool;
 
-use super::quote_identifier;
-use crate::graph::{Kind, Label};
+use super::{identifier, quote_identifier};
+use crate::graph::{Kind, Label, Stats};
+
+pub const AGE_VERSION: &str = "1.8";
+
+pub fn check_age(found: Option<&str>) -> Result<()> {
+    let Some(found) = found else {
+        bail!("the AGE extension is not installed in this database");
+    };
+    let major_minor: Vec<&str> = found.split('.').take(2).collect();
+    if major_minor.join(".") != AGE_VERSION {
+        bail!(
+            "AGE {found} is installed, but graph sync writes AGE's own tables and is tested \
+             with AGE {AGE_VERSION}.x only; install AGE {AGE_VERSION} or a zontologize \
+             version made for AGE {found}"
+        );
+    }
+    Ok(())
+}
+
+pub async fn stored_labels(pool: &PgPool) -> Result<Vec<Label>> {
+    let rows: Vec<(String, String, String)> =
+        sqlx::query_as("select kind, iri, label from graph_labels")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(kind, iri, name)| Label {
+            kind: if kind == Kind::Vertex.as_str() {
+                Kind::Vertex
+            } else {
+                Kind::Edge
+            },
+            iri,
+            name,
+        })
+        .collect())
+}
+
+pub async fn fingerprint(pool: &PgPool) -> Result<String> {
+    let text = sqlx::query_scalar(
+        "select (select count(*) || '.' || coalesce(sum(hashtextextended(row(id, class_iri, key, \
+         name, canonical_id, dataset, document_id)::text, 0)), 0) from entities) || ':' || \
+         (select count(*) || '.' || coalesce(sum(hashtextextended(row(id, src_id, property_iri, \
+         dst_id, status, confidence, method, document_id, chunk_id, span_start, span_end)::text, \
+         0)), 0) from relations where status <> 'rejected')",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(text)
+}
+
+pub async fn last_sync(pool: &PgPool) -> Result<Option<Stats>> {
+    let row: Option<sqlx::types::Json<Stats>> = sqlx::query_scalar(
+        "select stats -> 'graph' from runs where status = 'finished' and stats ? 'graph' \
+         order by id desc limit 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|json| json.0))
+}
+
+pub async fn exists(pool: &PgPool, graph: &str) -> Result<bool> {
+    let found =
+        sqlx::query_scalar("select exists(select 1 from ag_catalog.ag_graph where name = $1)")
+            .bind(graph)
+            .fetch_one(pool)
+            .await?;
+    Ok(found)
+}
 
 pub async fn classes(pool: &PgPool, language: &str) -> Result<Vec<(String, Option<String>)>> {
     let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -148,8 +216,9 @@ pub async fn rebuild(
     labels: &[Label],
 ) -> Result<(u64, u64)> {
     load_age(conn).await?;
-    let g = quote_identifier(graph);
-    let s = quote_identifier(schema);
+    check_age(super::extension_version(conn, "age").await?.as_deref())?;
+    let g = identifier(graph)?;
+    let s = identifier(schema)?;
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
     sqlx::query(
         "select set_config('search_path', 'ag_catalog, ' || current_setting('search_path'), true)",
@@ -182,7 +251,8 @@ pub async fn rebuild(
             "insert into {table} (id, properties) \
              select ag_catalog._graphid($1, e.id), jsonb_build_object('id', e.id, \
              'class', e.class_iri, 'key', e.key, 'name', e.name, \
-             'canonical_id', e.canonical_id, 'dataset', e.dataset)::text::ag_catalog.agtype \
+             'canonical_id', e.canonical_id, 'dataset', e.dataset, \
+             'document_id', e.document_id)::text::ag_catalog.agtype \
              from {s}.entities e where e.class_iri = $2"
         )))
         .bind(id)
@@ -207,7 +277,9 @@ pub async fn rebuild(
              select ag_catalog._graphid($1, r.id), \
              ag_catalog._graphid(ms.label_id, r.src_id), ag_catalog._graphid(md.label_id, r.dst_id), \
              jsonb_build_object('id', r.id, 'iri', r.property_iri, 'status', r.status, \
-             'confidence', r.confidence, 'method', r.method)::text::ag_catalog.agtype \
+             'confidence', r.confidence, 'method', r.method, 'document_id', r.document_id, \
+             'chunk_id', r.chunk_id, 'span_start', r.span_start, \
+             'span_end', r.span_end)::text::ag_catalog.agtype \
              from {s}.relations r \
              join {s}.entities a on a.id = r.src_id join m ms on ms.iri = a.class_iri \
              join {s}.entities b on b.id = r.dst_id join m md on md.iri = b.class_iri \
@@ -258,4 +330,20 @@ async fn set_sequence(
     .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_pinned_age_minor_version_is_accepted() {
+        assert!(check_age(Some("1.8.0")).is_ok());
+        assert!(check_age(Some("1.8.1")).is_ok());
+        let error = check_age(Some("1.9.0")).unwrap_err().to_string();
+        assert!(error.contains("AGE 1.9.0 is installed"), "{error}");
+        assert!(check_age(Some("1.80.0")).is_err());
+        assert!(check_age(Some("2.8.0")).is_err());
+        assert!(check_age(None).is_err());
+    }
 }

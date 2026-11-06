@@ -1,8 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::ns::local_name;
 use crate::ontology::{Class, LangMap, Ontology};
-
-pub const DEFINITION_CHARS: usize = 200;
 
 pub fn shortlist(
     ontology: &Ontology,
@@ -65,11 +64,20 @@ pub fn label(class: &Class, languages: &[String]) -> String {
     pick(&class.labels, languages).unwrap_or_else(|| local_name(&class.iri).to_string())
 }
 
-pub fn local_name(iri: &str) -> &str {
-    iri.rsplit(['#', '/', ':']).next().unwrap_or(iri)
+pub fn short_definition(class: &Class, languages: &[String], chars: usize) -> String {
+    let definition = pick(&class.definition, languages).unwrap_or_default();
+    crate::text::squash(&definition)
+        .chars()
+        .take(chars)
+        .collect()
 }
 
-pub fn shortlist_lines(ontology: &Ontology, list: &[String], languages: &[String]) -> String {
+pub fn shortlist_lines(
+    ontology: &Ontology,
+    list: &[String],
+    languages: &[String],
+    definition_chars: usize,
+) -> String {
     let mut out = String::new();
     for iri in list {
         let Some(class) = ontology.classes.get(iri) else {
@@ -81,14 +89,7 @@ pub fn shortlist_lines(ontology: &Ontology, list: &[String], languages: &[String
                 aliases.insert(alias.as_str());
             }
         }
-        let definition: String = pick(&class.definition, languages)
-            .unwrap_or_default()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(DEFINITION_CHARS)
-            .collect();
+        let definition = short_definition(class, languages, definition_chars);
         out.push_str(&format!(
             "- {iri} | {} | {} | {definition}\n",
             label(class, languages),
@@ -99,13 +100,6 @@ pub fn shortlist_lines(ontology: &Ontology, list: &[String], languages: &[String
         out.push_str("(none)\n");
     }
     out
-}
-
-pub fn normalise(text: &str) -> String {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
 }
 
 pub fn counts_by_chunk(rows: Vec<(i64, String, i64)>) -> HashMap<i64, Vec<(String, i64)>> {
@@ -219,7 +213,7 @@ mod tests {
     #[test]
     fn shortlist_lines_carry_label_aliases_and_short_definition() {
         let onto = ontology();
-        let lines = shortlist_lines(&onto, &[iri("Machine")], &languages());
+        let lines = shortlist_lines(&onto, &[iri("Machine")], &languages(), 200);
         assert_eq!(
             lines,
             format!(
@@ -227,6 +221,6 @@ mod tests {
                 iri("Machine")
             )
         );
-        assert_eq!(shortlist_lines(&onto, &[], &languages()), "(none)\n");
+        assert_eq!(shortlist_lines(&onto, &[], &languages(), 200), "(none)\n");
     }
 }

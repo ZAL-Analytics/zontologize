@@ -216,7 +216,18 @@ async fn full_text_search_finds_a_chunk_and_chunk_change_skips_extraction() {
         .await,
         1
     );
-    let chunks_before = env.count("select max(id) from chunks").await;
+    let chunks_before = env.count("select sum(id)::bigint from chunks").await;
+    for sql in [
+        "insert into entities (class_iri, key, name, method, confidence, ontology_version_id) \
+         select 'https://example.org/acme#Site', 'north', 'north', 'llm:x', 0.7, max(id) \
+         from ontology_versions",
+        "insert into relations (src_id, property_iri, dst_id, method, confidence, chunk_id, \
+         status, span_start, span_end) select e.id, 'https://example.org/acme#partOf', e.id, \
+         'llm:x', 0.7, c.id, 'confirmed', 0, 3 from entities e, chunks c where e.key = 'north'",
+        "update chunks set llm_key = 'k'",
+    ] {
+        sqlx::query(sql).execute(&env.pool).await.unwrap();
+    }
     env.write_config(&format!(
         "[chunk]\nmax_chars = 500\noverlap = 50\ntext_search = \"simple\"\n{}",
         folder_source("docs", &env.data(), "current")
@@ -225,7 +236,36 @@ async fn full_text_search_finds_a_chunk_and_chunk_change_skips_extraction() {
     assert_eq!(stage(&stats, "extract"), 0);
     assert_eq!(stage(&stats, "chunk"), 2);
     assert_eq!(stage(&stats, "rules"), 2);
-    assert!(env.count("select min(id) from chunks").await > chunks_before);
+    assert_eq!(
+        env.count("select sum(id)::bigint from chunks").await,
+        chunks_before
+    );
+    assert_eq!(
+        env.count("select count(*) from chunks where llm_key = 'k'")
+            .await,
+        2
+    );
+    assert_eq!(
+        env.count("select count(*) from relations where status = 'confirmed' and span_end = 3")
+            .await,
+        2
+    );
+    env.write_config(&format!(
+        "[chunk]\nmax_chars = 20\noverlap = 0\ntext_search = \"simple\"\n{}",
+        folder_source("docs", &env.data(), "current")
+    ));
+    env.scan().await;
+    assert!(env.count("select count(*) from chunks").await > 2);
+    assert_eq!(
+        env.count("select count(*) from chunks where llm_key = 'k'")
+            .await,
+        0
+    );
+    assert_eq!(
+        env.count("select count(*) from relations where status = 'confirmed' and span_end is null")
+            .await,
+        2
+    );
     env.finish().await;
 }
 
@@ -458,5 +498,17 @@ async fn the_current_ontology_follows_the_last_finished_scan() {
     env.scan().await;
     let third = zontologize::db::ontology::current(&env.pool).await.unwrap();
     assert_eq!(first, third);
+    let config = zontologize::config::load(Some(&env.config())).unwrap();
+    let loaded = zontologize::ontology::load(Some(&env.config()), &config.ontology).unwrap();
+    let failed: i64 =
+        sqlx::query_scalar("insert into runs (started_at, config_hash, status) values (now(), '', 'failed') returning id")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    zontologize::db::ontology::store(&env.pool, &loaded.ontology, failed)
+        .await
+        .unwrap();
+    let fourth = zontologize::db::ontology::current(&env.pool).await.unwrap();
+    assert_eq!(first, fourth);
     env.finish().await;
 }

@@ -10,12 +10,16 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::ontology::{Ontology, hex};
+use crate::hash::hex;
+use crate::ontology::Ontology;
 
-pub const STAGE_VERSION: u32 = 2;
+pub const STAGE_VERSION: u32 = 3;
 const DEFAULT_RULES: &str = include_str!("../../defaults/rules.toml");
 const RULES_FILE: &str = "rules.toml";
 const GAZETTEER_DIR: &str = "gazetteer";
+pub const PATH_METHOD: &str = "path";
+pub const REGEX_METHOD: &str = "regex";
+pub const GAZETTEER_METHOD: &str = "gazetteer";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -46,7 +50,8 @@ struct RulesFile {
     path_rules: Vec<path::PathRuleSpec>,
     #[serde(default)]
     id_patterns: Vec<ids::IdPatternSpec>,
-    ocr_confusions: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    ocr_confusions: BTreeMap<String, String>,
     #[serde(default)]
     page_types: Vec<pages::PageTypeSpec>,
     pages: Option<pages::PagesSpec>,
@@ -146,7 +151,30 @@ pub struct Rules {
     pub revisions: Vec<Revision>,
 }
 
+struct Sources {
+    key: String,
+    rules_name: String,
+    rules_text: String,
+    gazetteer: Vec<(String, Vec<u8>)>,
+}
+
 pub fn load(config_dir: Option<&Path>, ontology: &Ontology, document_class: &str) -> Result<Rules> {
+    let sources = read(config_dir, ontology)?;
+    compile(
+        &sources.rules_name,
+        &sources.rules_text,
+        &sources.gazetteer,
+        ontology,
+        document_class,
+        sources.key,
+    )
+}
+
+pub fn key(config_dir: Option<&Path>, ontology: &Ontology) -> Result<String> {
+    Ok(read(config_dir, ontology)?.key)
+}
+
+fn read(config_dir: Option<&Path>, ontology: &Ontology) -> Result<Sources> {
     let mut hasher = Sha256::new();
     hasher.update(STAGE_VERSION.to_le_bytes());
     hasher.update(ontology.version.as_bytes());
@@ -170,7 +198,9 @@ pub fn load(config_dir: Option<&Path>, ontology: &Ontology, document_class: &str
         let entries =
             std::fs::read_dir(&dir).with_context(|| format!("cannot read {}", dir.display()))?;
         for entry in entries {
-            let path = entry?.path();
+            let path = entry
+                .with_context(|| format!("cannot read {}", dir.display()))?
+                .path();
             if path.extension().is_some_and(|e| e == "csv") {
                 gazetteer_files.push(path);
             }
@@ -190,15 +220,17 @@ pub fn load(config_dir: Option<&Path>, ontology: &Ontology, document_class: &str
         hasher.update(&bytes);
         gazetteer_sources.push((path.display().to_string(), bytes));
     }
-    let key = format!("rules-v{STAGE_VERSION}-{}", &hex(&hasher.finalize())[..16]);
-    compile(
-        &rules_name,
-        &rules_text,
-        &gazetteer_sources,
-        ontology,
-        document_class,
+    let key = format!(
+        "{}-{}",
+        crate::hash::stage_key("rules", STAGE_VERSION, &[]),
+        &hex(&hasher.finalize())[..16]
+    );
+    Ok(Sources {
         key,
-    )
+        rules_name,
+        rules_text,
+        gazetteer: gazetteer_sources,
+    })
 }
 
 pub fn compile(
@@ -237,26 +269,15 @@ pub fn compile(
             .map_err(|e| anyhow::anyhow!("{rules_name}: path_rules[{index}]: {e}"))?;
         path_rules.push(rule);
     }
-    let ids = ids::IdPatterns::compile(&file.id_patterns, ontology)
+    let confusions = ids::Confusions::compile(&file.ocr_confusions)
         .map_err(|e| anyhow::anyhow!("{rules_name}: {e}"))?;
-    let defaults = defaults()?;
-    let confusions = match &file.ocr_confusions {
-        Some(table) => ids::Confusions::compile(table),
-        None => ids::Confusions::compile(&defaults.ocr_confusions.unwrap_or_default()),
-    }
-    .map_err(|e| anyhow::anyhow!("{rules_name}: {e}"))?;
+    let ids = ids::IdPatterns::compile(&file.id_patterns, ontology, &confusions)
+        .map_err(|e| anyhow::anyhow!("{rules_name}: {e}"))?;
     let pages = file.pages.unwrap_or_default();
-    let default_pages = defaults.pages.unwrap_or_default();
-    let head_chars = pages
-        .head_chars
-        .or(default_pages.head_chars)
-        .unwrap_or_default();
+    let head_chars = pages.head_chars.unwrap_or_default();
     let page_types = pages::PageTypes::compile(&file.page_types, &doc_types, head_chars)
         .map_err(|e| anyhow::anyhow!("{rules_name}: {e}"))?;
-    let part_property = pages
-        .part_property
-        .or(default_pages.part_property)
-        .unwrap_or_default();
+    let part_property = pages.part_property.unwrap_or_default();
     let part_property = part_property_iri(
         &part_property,
         &file.page_types,
@@ -301,10 +322,6 @@ pub fn compile(
         lexicon,
         revisions,
     })
-}
-
-fn defaults() -> Result<RulesFile> {
-    toml::from_str(DEFAULT_RULES).context("built-in defaults/rules.toml is not valid")
 }
 
 fn part_property_iri(
@@ -407,10 +424,15 @@ impl Rules {
 }
 
 fn char_offsets(text: &str, entities: &mut [EntityHit], classes: &mut [ClassHit]) {
-    if text.is_ascii() {
+    if text.is_ascii() || (entities.is_empty() && classes.is_empty()) {
         return;
     }
-    let chars = |byte: usize| text[..byte.min(text.len())].chars().count();
+    let mut counts = vec![0; text.len() + 1];
+    for (n, (byte, _)) in text.char_indices().enumerate() {
+        counts[byte] = n;
+    }
+    counts[text.len()] = text.chars().count();
+    let chars = |byte: usize| counts[byte.min(text.len())];
     for hit in entities.iter_mut() {
         (hit.start, hit.end) = (chars(hit.start), chars(hit.end));
     }
@@ -439,6 +461,9 @@ pub(crate) mod tests {
         ex:describes a owl:ObjectProperty ; rdfs:domain ex:Document ; rdfs:range ex:Project .\n\
         ex:forCustomer a owl:ObjectProperty ; rdfs:domain ex:Project ; rdfs:range ex:Customer .\n\
         ex:partOf a owl:ObjectProperty ; rdfs:domain ex:Document ; rdfs:range ex:Document .\n";
+
+    pub const CONFUSIONS: &str =
+        "[ocr_confusions]\n\"0\" = \"Oo\"\n\"1\" = \"Il|\"\n\"5\" = \"S\"\n\"8\" = \"B\"\n\n";
 
     pub fn ontology() -> Ontology {
         let config = OntologyConfig {
@@ -481,6 +506,12 @@ pub(crate) mod tests {
         let rules = rules("").unwrap();
         let facts = rules.text_facts("é pump", None, &ids::KnownKeys::new());
         assert_eq!((facts.classes[0].start, facts.classes[0].end), (2, 6));
+        let text = "é ü pump ëë pump";
+        let facts = rules.text_facts(text, None, &ids::KnownKeys::new());
+        let spans: Vec<(usize, usize)> = facts.classes.iter().map(|c| (c.start, c.end)).collect();
+        assert_eq!(spans, [(4, 8), (12, 16)]);
+        let chars: Vec<char> = text.chars().collect();
+        assert_eq!(chars[12..16].iter().collect::<String>(), "pump");
     }
 
     #[test]
@@ -497,9 +528,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn tolerant_ids_only_on_ocr_text_with_default_confusions() {
-        let rules =
-            rules("[[id_patterns]]\nclass = \"ex:Project\"\npattern = 'P-\\d{4}'\n").unwrap();
+    fn tolerant_ids_only_on_ocr_text_with_confusions() {
+        let rules = rules(&format!(
+            "{CONFUSIONS}[[id_patterns]]\nclass = \"ex:Project\"\npattern = 'P-\\d{{4}}'\n"
+        ))
+        .unwrap();
         let known = ids::KnownKeys::from([(
             "http://example.org/onto#Project".to_string(),
             std::collections::HashSet::from(["P-1234".to_string()]),
@@ -510,6 +543,29 @@ pub(crate) mod tests {
         assert_eq!(ocr.entities.len(), 1);
         assert_eq!(ocr.entities[0].method, ids::OCR_METHOD);
         assert!((ocr.entities[0].confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_rules_file_without_confusions_has_none() {
+        let rules =
+            rules("[[id_patterns]]\nclass = \"ex:Project\"\npattern = 'P-\\d{4}'\n").unwrap();
+        let known = ids::KnownKeys::from([(
+            "http://example.org/onto#Project".to_string(),
+            std::collections::HashSet::from(["P-1234".to_string()]),
+        )]);
+        assert!(
+            rules
+                .text_facts("see P-l234", Some(0.9), &known)
+                .entities
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn page_types_need_head_chars() {
+        let text = format!("[pages]\npart_property = \"ex:partOf\"\n{PAGE_TYPES}");
+        let error = rules(&text).err().unwrap();
+        assert!(format!("{error}").contains("pages.head_chars"), "{error}");
     }
 
     #[test]
@@ -537,16 +593,19 @@ pub(crate) mod tests {
 
     #[test]
     fn page_types_need_a_part_property_inside_domain_and_range() {
-        let error = rules(PAGE_TYPES).err().unwrap();
+        let error = rules(&format!("[pages]\nhead_chars = 400\n{PAGE_TYPES}"))
+            .err()
+            .unwrap();
         assert!(
             format!("{error}").contains("pages.part_property"),
             "{error}"
         );
-        let outside = format!("[pages]\npart_property = \"ex:forCustomer\"\n{PAGE_TYPES}");
+        let outside =
+            format!("[pages]\nhead_chars = 400\npart_property = \"ex:forCustomer\"\n{PAGE_TYPES}");
         let error = rules(&outside).err().unwrap();
         assert!(format!("{error}").contains("outside its domain"), "{error}");
         let rules = rules(&format!(
-            "[pages]\npart_property = \"ex:partOf\"\n{PAGE_TYPES}"
+            "[pages]\nhead_chars = 400\npart_property = \"ex:partOf\"\n{PAGE_TYPES}"
         ))
         .unwrap();
         assert_eq!(
@@ -560,6 +619,13 @@ pub(crate) mod tests {
         let rules = rules("[pages]\npart_property = \"ex:partOf\"\n").unwrap();
         assert!(rules.page_types.is_empty());
         assert_eq!(rules.part_property, None);
+    }
+
+    #[test]
+    fn key_alone_matches_the_loaded_rules() {
+        let ontology = ontology();
+        let loaded = load(None, &ontology, "").unwrap();
+        assert_eq!(key(None, &ontology).unwrap(), loaded.key);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use sqlx::{FromRow, PgPool};
 
+use super::OCR_CONFIDENCE;
 use crate::attributes::check::Checked;
 
 const SEGMENT_METHOD: &str = super::entities::SEGMENT_METHOD;
@@ -43,13 +44,11 @@ pub async fn eligible(
     after: i64,
     limit: i64,
 ) -> Result<Vec<Eligible>> {
-    let rows = sqlx::query_as(
+    let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select k.id, k.attr_key, d.source, d.id as document_id, d.doc_type, d.path, k.text, \
          coalesce((select right(p.text, $6) from chunks p where p.content_id = k.content_id \
          and p.ord = k.ord - 1), '') as context, \
-         (select min(p.ocr_confidence) from pages p where p.content_id = k.content_id \
-         and p.method = 'ocr' and p.page_no between coalesce(k.page_from, 0) \
-         and coalesce(k.page_to, 2147483647)) as ocr_confidence, \
+         {OCR_CONFIDENCE} as ocr_confidence, \
          exists (select 1 from class_mentions m where m.chunk_id = k.id) as matched \
          from chunks k \
          join lateral (select d.id, d.doc_type, d.path, s.name as source from documents d \
@@ -59,8 +58,8 @@ pub async fn eligible(
          and (cardinality($2::text[]) = 0 or d.doc_type = any($2)) \
          order by d.id limit 1) d on true \
          where length(k.text) >= $3 and k.id > $4 and (not $7 or k.llm_key is not null) \
-         order by k.id limit $5",
-    )
+         order by k.id limit $5"
+    )))
     .bind(filter.sources)
     .bind(filter.doc_types)
     .bind(filter.min_chars)
@@ -191,6 +190,20 @@ pub async fn write(
     .bind(&keys)
     .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn clear(pool: &PgPool, ids: &[i64]) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("delete from attributes where chunk_id = any($1)")
+        .bind(ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("update chunks set attr_key = null where id = any($1)")
+        .bind(ids)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(())
 }

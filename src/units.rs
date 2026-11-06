@@ -4,9 +4,9 @@ use aho_corasick::{AhoCorasick, Anchored, Input, MatchKind, StartKind};
 use anyhow::{Context, Result};
 use regex::Regex;
 use sha2::{Digest, Sha256};
-use unicode_normalization::UnicodeNormalization;
 
 use crate::ontology::{Ontology, Unit};
+use crate::text::nfkc_squash;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Lookup<'a> {
@@ -19,76 +19,66 @@ pub struct UnitIndex<'a> {
     exact: BTreeMap<(String, String), BTreeSet<&'a str>>,
     folded: BTreeMap<(String, String), BTreeSet<&'a str>>,
     texts: BTreeMap<String, BTreeSet<String>>,
+    members: BTreeMap<String, BTreeSet<&'a str>>,
     units: BTreeMap<&'a str, &'a Unit>,
 }
 
-pub fn normalise(text: &str) -> String {
-    let nfkc: String = text.nfkc().collect();
-    let mut out = String::with_capacity(nfkc.len());
-    for word in nfkc.split_whitespace() {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(word);
-    }
-    out.replace('−', "-")
-}
-
-pub fn unit_texts(unit: &Unit) -> Vec<String> {
+fn unit_texts(unit: &Unit) -> Vec<String> {
     let mut texts: Vec<String> = unit.symbols.clone();
     texts.extend(unit.labels.values().cloned());
     texts.extend(unit.alt_labels.values().flatten().cloned());
     let mut seen = BTreeSet::new();
     texts
         .into_iter()
-        .map(|t| normalise(&t))
+        .map(|t| nfkc_squash(&t))
         .filter(|t| !t.is_empty() && seen.insert(t.clone()))
         .collect()
 }
 
 impl<'a> UnitIndex<'a> {
     pub fn new(ontology: &'a Ontology) -> UnitIndex<'a> {
-        let dimensions: BTreeSet<&str> = ontology
-            .properties
-            .values()
-            .filter(|p| p.is_attribute())
-            .filter_map(|p| p.dimension.as_deref())
-            .collect();
         let mut index = UnitIndex {
             exact: BTreeMap::new(),
             folded: BTreeMap::new(),
             texts: BTreeMap::new(),
+            members: BTreeMap::new(),
             units: BTreeMap::new(),
         };
-        for unit in ontology.units.values() {
-            if !dimensions.contains(unit.dimension.as_str()) {
+        for property in ontology.properties.values().filter(|p| p.is_attribute()) {
+            let Some(kind) = &property.quantity_kind else {
+                continue;
+            };
+            if index.members.contains_key(kind) {
                 continue;
             }
-            index.units.insert(&unit.iri, unit);
-            for text in unit_texts(unit) {
-                let dimension = unit.dimension.clone();
-                index
-                    .folded
-                    .entry((dimension.clone(), text.to_lowercase()))
-                    .or_default()
-                    .insert(&unit.iri);
-                index
-                    .texts
-                    .entry(dimension.clone())
-                    .or_default()
-                    .insert(text.clone());
-                index
-                    .exact
-                    .entry((dimension, text))
-                    .or_default()
-                    .insert(&unit.iri);
+            let members = index.members.entry(kind.clone()).or_default();
+            for unit in ontology.fitting_units(property) {
+                members.insert(&unit.iri);
+                index.units.insert(&unit.iri, unit);
+                for text in unit_texts(unit) {
+                    index
+                        .folded
+                        .entry((kind.clone(), text.to_lowercase()))
+                        .or_default()
+                        .insert(&unit.iri);
+                    index
+                        .texts
+                        .entry(kind.clone())
+                        .or_default()
+                        .insert(text.clone());
+                    index
+                        .exact
+                        .entry((kind.clone(), text))
+                        .or_default()
+                        .insert(&unit.iri);
+                }
             }
         }
         index
     }
 
-    pub fn lookup(&self, dimension: &str, text: &str) -> Lookup<'a> {
-        let text = normalise(text);
+    pub fn lookup(&self, kind: &str, text: &str) -> Lookup<'a> {
+        let text = nfkc_squash(text);
         let pick = |iris: &BTreeSet<&'a str>| -> Lookup<'a> {
             match iris.len() {
                 1 => iris
@@ -98,23 +88,22 @@ impl<'a> UnitIndex<'a> {
                 _ => Lookup::Ambiguous,
             }
         };
-        if let Some(iris) = self.exact.get(&(dimension.to_string(), text.clone())) {
+        if let Some(iris) = self.exact.get(&(kind.to_string(), text.clone())) {
             return pick(iris);
         }
-        match self
-            .folded
-            .get(&(dimension.to_string(), text.to_lowercase()))
-        {
+        match self.folded.get(&(kind.to_string(), text.to_lowercase())) {
             Some(iris) => pick(iris),
             None => Lookup::Unknown,
         }
     }
 
-    pub fn symbols(&self, dimension: &str, limit: usize) -> Vec<String> {
+    pub fn symbols(&self, kind: &str, limit: usize) -> Vec<String> {
         let mut out: Vec<String> = self
-            .units
-            .values()
-            .filter(|u| u.dimension == dimension)
+            .members
+            .get(kind)
+            .into_iter()
+            .flatten()
+            .filter_map(|iri| self.units.get(iri))
             .flat_map(|u| u.symbols.first().cloned())
             .collect();
         out.sort_by_key(|s| (s.chars().count(), s.clone()));
@@ -125,8 +114,8 @@ impl<'a> UnitIndex<'a> {
 
     pub fn fingerprint(&self) -> String {
         let mut hasher = Sha256::new();
-        for ((dimension, text), iris) in &self.exact {
-            for part in [dimension.as_str(), text.as_str()]
+        for ((kind, text), iris) in &self.exact {
+            for part in [kind.as_str(), text.as_str()]
                 .into_iter()
                 .chain(iris.iter().copied())
             {
@@ -139,17 +128,17 @@ impl<'a> UnitIndex<'a> {
             hasher.update(unit.multiplier.to_le_bytes());
             hasher.update(unit.offset.to_le_bytes());
         }
-        crate::ontology::hex(&hasher.finalize())
+        crate::hash::hex(&hasher.finalize())
     }
 
     pub fn finder(&self) -> Result<UnitFinder> {
         let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for (dimension, texts) in &self.texts {
+        for (kind, texts) in &self.texts {
             for text in texts {
                 owners
                     .entry(text.to_lowercase())
                     .or_default()
-                    .insert(dimension.clone());
+                    .insert(kind.clone());
             }
         }
         let patterns: Vec<&String> = owners.keys().collect();
@@ -171,7 +160,7 @@ pub struct UnitFinder {
 }
 
 impl UnitFinder {
-    pub fn dimensions(&self, lowered: &str) -> BTreeSet<String> {
+    pub fn kinds(&self, lowered: &str) -> BTreeSet<String> {
         let mut found = BTreeSet::new();
         let bytes = lowered.as_bytes();
         for (i, byte) in bytes.iter().enumerate() {
@@ -217,7 +206,7 @@ pub fn to_si(unit: &Unit, value: f64) -> f64 {
 fn number_token() -> &'static Regex {
     static TOKEN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     TOKEN.get_or_init(|| {
-        Regex::new(r"[-−]?\d+(?:[.,' \u{a0}\u{202f}]\d+)*").expect("number token pattern")
+        Regex::new(r"[-−]?[0-9]+(?:[.,' \u{a0}\u{202f}][0-9]+)*").expect("number token pattern")
     })
 }
 
@@ -233,6 +222,7 @@ fn grouped(groups: &[&str], separators: &[char], decimal: Option<char>) -> Optio
     if let Some(first) = thousands.first()
         && (thousands.iter().any(|s| s != first)
             || Some(*first) == decimal
+            || whole[0].len() > 3
             || whole[1..].iter().any(|g| g.len() != 3))
     {
         return None;
@@ -254,8 +244,10 @@ pub fn readings(quote: &str) -> Vec<f64> {
         let groups: Vec<&str> = body.split(|c: char| !c.is_ascii_digit()).collect();
         let separators: Vec<char> = body.chars().filter(|c| !c.is_ascii_digit()).collect();
         let mut values: Vec<f64> = groups.iter().filter_map(|g| g.parse().ok()).collect();
+        let mark = |i: usize| separators.get(i).is_some_and(|s| matches!(s, '.' | ','));
         for (i, separator) in separators.iter().enumerate() {
-            if matches!(separator, '.' | ',') {
+            let alone = (i == 0 || !mark(i - 1)) && !mark(i + 1);
+            if matches!(separator, '.' | ',') && alone {
                 let text = format!("{}.{}", groups[i], groups[i + 1]);
                 values.extend(text.parse::<f64>().ok());
             }
@@ -325,9 +317,9 @@ mod tests {
             qudt:hasQuantityKind qk:Temperature .
     "#;
 
-    const P: &str = "http://qudt.org/vocab/dimensionvector/P";
-    const W: &str = "http://qudt.org/vocab/dimensionvector/W";
-    const T: &str = "http://qudt.org/vocab/dimensionvector/T";
+    const P: &str = "http://qudt.org/vocab/quantitykind/Pressure";
+    const W: &str = "http://qudt.org/vocab/quantitykind/Power";
+    const T: &str = "http://qudt.org/vocab/quantitykind/Temperature";
 
     fn ontology() -> Ontology {
         let config = OntologyConfig {
@@ -398,6 +390,55 @@ mod tests {
         assert!(!has("1.450 kW", 14.5));
         assert!(!has("1,23,4", 1234.0));
         assert!(!has("no digits", 0.0));
+        assert!(!has("1.234,5 m3/h", 234.5));
+        assert!(!has("1.234,5 m3/h", 1.234));
+        assert!(!has("12345.678 kg", 12345678.0));
+        assert!(has("12345.678 kg", 12345.678));
+        assert!(has("10,5 12,5 bar", 12.5));
+        assert!(readings("١٢ bar").is_empty());
+    }
+
+    #[test]
+    fn units_are_filtered_by_quantity_kind() {
+        let text = r#"
+            @prefix ex: <http://example.org/onto#> .
+            @prefix owl: <http://www.w3.org/2002/07/owl#> .
+            @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+            @prefix qudt: <http://qudt.org/schema/qudt/> .
+            @prefix unit: <http://qudt.org/vocab/unit/> .
+            @prefix qk: <http://qudt.org/vocab/quantitykind/> .
+            @prefix qkdv: <http://qudt.org/vocab/dimensionvector/> .
+            ex:Pump a owl:Class .
+            qk:Torque a qudt:QuantityKind ; qudt:hasDimensionVector qkdv:E .
+            qk:Energy a qudt:QuantityKind ; qudt:hasDimensionVector qkdv:E .
+            qk:Work a qudt:QuantityKind ; qudt:hasDimensionVector qkdv:E .
+            unit:N-M a qudt:Unit ; qudt:symbol "N·m" ; qudt:hasQuantityKind qk:Torque ;
+                qudt:conversionMultiplier 1.0 ; qudt:hasDimensionVector qkdv:E .
+            unit:KiloW-HR a qudt:Unit ; qudt:symbol "kWh" ; qudt:hasQuantityKind qk:Energy ;
+                qudt:conversionMultiplier 3600000.0 ; qudt:hasDimensionVector qkdv:E .
+            unit:J a qudt:Unit ; qudt:symbol "J" ;
+                qudt:conversionMultiplier 1.0 ; qudt:hasDimensionVector qkdv:E .
+            ex:torque a owl:DatatypeProperty ; rdfs:domain ex:Pump ; qudt:hasQuantityKind qk:Torque .
+            ex:work a owl:DatatypeProperty ; rdfs:domain ex:Pump ; qudt:hasQuantityKind qk:Work .
+        "#;
+        let config = OntologyConfig {
+            files: Vec::new(),
+            languages: vec!["en".to_string()],
+            include: vec!["http://example.org/onto#Pump".to_string()],
+            exclude: Vec::new(),
+            document_class: String::new(),
+        };
+        let loaded = crate::ontology::load_sources(&[("t.ttl".to_string(), text.into())], &config);
+        let index = UnitIndex::new(&loaded.ontology);
+        let torque = "http://qudt.org/vocab/quantitykind/Torque";
+        let work = "http://qudt.org/vocab/quantitykind/Work";
+        assert_eq!(index.lookup(torque, "kWh"), Lookup::Unknown);
+        assert_eq!(found(&index, torque, "N·m").as_deref(), Some("N-M"));
+        assert_eq!(index.symbols(torque, 10), ["J", "N·m"]);
+        assert_eq!(index.symbols(work, 10), ["J", "N·m", "kWh"]);
+        let finder = index.finder().unwrap();
+        let kinds = finder.kinds("rated 12 kwh");
+        assert!(!kinds.contains(torque) && kinds.contains(work));
     }
 
     #[test]
@@ -407,17 +448,17 @@ mod tests {
         let finder = index.finder().unwrap();
         let hits = |text: &str| -> Vec<String> {
             finder
-                .dimensions(&normalise(text).to_lowercase())
+                .kinds(&nfkc_squash(text).to_lowercase())
                 .iter()
                 .map(|d| d.rsplit('/').next().unwrap().to_string())
                 .collect()
         };
-        assert_eq!(hits("rated 7,5 kW at 1450 rpm"), ["W"]);
-        assert_eq!(hits("design 10 barg, 80 °C"), ["P", "T"]);
+        assert_eq!(hits("rated 7,5 kW at 1450 rpm"), ["Power"]);
+        assert_eq!(hits("design 10 barg, 80 °C"), ["Pressure", "Temperature"]);
         assert!(hits("10 barrels").is_empty());
         assert!(hits("kW only").is_empty());
-        assert_eq!(hits("1.450 KW"), ["W"]);
-        assert_eq!(hits("Druk: 8-10 BAR(G)"), ["P"]);
+        assert_eq!(hits("1.450 KW"), ["Power"]);
+        assert_eq!(hits("Druk: 8-10 BAR(G)"), ["Pressure"]);
         assert!(hits("P-101 at 10").is_empty());
         assert_eq!(index.symbols(W, 2), ["MW", "hp"]);
     }

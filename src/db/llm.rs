@@ -420,9 +420,9 @@ pub async fn spend(pool: &PgPool, job: i64) -> Result<(f64, i64)> {
 
 pub async fn lock(conn: &mut PoolConnection<Postgres>, job: i64) -> Result<bool> {
     let locked = sqlx::query_scalar(
-        "select pg_try_advisory_lock(hashtext(current_schema() || ':llm_job'), $1::integer)",
+        "select pg_try_advisory_lock(hashtextextended(current_schema() || ':llm_job:' || $1, 0))",
     )
-    .bind(job as i32)
+    .bind(job)
     .fetch_one(&mut **conn)
     .await?;
     Ok(locked)

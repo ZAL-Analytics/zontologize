@@ -76,7 +76,7 @@ where
     Ok(())
 }
 
-pub async fn guarded<F>(future: F) -> Outcome
+async fn guarded<F>(future: F) -> Outcome
 where
     F: Future<Output = Result<Vec<Page>>> + Send + 'static,
 {

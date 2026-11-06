@@ -9,14 +9,17 @@ use anyhow::{Context as _, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::hash::hex;
 use crate::llm::prompt::Prompt;
-use crate::llm::shortlist::{label, local_name, pick};
+use crate::llm::shortlist::{label, pick};
 use crate::llm::{ModelName, Request};
-use crate::ontology::{Ontology, Property, ValueKind, hex};
+use crate::ns::local_name;
+use crate::ontology::{Ontology, Property, ValueKind};
 use crate::units::{UnitFinder, UnitIndex};
 
 pub const TASK: &str = "attributes";
-pub const STAGE_VERSION: u32 = 1;
+pub const CACHE_VERSION: u32 = 1;
+pub const CHECK_VERSION: u32 = 2;
 pub const DOC: &str = "doc";
 pub const USER_VARIABLES: [&str; 6] = [
     "path",
@@ -26,8 +29,6 @@ pub const USER_VARIABLES: [&str; 6] = [
     "context",
     "chunk",
 ];
-const UNIT_SYMBOLS: usize = 12;
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct Answer {
     pub values: Vec<ValueOut>,
@@ -79,6 +80,8 @@ pub struct Context<'a> {
     pub units: &'a UnitIndex<'a>,
     pub languages: &'a [String],
     pub max_properties: usize,
+    pub max_subjects: usize,
+    pub unit_symbols: usize,
     pub check_key: &'a str,
     pub system: &'a Prompt,
     pub user: &'a Prompt,
@@ -87,13 +90,13 @@ pub struct Context<'a> {
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Hits {
-    pub dimensions: BTreeSet<String>,
+    pub kinds: BTreeSet<String>,
     pub properties: BTreeSet<String>,
 }
 
 impl Hits {
     pub fn is_empty(&self) -> bool {
-        self.dimensions.is_empty() && self.properties.is_empty()
+        self.kinds.is_empty() && self.properties.is_empty()
     }
 }
 
@@ -103,7 +106,7 @@ pub struct Matcher {
     owners: Vec<String>,
 }
 
-pub fn property_texts(property: &Property) -> Vec<String> {
+fn property_texts(property: &Property) -> Vec<String> {
     let mut texts: BTreeSet<String> = property.labels.values().map(|l| l.to_lowercase()).collect();
     texts.extend(
         property
@@ -145,9 +148,9 @@ impl Matcher {
     }
 
     pub fn hits(&self, text: &str) -> Hits {
-        let lowered = crate::units::normalise(text).to_lowercase();
+        let lowered = crate::text::nfkc_squash(text).to_lowercase();
         let hits = Hits {
-            dimensions: self.units.dimensions(&lowered),
+            kinds: self.units.kinds(&lowered),
             properties: BTreeSet::new(),
         };
         let Some(labels) = &self.labels else {
@@ -170,16 +173,12 @@ impl Matcher {
     }
 }
 
-fn allows(ontology: &Ontology, property: &Property, class: &str) -> bool {
-    property.domain.iter().any(|d| ontology.is_a(class, d))
-}
-
 fn property_hit(property: &Property, hits: &Hits) -> bool {
     hits.properties.contains(&property.iri)
         || property
-            .dimension
+            .quantity_kind
             .as_ref()
-            .is_some_and(|d| hits.dimensions.contains(d))
+            .is_some_and(|k| hits.kinds.contains(k))
 }
 
 fn class_name(ontology: &Ontology, iri: &str, languages: &[String]) -> String {
@@ -215,10 +214,13 @@ fn property_lines(
         };
         let name = pick(&property.labels, context.languages)
             .unwrap_or_else(|| local_name(iri).to_string());
-        let (kind, units) = match (&property.value, &property.dimension) {
-            (Some(ValueKind::Number), Some(dimension)) => (
+        let (kind, units) = match (&property.value, &property.quantity_kind) {
+            (Some(ValueKind::Number), Some(quantity)) => (
                 "number",
-                context.units.symbols(dimension, UNIT_SYMBOLS).join(", "),
+                context
+                    .units
+                    .symbols(quantity, context.unit_symbols)
+                    .join(", "),
             ),
             (Some(ValueKind::Number), None) => ("number", "no unit".to_string()),
             _ => ("text", "no unit".to_string()),
@@ -260,16 +262,9 @@ pub fn schema(properties: &[String], refs: &[String]) -> serde_json::Value {
     })
 }
 
-pub fn cache_key(request: &Request, model: &ModelName) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(TASK.as_bytes());
-    hasher.update(STAGE_VERSION.to_le_bytes());
-    hasher.update(request.key(model).as_bytes());
-    hex(&hasher.finalize())
-}
-
 pub fn check_key(units: &UnitIndex, max_text_chars: usize) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(CHECK_VERSION.to_le_bytes());
     hasher.update(units.fingerprint().as_bytes());
     hasher.update((max_text_chars as u64).to_le_bytes());
     hex(&hasher.finalize())
@@ -287,28 +282,41 @@ pub fn state_key(cache_key: &str, check_key: &str, subjects: &[Subject]) -> Stri
 
 pub fn build(context: &Context, input: &ChunkInput, hits: &Hits) -> Option<Built> {
     let ontology = context.ontology;
-    let candidates: Vec<&Subject> = input.known.iter().chain(&input.doc).collect();
-    let mut properties = Vec::new();
-    let mut refs: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut used: BTreeSet<String> = BTreeSet::new();
+    let candidates: Vec<&Subject> = input
+        .known
+        .iter()
+        .take(context.max_subjects)
+        .chain(&input.doc)
+        .collect();
+    let mut found: Vec<(&String, Vec<String>)> = Vec::new();
     for property in ontology.properties.values().filter(|p| p.is_attribute()) {
-        if properties.len() >= context.max_properties || !property_hit(property, hits) {
+        if !property_hit(property, hits) {
             continue;
         }
         let allowed: Vec<String> = candidates
             .iter()
-            .filter(|s| allows(ontology, property, &s.class))
+            .filter(|s| ontology.fits(&s.class, &property.domain))
             .map(|s| s.reference.clone())
             .collect();
-        if allowed.is_empty() {
-            continue;
+        if !allowed.is_empty() {
+            found.push((&property.iri, allowed));
         }
-        used.extend(allowed.iter().cloned());
-        properties.push(property.iri.clone());
-        refs.insert(property.iri.clone(), allowed);
     }
-    if properties.is_empty() {
+    if found.is_empty() {
         return None;
+    }
+    if found.len() > context.max_properties {
+        found.sort_by_key(|(iri, _)| !hits.properties.contains(*iri));
+        found.truncate(context.max_properties);
+        found.sort_by(|a, b| a.0.cmp(b.0));
+    }
+    let mut properties = Vec::new();
+    let mut refs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    for (iri, allowed) in found {
+        used.extend(allowed.iter().cloned());
+        properties.push(iri.clone());
+        refs.insert(iri.clone(), allowed);
     }
     let subjects: Vec<Subject> = candidates
         .into_iter()
@@ -336,7 +344,7 @@ pub fn build(context: &Context, input: &ChunkInput, hits: &Hits) -> Option<Built
         user,
         schema: schema(&properties, &references),
     };
-    let cache_key = cache_key(&request, context.model);
+    let cache_key = request.stage_key(context.model, CACHE_VERSION);
     let key = state_key(&cache_key, context.check_key, &subjects);
     Some(Built {
         subjects,
@@ -386,7 +394,8 @@ pub mod tests {
             skos:altLabel "druk"@nl .
         ex:power a owl:DatatypeProperty ; rdfs:domain ex:Asset, ex:Sheet ;
             qudt:hasQuantityKind ex:Power ; skos:prefLabel "power"@en .
-        ex:stages a owl:DatatypeProperty ; rdfs:domain ex:Asset ; rdfs:range xsd:integer ;
+        ex:stages a owl:DatatypeProperty ; rdfs:domain ex:Asset ;
+            rdfs:range xsd:nonNegativeInteger ;
             skos:prefLabel "stages"@en .
         ex:material a owl:DatatypeProperty ; rdfs:domain ex:Asset ; rdfs:range xsd:string ;
             skos:prefLabel "material"@en ; skos:altLabel "materiaal"@nl .
@@ -435,6 +444,15 @@ pub mod tests {
     }
 
     pub fn built_for(onto: &Ontology, input: &ChunkInput) -> Option<Built> {
+        built_with(onto, input, 30, 30)
+    }
+
+    fn built_with(
+        onto: &Ontology,
+        input: &ChunkInput,
+        max_properties: usize,
+        max_subjects: usize,
+    ) -> Option<Built> {
         let units = UnitIndex::new(onto);
         let matcher = Matcher::new(onto, &units).unwrap();
         let system = Prompt {
@@ -449,7 +467,9 @@ pub mod tests {
             ontology: onto,
             units: &units,
             languages: &languages,
-            max_properties: 30,
+            max_properties,
+            max_subjects,
+            unit_symbols: 12,
             check_key: &check,
             system: &system,
             user: &user,
@@ -475,7 +495,7 @@ pub mod tests {
         let units = UnitIndex::new(&onto);
         let matcher = Matcher::new(&onto, &units).unwrap();
         let hits = matcher.hits("Rated 7,5 kW. Materiaal: RVS. Druk max 10 barg");
-        assert_eq!(hits.dimensions.len(), 2);
+        assert_eq!(hits.kinds.len(), 2);
         assert_eq!(
             hits.properties.iter().cloned().collect::<Vec<_>>(),
             [iri("material"), iri("pressure")]
@@ -525,6 +545,43 @@ pub mod tests {
         assert!(schema.contains("\"enum\":[\"r1\",\"doc\"]"), "{schema}");
         assert!(!schema.contains("material"));
         assert!(built.request.user.contains("| number | MW, kW, mW |"));
+    }
+
+    #[test]
+    fn caps_keep_named_properties_and_the_first_subjects() {
+        let first = subject("r1", 10, "Pump", "P-101");
+        let second = subject("r2", 11, "Pump", "P-102");
+        let chunk = input(
+            "P-101 and P-102: pressure 10 bar, 7,5 kW",
+            vec![first.clone(), second],
+            None,
+        );
+        let all = built_for(&ontology(), &chunk).unwrap();
+        assert_eq!(all.properties, [iri("power"), iri("pressure")]);
+        assert_eq!(all.subjects.len(), 2);
+        let capped = built_with(&ontology(), &chunk, 1, 1).unwrap();
+        assert_eq!(capped.properties, [iri("pressure")]);
+        assert_eq!(capped.subjects, [first]);
+    }
+
+    #[test]
+    fn an_attribute_without_a_domain_is_never_asked() {
+        let config = OntologyConfig {
+            files: Vec::new(),
+            languages: vec!["en".to_string(), "nl".to_string()],
+            include: vec![iri("Asset"), iri("Company"), iri("Document"), iri("colour")],
+            exclude: Vec::new(),
+            document_class: String::new(),
+        };
+        let text = format!(
+            "{TTL}\nex:colour a owl:DatatypeProperty ; rdfs:range xsd:string ; skos:prefLabel \"colour\"@en ."
+        );
+        let onto =
+            crate::ontology::load_sources(&[("t.ttl".to_string(), text.into())], &config).ontology;
+        assert!(onto.properties[&iri("colour")].is_attribute());
+        let pump = subject("r1", 10, "Pump", "P-101");
+        let chunk = input("P-101 colour red", vec![pump], None);
+        assert!(built_for(&onto, &chunk).is_none());
     }
 
     #[test]

@@ -1,12 +1,13 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use super::{CallError, Reply, Request, Usage, Windows};
+use super::{CallError, ChatMessage, Reply, Request, Usage, Windows, messages};
 
 pub const HOST_VARIABLE: &str = "OLLAMA_HOST";
 const DEFAULT_HOST: &str = "http://localhost:11434";
+pub const DEFAULT_THINK: bool = false;
 
 pub struct Ollama {
     client: reqwest::Client,
@@ -60,6 +61,15 @@ fn normalise_host(host: &str) -> String {
     format!("http://{host}")
 }
 
+#[derive(Debug, Serialize)]
+pub struct Body<'a> {
+    model: &'a str,
+    messages: [ChatMessage<'a>; 2],
+    stream: bool,
+    format: &'a serde_json::Value,
+    think: bool,
+}
+
 impl Ollama {
     pub fn new(host: &str, model: &str, think: bool, timeout: Duration) -> Result<Ollama> {
         let client = reqwest::Client::builder()
@@ -74,17 +84,14 @@ impl Ollama {
         })
     }
 
-    pub fn body(&self, request: &Request) -> serde_json::Value {
-        serde_json::json!({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": request.system},
-                {"role": "user", "content": request.user},
-            ],
-            "stream": false,
-            "format": request.schema,
-            "think": self.think,
-        })
+    pub fn body<'a>(&'a self, request: &'a Request) -> Body<'a> {
+        Body {
+            model: &self.model,
+            messages: messages(request),
+            stream: false,
+            format: &request.schema,
+            think: self.think,
+        }
     }
 
     pub async fn send(&self, request: &Request) -> Result<Reply, CallError> {
@@ -109,7 +116,7 @@ impl Ollama {
                 .unwrap_or_else(|_| text.chars().take(200).collect());
             let message = format!("ollama HTTP {status}: {message}");
             return Err(match status {
-                404 | 400 => CallError::Fatal(message),
+                400 | 401 | 403 | 404 => CallError::Fatal(message),
                 _ => CallError::Retry {
                     after: None,
                     message,
@@ -117,22 +124,26 @@ impl Ollama {
             });
         }
         let chat: ChatResponse = serde_json::from_str(&text)
-            .map_err(|error| CallError::Invalid(format!("ollama response: {error}")))?;
+            .map_err(|error| CallError::invalid(format!("ollama response: {error}")))?;
+        let usage = Usage {
+            input_tokens: chat.prompt_eval_count,
+            cached_input_tokens: 0,
+            output_tokens: chat.eval_count,
+            cost_usd: 0.0,
+        };
         let content = chat.message.map(|m| m.content).unwrap_or_default();
         if serde_json::from_str::<serde::de::IgnoredAny>(&content).is_err() {
-            return Err(CallError::Invalid(format!(
-                "ollama content is not JSON: {}",
-                content.chars().take(200).collect::<String>()
-            )));
+            return Err(CallError::Invalid {
+                message: format!(
+                    "ollama content is not JSON: {}",
+                    content.chars().take(200).collect::<String>()
+                ),
+                usage,
+            });
         }
         Ok(Reply {
             response: content,
-            usage: Usage {
-                input_tokens: chat.prompt_eval_count,
-                cached_input_tokens: 0,
-                output_tokens: chat.eval_count,
-                cost_usd: 0.0,
-            },
+            usage,
             windows: Windows::default(),
             subscription: false,
         })
@@ -187,7 +198,19 @@ mod tests {
             user: "u".to_string(),
             schema: serde_json::json!({"type": "object"}),
         };
-        let body = provider.body(&request);
+        let sent = serde_json::to_string(&provider.body(&request)).unwrap();
+        let before = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "u"},
+            ],
+            "stream": false,
+            "format": request.schema,
+            "think": false,
+        });
+        assert_eq!(sent, before.to_string());
+        let body: serde_json::Value = serde_json::from_str(&sent).unwrap();
         assert_eq!(body["format"]["type"], "object");
         assert_eq!(body["stream"], false);
         assert_eq!(body["think"], false);

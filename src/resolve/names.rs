@@ -1,21 +1,18 @@
 use std::collections::BTreeMap;
 
-use unicode_normalization::UnicodeNormalization;
-use unicode_normalization::char::is_combining_mark;
-
 use crate::ontology::Ontology;
 use crate::rules::ids::{IdPatterns, On};
 
 pub fn plain(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for c in text.nfkd().filter(|c| !is_combining_mark(*c)) {
+    for c in crate::text::strip_accents(text).chars() {
         if c.is_alphanumeric() {
             out.extend(c.to_lowercase());
         } else {
             out.push(' ');
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    crate::text::squash(&out)
 }
 
 pub struct Normaliser {
@@ -41,13 +38,13 @@ impl Normaliser {
                 padded = padded.replace(&needle, " ");
             }
         }
-        padded.split_whitespace().collect::<Vec<_>>().join(" ")
+        crate::text::squash(&padded)
     }
 }
 
 const TAG_PREFIX_CHARS: usize = 3;
 
-pub fn digit_tokens(key: &str) -> Vec<String> {
+fn digit_tokens(key: &str) -> Vec<String> {
     let words: Vec<&str> = key.split(' ').collect();
     let mut tokens = Vec::new();
     for (i, word) in words.iter().enumerate() {
@@ -73,7 +70,7 @@ pub fn digits_agree(a: &str, b: &str) -> bool {
     digit_tokens(a) == digit_tokens(b)
 }
 
-pub fn first_token(key: &str) -> &str {
+fn first_token(key: &str) -> &str {
     key.split(' ').next().unwrap_or("")
 }
 

@@ -56,6 +56,11 @@ impl PageTypes {
         doc_types: &BTreeMap<String, String>,
         head_chars: usize,
     ) -> Result<PageTypes, String> {
+        if !specs.is_empty() && head_chars == 0 {
+            return Err(
+                "pages.head_chars must be greater than 0 when page_types are set".to_string(),
+            );
+        }
         let mut types = Vec::new();
         for (index, spec) in specs.iter().enumerate() {
             if !doc_types.contains_key(&spec.doc_type) {

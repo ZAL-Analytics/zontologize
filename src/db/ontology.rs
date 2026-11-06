@@ -12,6 +12,15 @@ pub async fn current(pool: &PgPool) -> Result<Option<i64>> {
     Ok(id)
 }
 
+pub async fn mark_used(pool: &PgPool, ontology: &Ontology, run_id: i64) -> Result<()> {
+    sqlx::query("update ontology_versions set last_run_id = $2 where sha256 = $1")
+        .bind(&ontology.version)
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn store(pool: &PgPool, ontology: &Ontology, run_id: i64) -> Result<(i64, bool)> {
     let existing: Option<i64> =
         sqlx::query_scalar("select id from ontology_versions where sha256 = $1")
@@ -19,17 +28,12 @@ pub async fn store(pool: &PgPool, ontology: &Ontology, run_id: i64) -> Result<(i
             .fetch_optional(pool)
             .await?;
     if let Some(id) = existing {
-        sqlx::query("update ontology_versions set last_run_id = $2 where id = $1")
-            .bind(id)
-            .bind(run_id)
-            .execute(pool)
-            .await?;
         return Ok((id, false));
     }
     let mut tx = pool.begin().await?;
     let id: i64 = sqlx::query_scalar(
-        "insert into ontology_versions (sha256, files, loaded_run_id, last_run_id) \
-         values ($1, $2, $3, $3) returning id",
+        "insert into ontology_versions (sha256, files, loaded_run_id) \
+         values ($1, $2, $3) returning id",
     )
     .bind(&ontology.version)
     .bind(sqlx::types::Json(&ontology.files))
@@ -148,20 +152,6 @@ fn array(items: &[String]) -> String {
     format!("{{{}}}", quoted.join(","))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn array_literal_quotes_items() {
-        assert_eq!(array(&[]), "{}");
-        assert_eq!(
-            array(&["a".to_string(), "b\"c".to_string()]),
-            "{\"a\",\"b\\\"c\"}"
-        );
-    }
-}
-
 #[derive(sqlx::FromRow)]
 struct ClassRow {
     iri: String,
@@ -276,6 +266,7 @@ pub async fn selected(pool: &PgPool, version_id: i64) -> Result<Stored> {
             labels: row.labels.0,
             alt_labels: row.alt_labels.0,
             dimension: row.dimension,
+            quantity_kinds: Vec::new(),
             multiplier: row.conversion_multiplier,
             offset: row.conversion_offset,
         })
@@ -286,4 +277,18 @@ pub async fn selected(pool: &PgPool, version_id: i64) -> Result<Stored> {
         properties: out,
         units,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn array_literal_quotes_items() {
+        assert_eq!(array(&[]), "{}");
+        assert_eq!(
+            array(&["a".to_string(), "b\"c".to_string()]),
+            "{\"a\",\"b\\\"c\"}"
+        );
+    }
 }

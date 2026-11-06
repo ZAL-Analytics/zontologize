@@ -72,7 +72,7 @@ async fn table_source_follows_renames_versions_and_removals() {
     let env = Env::new("table").await;
     let store = store(&env).await;
     env.write_config(&format!(
-        "[[sources]]\nname = \"store\"\nkind = \"table\"\nview = \"{store}.zontologize_files\"\n\
+        "[scan]\nbatch_size = 1\n\n[[sources]]\nname = \"store\"\nkind = \"table\"\nview = \"{store}.zontologize_files\"\n\
          root = \"{}\"\ndataset = \"current\"\n",
         env.data().display()
     ));
@@ -193,5 +193,20 @@ async fn missing_column_names_view_and_column() {
     assert!(message.contains(&format!("{store}.files")), "{message}");
     assert!(message.contains("no column sha256"), "{message}");
     assert_eq!(env.count("select count(*) from runs").await, 0);
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn table_source_needs_a_root() {
+    let env = Env::new("table_root").await;
+    env.write_config(
+        "[[sources]]\nname = \"store\"\nkind = \"table\"\nview = \"store.files\"\nroot = \"\"\n",
+    );
+    let error = zontologize::scan::prepare(Some(&env.config()), &[])
+        .err()
+        .unwrap();
+    let message = format!("{error:#}");
+    assert!(message.contains("sources.store.root"), "{message}");
     env.finish().await;
 }

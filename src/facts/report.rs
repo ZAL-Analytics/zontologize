@@ -11,8 +11,12 @@ use super::TASK;
 use crate::config::Config;
 use crate::db;
 use crate::db::facts::TermRow;
-use crate::fit::report::{RDF_TYPE, RDFS_COMMENT, SKOS_PREF, STANDARD_PREFIXES, label, slug};
-use crate::llm::shortlist::local_name;
+use crate::fit::report::{label, slug};
+use crate::ns::local_name;
+use crate::ns::{
+    OWL_OBJECT_PROPERTY, RDF_TYPE, RDFS_COMMENT, RDFS_DOMAIN, RDFS_RANGE, SKOS_PREF_LABEL,
+    STANDARD_PREFIXES,
+};
 use crate::ontology::Ontology;
 
 pub const REPORT_FILE: &str = "extract-report.md";
@@ -21,9 +25,6 @@ pub const NAMES_FILE: &str = "gazetteer-candidates.csv";
 const EXAMPLES: i32 = 3;
 const NAMES_PER_CLASS: i64 = 5;
 const LISTED_TERMS: usize = 200;
-const OWL_OBJECT_PROPERTY: &str = "http://www.w3.org/2002/07/owl#ObjectProperty";
-const RDFS_DOMAIN: &str = "http://www.w3.org/2000/01/rdf-schema#domain";
-const RDFS_RANGE: &str = "http://www.w3.org/2000/01/rdf-schema#range";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Proposal {
@@ -132,7 +133,11 @@ pub fn turtle(
             node(RDF_TYPE)?,
             node(OWL_OBJECT_PROPERTY)?,
         ))?;
-        writer.serialize_triple(&Triple::new(property.clone(), node(SKOS_PREF)?, label))?;
+        writer.serialize_triple(&Triple::new(
+            property.clone(),
+            node(SKOS_PREF_LABEL)?,
+            label,
+        ))?;
         writer.serialize_triple(&Triple::new(
             property.clone(),
             node(RDFS_DOMAIN)?,
@@ -162,7 +167,7 @@ pub fn turtle(
     Ok(text)
 }
 
-pub fn compact(ontology: &Ontology, iri: &str) -> String {
+fn compact(ontology: &Ontology, iri: &str) -> String {
     for (prefix, namespace) in &ontology.prefixes {
         if let Some(local) = iri.strip_prefix(namespace.as_str())
             && !local.is_empty()
@@ -176,7 +181,7 @@ pub fn compact(ontology: &Ontology, iri: &str) -> String {
     format!("<{iri}>")
 }
 
-pub fn names_csv(ontology: &Ontology, rows: &[(String, String, String, i64)]) -> Result<String> {
+fn names_csv(ontology: &Ontology, rows: &[(String, String, String, i64)]) -> Result<String> {
     let mut writer = csv::Writer::from_writer(Vec::new());
     writer.write_record(["class", "key", "name", "aliases", "lang", "chunks"])?;
     for (class, key, name, chunks) in rows {
@@ -193,7 +198,7 @@ pub fn names_csv(ontology: &Ontology, rows: &[(String, String, String, i64)]) ->
     String::from_utf8(bytes).context("CSV output is not UTF-8")
 }
 
-pub fn short_label(ontology: &Ontology, iri: &str) -> String {
+fn short_label(ontology: &Ontology, iri: &str) -> String {
     let languages = &ontology.languages;
     if let Some(class) = ontology.classes.get(iri) {
         return crate::llm::shortlist::label(class, languages);
