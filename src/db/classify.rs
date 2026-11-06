@@ -24,9 +24,10 @@ pub async fn units(pool: &PgPool) -> Result<Vec<Unit>> {
          left join llm_types t on t.content_id = u.content_id and t.page_from = u.page_from \
          where u.doc_type is null and (u.n > 1 or exists (select 1 from documents x \
          where x.content_id = u.content_id and x.status = 'present' \
-         and (x.doc_type is null or x.type_method like 'llm:%'))) \
+         and (x.doc_type is null or x.type_method like $1))) \
          order by u.content_id, u.page_from",
     )
+    .bind(super::MODEL_METHODS)
     .fetch_all(pool)
     .await?;
     Ok(rows)

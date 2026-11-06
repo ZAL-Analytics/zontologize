@@ -358,3 +358,125 @@ async fn a_rules_rerun_keeps_links_and_reviews() {
     );
     env.finish().await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn same_as_links_carry_provenance_and_keep_other_methods() {
+    let env = setup("resolve_provenance").await;
+    sqlx::query(
+        "insert into relations (src_id, property_iri, dst_id, method, status, confidence) \
+         select min(id), 'http://www.w3.org/2002/07/owl#sameAs', max(id), 'llm:test', 'auto', 0.9 \
+         from entities where document_id is null",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    let stats = resolve(&env).await;
+    let other = env
+        .count("select count(*) from relations where method = 'llm:test'")
+        .await;
+    assert_eq!(other, 1, "{stats:?}");
+    let same_as = "from relations where property_iri = 'http://www.w3.org/2002/07/owl#sameAs' \
+                   and method like 'resolve:%'";
+    assert!(env.count(&format!("select count(*) {same_as}")).await > 0);
+    let bare = env
+        .count(&format!(
+            "select count(*) {same_as} and chunk_id is null and document_id is null"
+        ))
+        .await;
+    assert_eq!(bare, 0);
+    let listed = env
+        .count(&format!(
+            "select count(*) {same_as} and chunk_id is not null \
+             and (props -> 'chunks') @> to_jsonb(chunk_id)"
+        ))
+        .await;
+    assert_eq!(
+        listed,
+        env.count(&format!(
+            "select count(*) {same_as} and chunk_id is not null"
+        ))
+        .await
+    );
+    let runs = env
+        .count("select count(*) from runs where status = 'finished' and stats ? 'resolve'")
+        .await;
+    assert_eq!(runs, 1);
+    let again = resolve(&env).await;
+    assert_eq!(again.written(), 0, "{again:?}");
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn deleted_owners_take_their_vectors_and_job_items_along() {
+    let env = setup("resolve_owners").await;
+    sqlx::query(
+        "insert into embedding_models (name, fingerprint, repo, file, tokenizer, revision, \
+         sha256, dimensions, pooling, output, passage_prefix, query_prefix, max_tokens, \
+         normalize) values ('m', 'f', 'r', 'f', 't', 'v', 's', 2, 'mean', 'o', '', '', 8, true)",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into embeddings (model_id, owner_kind, owner_id, text_key, embedding) \
+         select (select id from embedding_models), 'entity', id, 'k', '[1,0]'::halfvec from entities \
+         union all select (select id from embedding_models), 'chunk', id, 'k', '[0,1]'::halfvec \
+         from chunks",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    sqlx::query("insert into llm_jobs (task, provider, model) values ('facts', 'p', 'm')")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "insert into llm_job_items (job_id, ord, chunk_id) \
+         select (select id from llm_jobs), row_number() over (order by id), id from chunks",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    let chunk: i64 = sqlx::query_scalar("select min(id) from chunks")
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    let entity: i64 = sqlx::query_scalar("select min(id) from entities")
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    sqlx::query("delete from chunks where id = $1")
+        .bind(chunk)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    sqlx::query("delete from entities where id = $1")
+        .bind(entity)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let stale = env
+        .count(
+            "select count(*) from embeddings v where not exists (select 1 from chunks k \
+             where v.owner_kind = 'chunk' and k.id = v.owner_id) and not exists (select 1 \
+             from entities e where v.owner_kind = 'entity' and e.id = v.owner_id)",
+        )
+        .await;
+    assert_eq!(stale, 0);
+    let left = env
+        .count(&format!(
+            "select count(*) from llm_job_items where chunk_id = {chunk}"
+        ))
+        .await;
+    assert_eq!(left, 0);
+    let orphan = sqlx::query(
+        "insert into llm_job_items (job_id, ord, chunk_id) \
+         values ((select id from llm_jobs), 0, -1)",
+    )
+    .execute(&env.pool)
+    .await;
+    assert!(orphan.is_err());
+    env.finish().await;
+}

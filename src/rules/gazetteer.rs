@@ -47,9 +47,19 @@ impl Lexicon {
             let mut reader = csv::ReaderBuilder::new()
                 .trim(csv::Trim::All)
                 .from_reader(bytes.as_slice());
-            for (index, row) in reader.deserialize::<Row>().enumerate() {
-                let line = index + 2;
-                let row = row.map_err(|e| anyhow!("{name}:{line}: {e}"))?;
+            let headers = reader
+                .headers()
+                .map_err(|e| anyhow!("{name}: {e}"))?
+                .clone();
+            let mut record = csv::StringRecord::new();
+            while reader
+                .read_record(&mut record)
+                .map_err(|e| anyhow!("{name}: {e}"))?
+            {
+                let line = record.position().map_or(0, |p| p.line());
+                let row: Row = record
+                    .deserialize(Some(&headers))
+                    .map_err(|e| anyhow!("{name}:{line}: {e}"))?;
                 let class = ontology
                     .class(&row.class)
                     .map_err(|e| anyhow!("{name}:{line}: {e}"))?;
@@ -158,7 +168,7 @@ impl Lexicon {
                             name: entry.name.clone(),
                             start,
                             end,
-                            method: "gazetteer",
+                            method: super::GAZETTEER_METHOD,
                             confidence: 1.0,
                         });
                     }
@@ -290,5 +300,18 @@ mod tests {
         .err()
         .unwrap();
         assert!(format!("{error}").starts_with("g.csv:2:"), "{error}");
+    }
+
+    #[test]
+    fn line_numbers_count_fields_that_span_lines() {
+        let csv =
+            "class,key,name,aliases,lang\nex:Customer,C-1,\"Two\nLines\",,\nex:Hidden,H,h,,\n";
+        let error = Lexicon::build(
+            &[("g.csv".to_string(), csv.as_bytes().to_vec())],
+            &ontology(),
+        )
+        .err()
+        .unwrap();
+        assert!(format!("{error}").starts_with("g.csv:4:"), "{error}");
     }
 }

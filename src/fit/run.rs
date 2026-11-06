@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Result, bail};
 use sqlx::PgPool;
@@ -11,7 +10,7 @@ use crate::config::{self, Config};
 use crate::db;
 use crate::db::fit::Chunk;
 use crate::db::llm::{Item, Job, JobParams};
-use crate::llm::job::{self, Handler, Limits, Runner, Work};
+use crate::llm::job::{self, Handler, Runner, Work};
 use crate::llm::prompt::{self, Prompt};
 use crate::llm::shortlist::{counts_by_chunk, shortlist, shortlist_lines};
 use crate::llm::{ModelName, Request};
@@ -19,35 +18,7 @@ use crate::ontology::{self, Ontology};
 
 const USER_VARIABLES: [&str; 5] = ["path", "pages", "languages", "shortlist", "chunk"];
 
-pub struct Options {
-    pub claude_program: PathBuf,
-    pub sample: Option<usize>,
-    pub seed: Option<String>,
-    pub max_usd: Option<f64>,
-    pub max_requests: Option<u64>,
-    pub dry_run: bool,
-    pub no_wait: bool,
-    pub new: bool,
-    pub backoff: Duration,
-}
-
-impl Options {
-    pub fn new(claude_program: PathBuf) -> Options {
-        Options {
-            claude_program,
-            sample: None,
-            seed: None,
-            max_usd: None,
-            max_requests: None,
-            dry_run: false,
-            no_wait: false,
-            new: false,
-            backoff: Duration::from_secs(2),
-        }
-    }
-}
-
-pub use crate::llm::job::Outcome;
+pub use crate::llm::job::{Options, Outcome};
 
 struct Prepared {
     chunk: Chunk,
@@ -75,20 +46,18 @@ pub async fn run(
     if config.models.fit.is_empty() {
         bail!("[models] fit is empty; set it to provider:model, for example claude-code:haiku");
     }
-    let name =
-        ModelName::parse(&config.models.fit).map_err(|e| anyhow::anyhow!("models.fit: {e}"))?;
+    let name = ModelName::configured(&config.models.fit, &config.providers)
+        .map_err(|e| anyhow::anyhow!("models.fit: {e}"))?;
     if config.ontology.files.is_empty() {
         bail!("[ontology] files is empty");
     }
-    let loaded = ontology::load(config_dir, &config.ontology)?;
-    if let Some(error) = loaded.first_error() {
-        bail!("ontology: {error}; run zontologize ontology check");
-    }
+    let loaded = ontology::load_checked(config_dir, &config.ontology)?;
     let system = prompt::load(config_dir, "fit-system")?;
     system.check(&[])?;
     let user = prompt::load(config_dir, "fit-user")?;
     user.check(&USER_VARIABLES)?;
-    let _lock = match options.dry_run {
+    user.require("chunk")?;
+    let lock = match options.dry_run {
         true => None,
         false => Some(db::runs::lock(url, &config.database.schema).await?),
     };
@@ -109,6 +78,7 @@ pub async fn run(
     )
     .await;
     pool.close().await;
+    db::runs::release(lock).await;
     result
 }
 
@@ -139,44 +109,7 @@ async fn run_with(
             .clone()
             .unwrap_or_else(|| config.fit.seed.clone()),
     };
-    let mut job = db::llm::open_job(pool, TASK).await?;
-    if let Some(open) = &job
-        && options.new
-        && !options.dry_run
-    {
-        db::llm::set_job(pool, open.id, "abandoned", Some("abandoned by --new"), None).await?;
-        println!("fit job {}: abandoned", open.id);
-        job = None;
-    }
-    if let Some(open) = &job
-        && !options.new
-    {
-        let mut differences = Vec::new();
-        if open.provider != name.provider.as_str() || open.model != name.model {
-            differences.push(format!("model {}:{}", open.provider, open.model));
-        }
-        if open.params.0 != params {
-            differences.push(format!(
-                "sample {} with seed {:?}",
-                open.params.0.sample, open.params.0.seed
-            ));
-        }
-        if open.ontology_version_id != Some(version_id) {
-            differences.push("another ontology version".to_string());
-        }
-        if !differences.is_empty() {
-            bail!(
-                "fit job {} is unfinished and was started with {}; run with --new to abandon it and start over",
-                open.id,
-                differences.join(", ")
-            );
-        }
-    }
-    let job = if options.new && options.dry_run {
-        None
-    } else {
-        job
-    };
+    let job = job::reopen(pool, TASK, name, version_id, &params, options, false).await?;
     let items = match &job {
         Some(open) => db::llm::items(pool, open.id).await?,
         None => draw(pool, config, &params).await?,
@@ -279,15 +212,7 @@ async fn run_with(
         job_id: job.id,
         resume_after: job.resume_after,
     };
-    let limits = Limits {
-        claude_program: options.claude_program.clone(),
-        max_usd: options.max_usd,
-        max_requests: options.max_requests,
-        dry_run: options.dry_run,
-        no_wait: options.no_wait,
-        backoff: options.backoff,
-    };
-    job::run(&runner, &handler, queue, &limits).await
+    job::run(&runner, &handler, queue, options).await
 }
 
 impl Handler for Fit<'_> {
@@ -376,7 +301,7 @@ async fn prepare(
             &[],
             config.fit.max_shortlist,
         );
-        let lines = shortlist_lines(ontology, &list, languages);
+        let lines = shortlist_lines(ontology, &list, languages, config.fit.definition_chars);
         let user_text = user.fill(&[
             ("path", &chunk.path),
             ("pages", &pages(&chunk)),

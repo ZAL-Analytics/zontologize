@@ -3,7 +3,7 @@ name = "zontologize"
 version = "0.0.1"
 edition = "2024"
 authors = ["Arsalan Anwari"]
-description = "Point zontologize at a folder and get an ontology back. A pure-Rust CLI that crawls mixed data sources, extracts concepts and relationships, and builds a structured ontology."
+description = "A Rust CLI that indexes folders into PostgreSQL, shaped by an OWL ontology (Turtle)."
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/ZAL-Analytics/zontologize"
@@ -11,7 +11,7 @@ homepage = "https://github.com/ZAL-Analytics/zontologize"
 documentation = "https://docs.rs/zontologize"
 keywords = ["ontology", "knowledge-graph", "extraction", "documents", "cli"]
 categories = ["command-line-utilities", "text-processing"]
-include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
+include = ["/src/**/*", "/defaults/**/*", "/prompts/**/*", "/migrations/**/*", "/benches/**/*", "/Cargo.toml", "/README.md", "/LICENSE"]
 
 [dependencies]
 anyhow = "1.0"
@@ -25,19 +25,19 @@ oxttl = "0.2.5"
 oxrdf = "0.3.5"
 csv = "1.4"
 regex = "1.13"
+regex-syntax = "0.8"
 aho-corasick = "1.1"
 walkdir = "2.5"
 globset = "0.4"
 sha2 = "0.11"
 serde_json = { version = "1.0", features = ["raw_value"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
-whoami = { version = "2", default-features = false, features = ["std"] }
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "api-18"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "api-18"] }
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 hf-hub = { version = "1.0", default-features = false, features = ["blocking"] }
-ndarray = "0.17"
 strsim = "0.11"
 unicode-normalization = "0.1"
+rayon = "1.12"
 
 [lib]
 path = "src/lib.rs"
@@ -48,4 +48,8 @@ path = "src/main.rs"
 
 [[bench]]
 name = "extract"
+harness = false
+
+[[bench]]
+name = "stages"
 harness = false

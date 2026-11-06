@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use anyhow::{Result, bail};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use crate::config::{self, Config};
@@ -14,17 +13,15 @@ use crate::db::llm::JobParams;
 use crate::facts::check::Haystack;
 use crate::llm::job::{self, Handler, Options, Outcome, Runner, Work};
 use crate::llm::prompt::{self, Prompt};
-use crate::llm::shortlist::{label, pick};
+use crate::llm::shortlist::{label, short_definition};
 use crate::llm::{ModelName, Request};
-use crate::ontology::{self, Ontology, hex};
+use crate::ontology::{self, Ontology};
 use crate::rules::Rules;
 
 pub const TASK: &str = "classify";
 pub const STAGE_VERSION: u32 = 1;
 pub const USER_VARIABLES: [&str; 4] = ["doc_types", "path", "pages", "text"];
 pub const NONE: &str = "none";
-const BATCH: usize = 500;
-const DEFINITION_CHARS: usize = 200;
 const UNKNOWN_TYPE: &str = "type not configured";
 const QUOTE_NOT_FOUND: &str = "quote not in the text";
 
@@ -60,20 +57,19 @@ struct Classify<'a> {
     written: Mutex<usize>,
 }
 
-pub fn doc_type_lines(rules: &Rules, ontology: &Ontology, languages: &[String]) -> String {
+pub fn doc_type_lines(
+    rules: &Rules,
+    ontology: &Ontology,
+    languages: &[String],
+    definition_chars: usize,
+) -> String {
     let mut out = String::new();
     for (name, iri) in &rules.doc_types {
         let class = ontology.classes.get(iri);
         let class_label = class.map_or(String::new(), |c| label(c, languages));
-        let definition: String = class
-            .and_then(|c| pick(&c.definition, languages))
-            .unwrap_or_default()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(DEFINITION_CHARS)
-            .collect();
+        let definition = class.map_or(String::new(), |c| {
+            short_definition(c, languages, definition_chars)
+        });
         out.push_str(&format!("- {name} | {class_label} | {definition}\n"));
     }
     out
@@ -119,14 +115,6 @@ fn head(text: &str, chars: usize) -> String {
         .to_string()
 }
 
-fn key(request: &Request, model: &ModelName) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(TASK.as_bytes());
-    hasher.update(STAGE_VERSION.to_le_bytes());
-    hasher.update(request.key(model).as_bytes());
-    hex(&hasher.finalize())
-}
-
 pub async fn run(
     config_dir: Option<&Path>,
     url: Option<&str>,
@@ -138,12 +126,9 @@ pub async fn run(
             "[models] classify is empty; set it to provider:model, for example claude-code:haiku"
         );
     }
-    let name = ModelName::parse(&config.models.classify)
+    let name = ModelName::configured(&config.models.classify, &config.providers)
         .map_err(|e| anyhow::anyhow!("models.classify: {e}"))?;
-    let loaded = ontology::load(config_dir, &config.ontology)?;
-    if let Some(error) = loaded.first_error() {
-        bail!("ontology: {error}; run zontologize ontology check");
-    }
+    let loaded = ontology::load_checked(config_dir, &config.ontology)?;
     let rules = crate::rules::load(
         config_dir,
         &loaded.ontology,
@@ -156,7 +141,8 @@ pub async fn run(
     system.check(&[])?;
     let user = prompt::load(config_dir, "classify-user")?;
     user.check(&USER_VARIABLES)?;
-    let _lock = match options.dry_run {
+    user.require("text")?;
+    let lock = match options.dry_run {
         true => None,
         false => Some(db::runs::lock(url, &config.database.schema).await?),
     };
@@ -173,7 +159,12 @@ pub async fn run(
         user: &user,
         name: &name,
         names: rules.doc_types.keys().cloned().collect(),
-        lines: doc_type_lines(&rules, &loaded.ontology, &config.ontology.languages),
+        lines: doc_type_lines(
+            &rules,
+            &loaded.ontology,
+            &config.ontology.languages,
+            config.classify.definition_chars,
+        ),
     };
     let result = run_with(&setup, options, &loaded.ontology).await;
     let result = match result {
@@ -186,6 +177,7 @@ pub async fn run(
         other => other.map(|(outcome, _)| outcome),
     };
     pool.close().await;
+    db::runs::release(lock).await;
     result
 }
 
@@ -225,7 +217,7 @@ async fn build(setup: &Setup<'_>, units: &[Unit]) -> Result<Vec<Built>> {
             ]),
             schema: schema(&setup.names),
         };
-        let key = key(&request, setup.name);
+        let key = request.stage_key(setup.name, STAGE_VERSION);
         built.push(Built {
             unit: unit.clone(),
             text,
@@ -281,7 +273,7 @@ async fn run_with(
     let units = db::classify::units(pool).await?;
     let mut todo: Vec<(Unit, String, usize)> = Vec::new();
     let (mut done, mut cached, mut written) = (0, 0, 0);
-    for part in units.chunks(BATCH) {
+    for part in units.chunks(setup.config.classify.read_batch) {
         let built = build(setup, part).await?;
         let changed: Vec<Built> = built
             .into_iter()
@@ -312,17 +304,8 @@ async fn run_with(
         units.len(),
         todo.len()
     );
-    let mut job = db::llm::open_job(pool, TASK).await?;
-    if let Some(open) = &job {
-        let changed = open.provider != setup.name.provider.as_str()
-            || open.model != setup.name.model
-            || open.ontology_version_id != Some(version_id);
-        if (options.new || changed) && !options.dry_run {
-            db::llm::set_job(pool, open.id, "abandoned", Some("abandoned"), None).await?;
-            println!("classify job {}: abandoned", open.id);
-            job = None;
-        }
-    }
+    let params = JobParams::default();
+    let mut job = job::reopen(pool, TASK, setup.name, version_id, &params, options, true).await?;
     if todo.is_empty() && !options.dry_run {
         if let Some(open) = &job {
             db::llm::set_job(pool, open.id, "finished", None, None).await?;
@@ -337,7 +320,7 @@ async fn run_with(
             setup.name.provider.as_str(),
             &setup.name.model,
             version_id,
-            &JobParams::default(),
+            &params,
             &[],
         )
         .await?;
@@ -386,8 +369,11 @@ async fn run_with(
         job_id,
         resume_after: job.as_ref().and_then(|j| j.resume_after),
     };
-    let outcome = job::run(&runner, &handler, queue, &options.limits()).await?;
-    let sent = handler.written.lock().map_or(0, |w| *w);
+    let outcome = job::run(&runner, &handler, queue, options).await?;
+    let sent = *handler
+        .written
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     Ok((outcome, written + sent))
 }
 
@@ -408,9 +394,10 @@ impl Handler for Classify<'_> {
             return Ok(None);
         };
         let pair = (built.key.clone(), built.request.clone());
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.insert(ord, built);
-        }
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(ord, built);
         Ok(Some(pair))
     }
 
@@ -421,14 +408,17 @@ impl Handler for Classify<'_> {
     }
 
     async fn answered(&self, ord: i32, response: &str) -> Result<()> {
-        let Some(built) = self.pending.lock().ok().and_then(|mut p| p.remove(&ord)) else {
+        let removed = self
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&ord);
+        let Some(built) = removed else {
             return Ok(());
         };
         let (doc_type, drop) = type_of(self.setup, &built, response);
         write_typed(self.setup, &[(&built, doc_type)], &self.method).await?;
-        if let Ok(mut written) = self.written.lock() {
-            *written += 1;
-        }
+        *self.written.lock().unwrap_or_else(PoisonError::into_inner) += 1;
         let Some(reason) = drop else {
             return Ok(());
         };

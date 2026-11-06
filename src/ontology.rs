@@ -1,20 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use oxrdf::{NamedOrBlankNode, Term};
 use oxttl::TurtleParser;
 use sha2::{Digest, Sha256};
 
 use crate::config::OntologyConfig;
+use crate::hash::hex;
+use crate::ns::{OWL, QUDT, RDF, RDFS, SKOS, XSD};
 
-const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
-const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
-const OWL: &str = "http://www.w3.org/2002/07/owl#";
-const SKOS: &str = "http://www.w3.org/2004/02/skos/core#";
-const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
-const QUDT: &str = "http://qudt.org/schema/qudt/";
 const ZONTOLOGIZE: &str = "urn:zontologize#";
+pub const STORE_FORMAT: u32 = 2;
+
 pub const TOLERANCE: &str = "urn:zontologize#similarityTolerance";
 const NUMBER_TYPES: [&str; 16] = [
     "decimal",
@@ -163,6 +161,22 @@ impl Property {
     pub fn is_attribute(&self) -> bool {
         self.selected && self.value.is_some()
     }
+
+    pub fn accepts_number(&self, value: f64) -> bool {
+        let Some(local) = self.range.first().and_then(|r| r.strip_prefix(XSD)) else {
+            return true;
+        };
+        let whole = value.fract() == 0.0;
+        match local {
+            "integer" | "int" | "long" | "short" | "byte" => whole,
+            "nonNegativeInteger" | "unsignedLong" | "unsignedInt" | "unsignedShort"
+            | "unsignedByte" => whole && value >= 0.0,
+            "positiveInteger" => whole && value > 0.0,
+            "nonPositiveInteger" => whole && value <= 0.0,
+            "negativeInteger" => whole && value < 0.0,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,6 +186,7 @@ pub struct Unit {
     pub labels: LangMap<String>,
     pub alt_labels: LangMap<Vec<String>>,
     pub dimension: String,
+    pub quantity_kinds: Vec<String>,
     pub multiplier: f64,
     pub offset: f64,
 }
@@ -186,6 +201,7 @@ pub struct Ontology {
     pub units: BTreeMap<String, Unit>,
     pub quantity_kinds: BTreeMap<String, String>,
     pub prefixes: BTreeMap<String, String>,
+    pub clashing_prefixes: BTreeSet<String>,
     pub ontology_iris: BTreeSet<String>,
     pub imports: Vec<(String, String)>,
     pub roots: Vec<String>,
@@ -212,6 +228,15 @@ struct Node {
     tolerance: Option<String>,
 }
 
+#[derive(Default)]
+struct Blank {
+    union: Option<String>,
+    first: Option<String>,
+    rest: Option<String>,
+}
+
+type Blanks = HashMap<String, Blank>;
+
 pub struct Loaded {
     pub ontology: Ontology,
     pub findings: Vec<Finding>,
@@ -222,7 +247,7 @@ impl Loaded {
         self.findings.iter().any(|f| f.severity == Severity::Error)
     }
 
-    pub fn first_error(&self) -> Option<&str> {
+    fn first_error(&self) -> Option<&str> {
         self.findings
             .iter()
             .find(|f| f.severity == Severity::Error)
@@ -242,9 +267,25 @@ pub fn load(config_dir: Option<&Path>, config: &OntologyConfig) -> Result<Loaded
     Ok(load_sources(&sources, config))
 }
 
+pub fn load_checked(config_dir: Option<&Path>, config: &OntologyConfig) -> Result<Loaded> {
+    let loaded = load(config_dir, config)?;
+    if let Some(error) = loaded.first_error() {
+        bail!("ontology: {error}; run zontologize ontology check");
+    }
+    Ok(loaded)
+}
+
+pub fn load_or_empty(config_dir: Option<&Path>, config: &OntologyConfig) -> Result<Ontology> {
+    if config.files.is_empty() {
+        return Ok(Ontology::default());
+    }
+    Ok(load_checked(config_dir, config)?.ontology)
+}
+
 pub fn load_sources(sources: &[(String, Vec<u8>)], config: &OntologyConfig) -> Loaded {
     let mut findings = Vec::new();
     let mut nodes: HashMap<String, Node> = HashMap::new();
+    let mut blanks = Blanks::new();
     let mut ontology = Ontology {
         version: version(sources, config),
         files: sources.iter().map(|(name, _)| name.clone()).collect(),
@@ -252,11 +293,19 @@ pub fn load_sources(sources: &[(String, Vec<u8>)], config: &OntologyConfig) -> L
         ..Ontology::default()
     };
     for (name, bytes) in sources {
-        parse_file(name, bytes, &mut nodes, &mut ontology, &mut findings);
+        parse_file(
+            name,
+            bytes,
+            &mut nodes,
+            &mut blanks,
+            &mut ontology,
+            &mut findings,
+        );
     }
-    if !findings.is_empty() {
+    if findings.iter().any(|f| f.severity == Severity::Error) {
         return Loaded { ontology, findings };
     }
+    resolve_unions(&mut nodes, &blanks, &mut findings);
     build(&mut ontology, nodes, &mut findings);
     check_references(&ontology, &mut findings);
     check_cycles(&ontology, &mut findings);
@@ -266,12 +315,14 @@ pub fn load_sources(sources: &[(String, Vec<u8>)], config: &OntologyConfig) -> L
         return Loaded { ontology, findings };
     }
     check_labels(&ontology, &mut findings);
+    check_bounds(&ontology, &mut findings);
     check_attributes(&ontology, &mut findings);
     Loaded { ontology, findings }
 }
 
 fn version(sources: &[(String, Vec<u8>)], config: &OntologyConfig) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(STORE_FORMAT.to_le_bytes());
     for (_, bytes) in sources {
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
@@ -288,18 +339,11 @@ fn version(sources: &[(String, Vec<u8>)], config: &OntologyConfig) -> String {
     hex(&hasher.finalize())
 }
 
-pub fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
-
 fn parse_file(
     name: &str,
     bytes: &[u8],
     nodes: &mut HashMap<String, Node>,
+    blanks: &mut Blanks,
     ontology: &mut Ontology,
     findings: &mut Vec<Finding>,
 ) {
@@ -318,18 +362,25 @@ fn parse_file(
                 return;
             }
         };
-        let NamedOrBlankNode::NamedNode(subject) = triple.subject else {
-            continue;
-        };
-        let subject = subject.into_string();
         let predicate = triple.predicate.as_str();
+        let subject = match triple.subject {
+            NamedOrBlankNode::NamedNode(subject) => subject.into_string(),
+            NamedOrBlankNode::BlankNode(subject) => {
+                add_blank(name, subject.as_str(), predicate, &triple.object, blanks);
+                continue;
+            }
+        };
         add_triple(name, subject, predicate, triple.object, nodes, ontology);
     }
     for (prefix, iri) in parser.prefixes() {
         match ontology.prefixes.get(prefix) {
-            Some(existing) if existing != iri => findings.push(Finding::error(format!(
-                "{name}: prefix {prefix}: is bound to {iri} here and to {existing} in an earlier file"
-            ))),
+            Some(existing) if existing != iri => {
+                findings.push(Finding::warning(format!(
+                    "{name}: prefix {prefix}: is bound to {iri} here and to {existing} in an \
+                     earlier file; write names with this prefix as full IRIs in the config"
+                )));
+                ontology.clashing_prefixes.insert(prefix.to_string());
+            }
             Some(_) => {}
             None => {
                 ontology
@@ -337,6 +388,92 @@ fn parse_file(
                     .insert(prefix.to_string(), iri.to_string());
             }
         }
+    }
+}
+
+fn blank_key(file: &str, id: &str) -> String {
+    format!("_:{file}#{id}")
+}
+
+fn node_or_blank(file: &str, object: &Term) -> Option<String> {
+    match object {
+        Term::NamedNode(node) => Some(node.as_str().to_string()),
+        Term::BlankNode(node) => Some(blank_key(file, node.as_str())),
+        _ => None,
+    }
+}
+
+fn add_blank(file: &str, id: &str, predicate: &str, object: &Term, blanks: &mut Blanks) {
+    let blank = blanks.entry(blank_key(file, id)).or_default();
+    let target = node_or_blank(file, object);
+    if predicate == format!("{OWL}unionOf") {
+        blank.union = target;
+    } else if predicate == format!("{RDF}first") {
+        blank.first = target;
+    } else if predicate == format!("{RDF}rest") && target != Some(format!("{RDF}nil")) {
+        blank.rest = target;
+    }
+}
+
+fn expand(bound: &str, blanks: &Blanks, out: &mut Vec<String>, depth: usize) -> bool {
+    if !bound.starts_with("_:") {
+        out.push(bound.to_string());
+        return true;
+    }
+    let Some(list) = blanks.get(bound).and_then(|b| b.union.as_deref()) else {
+        return false;
+    };
+    if depth > 8 {
+        return false;
+    }
+    let mut item = Some(list);
+    let mut steps = 0;
+    while let Some(key) = item {
+        if *key == format!("{RDF}nil") {
+            break;
+        }
+        let Some(cell) = blanks.get(key) else {
+            return false;
+        };
+        let Some(first) = cell.first.as_deref() else {
+            return false;
+        };
+        steps += 1;
+        if steps > blanks.len() || !expand(first, blanks, out, depth + 1) {
+            return false;
+        }
+        item = cell.rest.as_deref();
+    }
+    true
+}
+
+fn resolve_bounds(
+    iri: &str,
+    what: &str,
+    bounds: Vec<String>,
+    blanks: &Blanks,
+    findings: &mut Vec<Finding>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for bound in bounds {
+        let mut found = Vec::new();
+        if expand(&bound, blanks, &mut found, 0) {
+            out.extend(found);
+        } else {
+            findings.push(Finding::warning(format!(
+                "property {iri}: a {what} that is neither a class nor an owl:unionOf of classes is ignored"
+            )));
+        }
+    }
+    out
+}
+
+fn resolve_unions(nodes: &mut HashMap<String, Node>, blanks: &Blanks, findings: &mut Vec<Finding>) {
+    for (iri, node) in nodes.iter_mut() {
+        let domain = std::mem::take(&mut node.domain);
+        node.domain = resolve_bounds(iri, "domain", domain, blanks, findings);
+        let range = std::mem::take(&mut node.range);
+        node.range = resolve_bounds(iri, "range", range, blanks, findings);
     }
 }
 
@@ -348,6 +485,7 @@ fn add_triple(
     nodes: &mut HashMap<String, Node>,
     ontology: &mut Ontology,
 ) {
+    let bound = node_or_blank(file, &object);
     let iri = match &object {
         Term::NamedNode(node) => Some(node.as_str().to_string()),
         _ => None,
@@ -386,15 +524,15 @@ fn add_triple(
     match (local, iri, literal) {
         ((RDF, "type"), Some(iri), _) => node.types.push(iri),
         ((RDFS, "subClassOf"), Some(iri), _) => node.parents.push(iri),
-        ((RDFS, "domain"), Some(iri), _) => node.domain.push(iri),
-        ((RDFS, "range"), Some(iri), _) => node.range.push(iri),
+        ((RDFS, "domain"), _, _) => node.domain.extend(bound),
+        ((RDFS, "range"), _, _) => node.range.extend(bound),
         ((RDFS, "subPropertyOf"), Some(iri), _) => node.super_properties.push(iri),
         ((SKOS, "prefLabel"), _, Some(value)) => node.pref_labels.push(value),
         ((RDFS, "label"), _, Some(value)) => node.labels.push(value),
         ((SKOS, "altLabel"), _, Some(value)) => node.alt_labels.push(value),
         ((SKOS, "definition"), _, Some(value)) => node.definitions.push(value),
         ((RDFS, "comment"), _, Some(value)) => node.comments.push(value),
-        ((QUDT, "symbol" | "ucumCode"), _, Some((_, value))) => node.symbols.push(value),
+        ((QUDT, "symbol"), _, Some((_, value))) => node.symbols.push(value),
         ((QUDT, "conversionMultiplier"), _, Some((_, value))) => node.multiplier = Some(value),
         ((QUDT, "conversionOffset"), _, Some((_, value))) => node.offset = Some(value),
         ((QUDT, "hasDimensionVector"), Some(iri), _) => node.dimension = Some(iri),
@@ -536,6 +674,7 @@ fn unit(iri: &str, node: &Node, languages: &[String]) -> Option<Unit> {
         labels: first_per_language(&node.labels, languages),
         alt_labels: all_per_language(&node.alt_labels, languages),
         dimension: node.dimension.clone()?,
+        quantity_kinds: dedup(node.quantity_kinds.clone()),
         multiplier,
         offset,
     })
@@ -566,17 +705,13 @@ fn value_kind(range: &[String], has_quantity_kind: bool) -> Option<ValueKind> {
 }
 
 fn property_kind(types: &[String]) -> Option<PropertyKind> {
-    types.iter().find_map(|t| {
-        if *t == format!("{OWL}ObjectProperty") {
-            Some(PropertyKind::Object)
-        } else if *t == format!("{OWL}DatatypeProperty") {
-            Some(PropertyKind::Datatype)
-        } else if *t == format!("{RDF}Property") {
-            Some(PropertyKind::Rdf)
-        } else {
-            None
-        }
-    })
+    [
+        (format!("{OWL}ObjectProperty"), PropertyKind::Object),
+        (format!("{OWL}DatatypeProperty"), PropertyKind::Datatype),
+        (format!("{RDF}Property"), PropertyKind::Rdf),
+    ]
+    .into_iter()
+    .find_map(|(iri, kind)| types.contains(&iri).then_some(kind))
 }
 
 fn dedup(mut list: Vec<String>) -> Vec<String> {
@@ -726,6 +861,32 @@ fn check_labels(ontology: &Ontology, findings: &mut Vec<Finding>) {
     }
 }
 
+fn check_bounds(ontology: &Ontology, findings: &mut Vec<Finding>) {
+    let selected = |class: &String| ontology.classes.get(class).is_some_and(|c| c.selected);
+    for property in ontology.properties.values() {
+        let skipped = property.kind == PropertyKind::Datatype && property.value.is_none();
+        if skipped && property.domain.iter().any(selected) {
+            findings.push(Finding::warning(format!(
+                "property {}: range {} is not one number or text type, so it is not extracted \
+                 as an attribute",
+                property.iri,
+                property.range.join(", ")
+            )));
+        }
+    }
+    for property in ontology.properties.values().filter(|p| p.selected) {
+        let used = property.kind == PropertyKind::Object || property.value.is_some();
+        let unbounded = property.domain.is_empty()
+            || (property.kind == PropertyKind::Object && property.range.is_empty());
+        if used && unbounded {
+            findings.push(Finding::warning(format!(
+                "property {}: no domain or range, so no class fits it and it is not extracted",
+                property.iri
+            )));
+        }
+    }
+}
+
 fn check_attributes(ontology: &Ontology, findings: &mut Vec<Finding>) {
     for property in ontology.properties.values().filter(|p| p.is_attribute()) {
         let Some(kind) = &property.quantity_kind else {
@@ -768,10 +929,24 @@ impl Ontology {
         let Some(dimension) = &property.dimension else {
             return Vec::new();
         };
-        self.units
+        let same: Vec<&Unit> = self
+            .units
             .values()
             .filter(|u| &u.dimension == dimension)
+            .collect();
+        let Some(kind) = &property.quantity_kind else {
+            return same;
+        };
+        if !same.iter().any(|u| u.quantity_kinds.contains(kind)) {
+            return same;
+        }
+        same.into_iter()
+            .filter(|u| u.quantity_kinds.is_empty() || u.quantity_kinds.contains(kind))
             .collect()
+    }
+
+    pub fn fits(&self, class: &str, bounds: &[String]) -> bool {
+        bounds.iter().any(|bound| self.is_a(class, bound))
     }
 
     pub fn resolve(&self, name: &str) -> Result<String, String> {
@@ -782,6 +957,12 @@ impl Ontology {
         let Some((prefix, local)) = name.split_once(':') else {
             return Err(format!("{name:?} is neither a prefixed name nor an IRI"));
         };
+        if self.clashing_prefixes.contains(prefix) {
+            return Err(format!(
+                "{name:?}: the prefix {prefix}: is bound to different IRIs in the ontology files; \
+                 write the full IRI as <...>"
+            ));
+        }
         if let Some(namespace) = self.prefixes.get(prefix) {
             return Ok(format!("{namespace}{local}"));
         }
@@ -1094,13 +1275,29 @@ mod tests {
     }
 
     #[test]
-    fn prefix_conflict_is_an_error() {
+    fn prefix_conflict_is_a_warning_and_the_prefix_cannot_be_used() {
         let other = "@prefix ex: <http://example.org/other#> .\nex:B a owl:Class .\n";
         let loaded = load_text(&[TREE, other], &config(&[], &[]));
-        let errors = messages(&loaded, Severity::Error);
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("prefix ex:"), "{errors:?}");
-        assert!(errors[0].starts_with("file1.ttl"), "{errors:?}");
+        assert!(!loaded.has_errors(), "{:?}", loaded.findings);
+        let warnings = messages(&loaded, Severity::Warning);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("file1.ttl") && w.contains("prefix ex:")),
+            "{warnings:?}"
+        );
+        let ontology = &loaded.ontology;
+        assert!(
+            ontology
+                .classes
+                .contains_key("http://example.org/onto#Thing")
+        );
+        assert!(ontology.classes.contains_key("http://example.org/other#B"));
+        assert!(ontology.resolve("ex:Thing").is_err());
+        assert_eq!(
+            ontology.resolve("<http://example.org/other#B>").unwrap(),
+            "http://example.org/other#B"
+        );
     }
 
     #[test]
@@ -1180,6 +1377,48 @@ mod tests {
             .map(|p| p.iri.trim_start_matches("http://example.org/onto#"))
             .collect();
         assert_eq!(selected, ["locatedIn", "mentions", "relatesTo"]);
+    }
+
+    #[test]
+    fn union_domains_and_ranges_are_resolved() {
+        let text = format!(
+            "{TREE}ex:Site a owl:Class .\n\
+             ex:locatedAt a owl:ObjectProperty ;\n\
+               rdfs:domain [ a owl:Class ; owl:unionOf ( ex:Pump ex:Valve ) ] ;\n\
+               rdfs:range [ owl:unionOf ( ex:Site [ owl:unionOf ( ex:Project ) ] ) ] .\n\
+             ex:odd a owl:ObjectProperty ; rdfs:domain [ owl:intersectionOf ( ex:Pump ex:Valve ) ] ;\n\
+               rdfs:range ex:Site .\n"
+        );
+        let loaded = load_text(&[&text], &config(&[], &[]));
+        let iri = |name: &str| format!("http://example.org/onto#{name}");
+        let located = &loaded.ontology.properties[&iri("locatedAt")];
+        assert_eq!(located.domain, [iri("Pump"), iri("Valve")]);
+        assert_eq!(located.range, [iri("Site"), iri("Project")]);
+        assert!(loaded.ontology.classes.keys().all(|k| !k.starts_with("_:")));
+        let odd = &loaded.ontology.properties[&iri("odd")];
+        assert!(odd.domain.is_empty());
+        let warnings = messages(&loaded, Severity::Warning);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("odd: a domain that is neither")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn owl_property_types_win_over_rdf_property() {
+        let text = "ex:a a rdf:Property, owl:DatatypeProperty .\n\
+            ex:b a rdf:Property ; a owl:ObjectProperty .\n\
+            ex:c a rdf:Property .\n";
+        let text = format!("@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n{text}");
+        let loaded = load_text(&[&text], &config(&[], &[]));
+        let kind = |name: &str| {
+            loaded.ontology.properties[&format!("http://example.org/onto#{name}")].kind
+        };
+        assert_eq!(kind("a"), PropertyKind::Datatype);
+        assert_eq!(kind("b"), PropertyKind::Object);
+        assert_eq!(kind("c"), PropertyKind::Rdf);
     }
 
     #[test]
@@ -1275,6 +1514,33 @@ mod tests {
     }
 
     #[test]
+    fn ucum_codes_are_not_symbols() {
+        let text = format!(
+            "{UNITS}unit:DEG_C a qudt:Unit ; qudt:symbol \"°C\" ; qudt:ucumCode \"Cel\" ; \
+             qudt:conversionMultiplier 1.0 ; qudt:hasDimensionVector qkdv:T .\n"
+        );
+        let loaded = load_text(&[TREE, &text], &config(&["ex:Equipment"], &[]));
+        let celsius = &loaded.ontology.units["http://qudt.org/vocab/unit/DEG_C"];
+        assert_eq!(celsius.symbols, ["°C"]);
+    }
+
+    #[test]
+    fn integer_ranges_check_whole_numbers_and_signs() {
+        let mut property = Property::new("http://example.org/onto#n", PropertyKind::Datatype);
+        assert!(property.accepts_number(3.5));
+        property.range = vec![format!("{XSD}integer")];
+        assert!(!property.accepts_number(3.5));
+        assert!(property.accepts_number(-2.0));
+        property.range = vec![format!("{XSD}nonNegativeInteger")];
+        assert!(!property.accepts_number(-2.0));
+        assert!(property.accepts_number(0.0));
+        property.range = vec![format!("{XSD}positiveInteger")];
+        assert!(!property.accepts_number(0.0));
+        property.range = vec![format!("{XSD}decimal")];
+        assert!(property.accepts_number(-2.5));
+    }
+
+    #[test]
     fn attribute_properties_get_kind_dimension_and_selection() {
         let loaded = load_text(&[TREE, UNITS], &config(&["ex:Equipment"], &[]));
         let pressure = property(&loaded, "pressure");
@@ -1293,6 +1559,13 @@ mod tests {
         assert_eq!(property(&loaded, "material").value, Some(ValueKind::Text));
         assert_eq!(property(&loaded, "built").value, None);
         assert!(!property(&loaded, "projectCode").selected);
+        let warnings = messages(&loaded, Severity::Warning);
+        assert!(
+            warnings
+                .iter()
+                .any(|m| m.contains("onto#built: range") && m.contains("not extracted")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

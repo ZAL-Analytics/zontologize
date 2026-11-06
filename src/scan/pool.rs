@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc};
@@ -16,6 +16,7 @@ use super::worker::{Answer, Outcome, Request};
 
 const CHECK_EVERY: Duration = Duration::from_millis(250);
 const STOP_GRACE: Duration = Duration::from_secs(5);
+const MAX_SPAWN_FAILURES: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct WorkerCommand {
@@ -59,7 +60,8 @@ pub struct Finished {
     pub seconds: f64,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Restarts {
     pub timeout: u64,
     pub memory: u64,
@@ -143,6 +145,7 @@ async fn work(
     let mut restarts = Restarts::default();
     let mut process: Option<Process> = None;
     let mut served = 0;
+    let mut spawn_failures = 0;
     loop {
         let job = jobs.lock().await.recv().await;
         let Some(job) = job else {
@@ -157,7 +160,26 @@ async fn work(
         }
         let running = match process.as_mut() {
             Some(running) => running,
-            None => process.insert(Process::spawn(&command, &setup).await?),
+            None => match Process::spawn(&command, &setup).await {
+                Ok(spawned) => {
+                    spawn_failures = 0;
+                    process.insert(spawned)
+                }
+                Err(error) => {
+                    spawn_failures += 1;
+                    restarts.crash += 1;
+                    let item = Finished {
+                        id: job.id,
+                        path: job.path,
+                        done: Done::Lost(Lost::Crash),
+                        seconds: 0.0,
+                    };
+                    if finished.send(item).is_err() || spawn_failures >= MAX_SPAWN_FAILURES {
+                        return Err(error);
+                    }
+                    continue;
+                }
+            },
         };
         let started = Instant::now();
         let done = running.run(&job, &limits).await;
@@ -409,13 +431,23 @@ mod tests {
             args: Vec::new(),
         };
         let mut pool = Pool::start(&command, "{}".to_string(), 1, limits(5000, 100));
-        let _ = pool
-            .submit(Job {
-                id: 1,
-                path: PathBuf::from("a"),
-            })
-            .await;
-        while pool.next_finished().await.is_some() {}
+        let mut lost = Vec::new();
+        for id in 1..=3 {
+            let _ = pool
+                .submit(Job {
+                    id,
+                    path: PathBuf::from("a"),
+                })
+                .await;
+            if let Some(finished) = pool.try_finished() {
+                lost.push(finished);
+            }
+        }
+        while let Some(finished) = pool.next_finished().await {
+            lost.push(finished);
+        }
+        assert_eq!(lost.len(), 3, "{lost:?}");
+        assert!(lost.iter().all(|f| f.done == Done::Lost(Lost::Crash)));
         let error = pool.join().await.unwrap_err();
         assert!(format!("{error:#}").contains("cannot start extract worker"));
     }

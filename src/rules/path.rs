@@ -254,7 +254,7 @@ impl PathRule {
                 key,
                 start: whole.start,
                 end: whole.end,
-                method: "path",
+                method: super::PATH_METHOD,
                 confidence: 1.0,
             });
         }
@@ -329,7 +329,7 @@ doc_type = "report"
         let path_entities: Vec<(&str, &str)> = facts
             .entities
             .iter()
-            .filter(|e| e.method == "path")
+            .filter(|e| e.method == crate::rules::PATH_METHOD)
             .map(|e| (e.key.as_str(), e.name.as_str()))
             .collect();
         assert_eq!(

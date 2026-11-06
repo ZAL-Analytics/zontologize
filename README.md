@@ -35,7 +35,7 @@ zontologize --config my-config db check
 
 A config directory (`--config DIR` or `ZONTOLOGIZE_CONFIG`) holds everything specific to your
 data. All files are optional; see `examples/acme/` for a complete example and
-[docs/configuration.md](docs/configuration.md) for every setting.
+[docs/configuration.md](docs/configuration.md) for the settings.
 
 ```
 my-config/
@@ -50,12 +50,19 @@ my-config/
 
 ```sh
 zontologize --config my-config ontology check   # validate the ontology
+zontologize --config my-config models check     # check each configured model
 zontologize --config my-config scan             # index new and changed files
 zontologize --config my-config ontology fit     # propose ontology changes for review
 zontologize --config my-config classify         # document types rules missed
 zontologize --config my-config extract          # LLM extraction
+zontologize --config my-config attributes       # values with units
 zontologize --config my-config embed            # local embeddings, see docs/embeddings.md
+zontologize --config my-config eval embed       # compare embedding models
 zontologize --config my-config resolve          # merge duplicates, link documents
+zontologize --config my-config review sample    # mark sampled facts right or wrong
+zontologize --config my-config review merges    # confirm or reject proposed links
+zontologize --config my-config graph sync       # rebuild the AGE graph
+zontologize --config my-config ontology export  # write the selected ontology as Turtle
 zontologize --config my-config status
 ```
 

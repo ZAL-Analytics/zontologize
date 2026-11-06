@@ -1,13 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use sqlx::{FromRow, PgConnection, PgPool};
 
-use super::copy_row;
 use super::entities::{NewEntity, Owner, copy, mention_row, upsert_entities};
+use super::{MODEL_METHODS, OCR_CONFIDENCE, copy_row};
 use crate::facts::check::{Checked, Endpoint};
 
-const MODEL_METHODS: &str = "llm:%";
 const SEGMENT_METHOD: &str = super::entities::SEGMENT_METHOD;
 
 #[derive(Debug, Clone, FromRow)]
@@ -96,11 +95,9 @@ pub async fn eligible(
     after: i64,
     limit: i64,
 ) -> Result<Vec<Eligible>> {
-    let rows = sqlx::query_as(
+    let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select k.id, k.llm_key, d.source, d.id as document_id, d.doc_type, d.path, k.text, \
-         (select min(p.ocr_confidence) from pages p where p.content_id = k.content_id \
-         and p.method = 'ocr' and p.page_no between coalesce(k.page_from, 0) \
-         and coalesce(k.page_to, 2147483647)) as ocr_confidence, \
+         {OCR_CONFIDENCE} as ocr_confidence, \
          exists (select 1 from class_mentions m where m.chunk_id = k.id) as matched \
          from chunks k \
          join lateral (select d.id, d.doc_type, d.path, s.name as source from documents d \
@@ -109,8 +106,8 @@ pub async fn eligible(
          and (cardinality($1::text[]) = 0 or s.name = any($1)) \
          and (cardinality($2::text[]) = 0 or d.doc_type = any($2)) \
          order by d.id limit 1) d on true \
-         where length(k.text) >= $3 and k.id > $4 order by k.id limit $5",
-    )
+         where length(k.text) >= $3 and k.id > $4 order by k.id limit $5"
+    )))
     .bind(sources)
     .bind(doc_types)
     .bind(min_chars)
@@ -188,6 +185,34 @@ pub async fn doc_classes(pool: &PgPool, ids: &[i64]) -> Result<HashMap<i64, Stri
 const COPY_RELATION_TERMS: &str = "copy relation_terms (chunk_id, src_class, label, lang, \
     dst_class, span_start, span_end, method) from stdin";
 
+#[derive(Default)]
+struct RelationRows {
+    seen: HashSet<(i64, String, i64, i64)>,
+    sources: Vec<i64>,
+    properties: Vec<String>,
+    targets: Vec<i64>,
+    chunks: Vec<i64>,
+    starts: Vec<i32>,
+    ends: Vec<i32>,
+    confidences: Vec<f64>,
+}
+
+impl RelationRows {
+    fn push(&mut self, key: (i64, &str, i64, i64), span: (i32, i32), confidence: f64) {
+        let (from, property, to, chunk) = key;
+        if !self.seen.insert((from, property.to_string(), to, chunk)) {
+            return;
+        }
+        self.sources.push(from);
+        self.properties.push(property.to_string());
+        self.targets.push(to);
+        self.chunks.push(chunk);
+        self.starts.push(span.0);
+        self.ends.push(span.1);
+        self.confidences.push(confidence);
+    }
+}
+
 pub async fn write(
     pool: &PgPool,
     facts: &[ChunkFacts],
@@ -238,13 +263,7 @@ pub async fn write(
     }
     let mut mentions = String::new();
     let mut terms = String::new();
-    let mut sources = Vec::new();
-    let mut properties = Vec::new();
-    let mut targets = Vec::new();
-    let mut chunks = Vec::new();
-    let mut starts = Vec::new();
-    let mut ends = Vec::new();
-    let mut confidences = Vec::new();
+    let mut rows = RelationRows::default();
     for chunk in facts {
         let owner = Owner::Chunk(chunk.chunk_id);
         let entity_ids: Vec<Option<i64>> = chunk
@@ -276,13 +295,11 @@ pub async fn write(
         for relation in &chunk.checked.relations {
             for from in resolve(relation.from) {
                 for to in resolve(relation.to) {
-                    sources.push(from);
-                    properties.push(relation.property.clone());
-                    targets.push(to);
-                    chunks.push(chunk.chunk_id);
-                    starts.push(relation.start as i32);
-                    ends.push(relation.end as i32);
-                    confidences.push(confidence.of(&relation.property) * chunk.scale);
+                    rows.push(
+                        (from, &relation.property, to, chunk.chunk_id),
+                        (relation.start as i32, relation.end as i32),
+                        confidence.of(&relation.property) * chunk.scale,
+                    );
                 }
             }
         }
@@ -313,7 +330,7 @@ pub async fn write(
     )
     .await?;
     copy(&mut tx, COPY_RELATION_TERMS, terms).await?;
-    if !sources.is_empty() {
+    if !rows.sources.is_empty() {
         sqlx::query(
             "insert into relations (src_id, property_iri, dst_id, method, confidence, chunk_id, \
              span_start, span_end) \
@@ -325,13 +342,13 @@ pub async fn write(
              and r.property_iri = u.property and r.dst_id = u.dst \
              and r.status in ('confirmed', 'rejected'))",
         )
-        .bind(&sources)
-        .bind(&properties)
-        .bind(&targets)
-        .bind(&chunks)
-        .bind(&starts)
-        .bind(&ends)
-        .bind(&confidences)
+        .bind(&rows.sources)
+        .bind(&rows.properties)
+        .bind(&rows.targets)
+        .bind(&rows.chunks)
+        .bind(&rows.starts)
+        .bind(&rows.ends)
+        .bind(&rows.confidences)
         .bind(method)
         .execute(&mut *tx)
         .await?;
@@ -350,14 +367,15 @@ pub async fn write(
 }
 
 pub async fn delete_orphans(pool: &PgPool) -> Result<u64> {
-    let count = sqlx::query(
-        "delete from entities e where e.method like $1 \
-         and not exists (select 1 from mentions m where m.entity_id = e.id)",
-    )
-    .bind(MODEL_METHODS)
-    .execute(pool)
-    .await?
-    .rows_affected();
+    let sql = format!(
+        "delete from entities e where e.method like $1 and {}",
+        super::entities::ORPHAN
+    );
+    let count = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(MODEL_METHODS)
+        .execute(pool)
+        .await?
+        .rows_affected();
     Ok(count)
 }
 
@@ -483,4 +501,21 @@ pub async fn name_candidates(
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_relation_is_written_once_per_chunk() {
+        let mut rows = RelationRows::default();
+        rows.push((1, "p", 2, 10), (0, 5), 0.9);
+        rows.push((1, "p", 2, 10), (7, 9), 0.8);
+        rows.push((1, "p", 2, 11), (0, 5), 0.9);
+        rows.push((1, "q", 2, 10), (0, 5), 0.9);
+        assert_eq!(rows.sources.len(), 3);
+        assert_eq!(rows.chunks, [10, 11, 10]);
+        assert_eq!(rows.starts, [0, 0, 0]);
+    }
 }

@@ -12,29 +12,27 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
-use sha2::{Digest, Sha256};
+use rayon::ThreadPool;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::types::chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 
 use crate::config::{self, Config, SourceConfig, SourceKind};
+use crate::cpu;
 use crate::db::documents::{self, Row, Stored};
 use crate::db::{self, contents, entities};
-use crate::ontology::{self, Ontology, hex};
+use crate::ontology::{self, Ontology};
 use crate::rules::{self, Rules};
 use chunk::ChunkSettings;
 use extract::ExtractSettings;
 use pool::{Done, Finished, Job, Limits, Pool, Restarts, WorkerCommand};
 use walk::{Decision, FileEntry, Kinds, WalkItem};
 
-const EXTRACT_BATCH: i64 = 200;
 const MAX_EXTRACT_ATTEMPTS: i32 = 2;
 const UNFINISHED: &str = "extraction did not finish in two attempts: the worker reading this \
                           file was stopped over extract.worker_memory_mb or crashed, or the \
                           scan itself was stopped";
-const CHUNK_BATCH: i64 = 200;
-const TEXT_RULES_BATCH: i64 = 100;
 
 pub struct Prepared {
     pub config: Config,
@@ -44,14 +42,14 @@ pub struct Prepared {
     pub chunk: ChunkSettings,
     pub sources: Vec<SourceConfig>,
     pub warnings: usize,
+    pub hash_pool: Arc<ThreadPool>,
+    pub chunk_pool: ThreadPool,
+    pub rules_pool: ThreadPool,
 }
 
 pub fn prepare(config_dir: Option<&Path>, only: &[String]) -> Result<Prepared> {
     let config = config::load(config_dir)?;
-    let loaded = ontology::load(config_dir, &config.ontology)?;
-    if let Some(error) = loaded.first_error() {
-        bail!("ontology: {error} (run zontologize ontology check for all findings)");
-    }
+    let loaded = ontology::load_checked(config_dir, &config.ontology)?;
     let warnings = loaded.findings.len();
     let ontology = loaded.ontology;
     let rules = rules::load(config_dir, &ontology, &config.ontology.document_class)?;
@@ -71,6 +69,12 @@ pub fn prepare(config_dir: Option<&Path>, only: &[String]) -> Result<Prepared> {
     }
     let mut checked = Vec::new();
     for source in sources {
+        if source.kind == SourceKind::Table && source.root.trim().is_empty() {
+            bail!(
+                "sources.{}.root: a table source needs the folder its files are under",
+                source.name
+            );
+        }
         let root = resolve_root(config_dir, &source.root);
         if source.kind == SourceKind::Folder && !root.is_dir() {
             bail!(
@@ -86,6 +90,9 @@ pub fn prepare(config_dir: Option<&Path>, only: &[String]) -> Result<Prepared> {
     }
     let extract = ExtractSettings::new(&config.extract, &config.ocr);
     let chunk = ChunkSettings::new(&config.chunk, config.extract.format);
+    let hash_pool = Arc::new(cpu::pool(config.scan.hash_threads)?);
+    let chunk_pool = cpu::pool(config.chunk.threads)?;
+    let rules_pool = cpu::pool(config.scan.rules_threads)?;
     Ok(Prepared {
         config,
         ontology,
@@ -94,6 +101,9 @@ pub fn prepare(config_dir: Option<&Path>, only: &[String]) -> Result<Prepared> {
         chunk,
         sources: checked,
         warnings,
+        hash_pool,
+        chunk_pool,
+        rules_pool,
     })
 }
 
@@ -123,7 +133,8 @@ pub struct SourceStats {
     pub seconds: f64,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StageStats {
     pub items: u64,
     pub errors: u64,
@@ -149,7 +160,8 @@ pub struct SegmentStats {
     pub split: u64,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OcrIdStats {
     pub accepted: u64,
     pub rejected: u64,
@@ -186,7 +198,7 @@ pub async fn run(
         );
     }
     let config = &prepared.config;
-    let _lock = db::runs::lock(url, &config.database.schema).await?;
+    let lock = db::runs::lock(url, &config.database.schema).await?;
     let pool = db::pool::connect(
         url,
         &config.database.schema,
@@ -199,11 +211,11 @@ pub async fn run(
         .iter()
         .filter(|s| s.kind == SourceKind::Table)
     {
-        table::check_view(&pool, &source.view)
+        db::table::check_view(&pool, &source.view)
             .await
             .map_err(|e| anyhow::anyhow!("sources.{}: {e:#}", source.name))?;
     }
-    let config_hash = hex(&Sha256::digest(format!("{config:?}").as_bytes()));
+    let config_hash = config::hash(config)?;
     let (run_id, aborted) = db::runs::start(&pool, &config_hash).await?;
     if aborted > 0 {
         println!("marked {aborted} earlier run(s) that did not finish as aborted");
@@ -211,11 +223,36 @@ pub async fn run(
     println!("run {run_id}");
     let mut stats = RunStats::default();
     let result = stages(&pool, prepared.clone(), run_id, options, &mut stats).await;
-    let status = if result.is_ok() { "finished" } else { "failed" };
-    let json = serde_json::to_value(&stats)?;
-    db::runs::finish(&pool, run_id, status, &json).await?;
+    let recorded = record(&pool, run_id, result.is_ok(), &stats, &prepared.ontology).await;
     pool.close().await;
-    result
+    lock.release().await;
+    outcome(result, recorded)
+}
+
+async fn record(
+    pool: &PgPool,
+    run_id: i64,
+    ok: bool,
+    stats: &RunStats,
+    ontology: &Ontology,
+) -> Result<()> {
+    let status = if ok { "finished" } else { "failed" };
+    let json = serde_json::to_value(stats)?;
+    db::runs::finish(pool, run_id, status, &json).await?;
+    if ok {
+        db::ontology::mark_used(pool, ontology, run_id).await?;
+    }
+    Ok(())
+}
+
+fn outcome(result: Result<()>, recorded: Result<()>) -> Result<()> {
+    match (result, recorded) {
+        (Err(error), Err(recorded)) => {
+            eprintln!("error: the failed run could not be recorded: {recorded:#}");
+            Err(error)
+        }
+        (result, recorded) => result.and(recorded),
+    }
 }
 
 async fn check_database(pool: &PgPool, config: &Config) -> Result<()> {
@@ -380,12 +417,27 @@ fn is_unchanged(stored: &Stored, found: &Found, decision: &Decision) -> bool {
     same_file && same_decision
 }
 
-pub fn file_path(root: &Path, path: &str, file: Option<&str>) -> PathBuf {
-    match file {
-        Some(file) if Path::new(file).is_absolute() => PathBuf::from(file),
-        Some(file) => root.join(file),
-        None => root.join(path),
+fn file_path(root: &Path, path: &str, file: Option<&str>) -> Result<PathBuf> {
+    let name = file.unwrap_or(path);
+    if name.contains("://") {
+        bail!("{name}: not a file path");
     }
+    let joined = root.join(name);
+    let metadata = std::fs::symlink_metadata(&joined)
+        .with_context(|| format!("cannot open {}", joined.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("{} is a symbolic link, skipped", joined.display());
+    }
+    let real = joined
+        .canonicalize()
+        .with_context(|| format!("cannot open {}", joined.display()))?;
+    let real_root = root
+        .canonicalize()
+        .with_context(|| format!("cannot open the source root {}", root.display()))?;
+    if !real.starts_with(&real_root) {
+        bail!("{name} is outside the source root {}", root.display());
+    }
+    Ok(real)
 }
 
 pub async fn apply_plans(
@@ -394,7 +446,7 @@ pub async fn apply_plans(
     run_id: i64,
     root: &Path,
     plans: Vec<Planned>,
-    threads: usize,
+    hash_pool: &Arc<ThreadPool>,
     stats: &mut SourceStats,
 ) -> Result<()> {
     let mut unchanged = Vec::new();
@@ -425,11 +477,15 @@ pub async fn apply_plans(
         }
     }
     if !to_hash.is_empty() {
-        let paths: Vec<PathBuf> = to_hash
-            .iter()
-            .map(|r| file_path(root, &r.path, r.file.as_deref()))
-            .collect();
-        let hashes = tokio::task::spawn_blocking(move || walk::hash_all(&paths, threads)).await?;
+        let root = root.to_path_buf();
+        let hash_pool = hash_pool.clone();
+        let (to_hash, hashes) = tokio::task::spawn_blocking(move || {
+            let hashes = cpu::map(&hash_pool, &to_hash, |r| {
+                file_path(&root, &r.path, r.file.as_deref()).and_then(|p| walk::hash_file(&p))
+            });
+            (to_hash, hashes)
+        })
+        .await?;
         stats.hashed += to_hash.len() as u64;
         for (mut row, hash) in to_hash.into_iter().zip(hashes) {
             match hash {
@@ -526,7 +582,7 @@ async fn scan_folder(
             run_id,
             &root,
             plans,
-            scan.hash_threads,
+            &prepared.hash_pool,
             &mut stats,
         )
         .await?;
@@ -563,6 +619,9 @@ async fn extract_stage(
     println!("extract: {todo} to extract");
     if todo == 0 {
         return Ok(());
+    }
+    if !cfg!(target_os = "linux") {
+        eprintln!("warning: extract.worker_memory_mb is only enforced on Linux");
     }
     let deadline = options
         .extract_minutes
@@ -644,7 +703,7 @@ impl Pass<'_> {
                 self.source_ids,
                 retries,
                 after,
-                EXTRACT_BATCH,
+                config.scan.extract_batch,
             )
             .await?;
             let Some(last) = batch.last() else {
@@ -655,8 +714,19 @@ impl Pass<'_> {
                 if self.deadline.is_some_and(|d| Instant::now() >= d) {
                     break 'feed;
                 }
-                let root = self.roots.get(&item.source_id).cloned().unwrap_or_default();
-                let path = file_path(&root, &item.path, item.file.as_deref());
+                let Some(root) = self.roots.get(&item.source_id) else {
+                    bail!("no source root for source id {}", item.source_id);
+                };
+                let path = match file_path(root, &item.path, item.file.as_deref()) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        eprintln!("error: {message}");
+                        contents::write_error(self.pool, item.id, key, &message, 0.0).await?;
+                        tally(stats, false);
+                        continue;
+                    }
+                };
                 let running = workers_pool.get_or_insert_with(|| {
                     Pool::start(self.worker, setup.clone(), workers, limits)
                 });
@@ -730,28 +800,6 @@ fn tally(stats: &mut StageStats, ok: bool) {
     }
 }
 
-pub fn parallel_map<T: Sync, R: Send>(
-    items: &[T],
-    threads: usize,
-    f: impl Fn(&T) -> R + Sync,
-) -> Vec<R> {
-    if items.is_empty() {
-        return Vec::new();
-    }
-    let per_thread = items.len().div_ceil(threads.clamp(1, items.len()));
-    let f = &f;
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = items
-            .chunks(per_thread)
-            .map(|chunk| scope.spawn(move || chunk.iter().map(f).collect::<Vec<R>>()))
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-            .collect()
-    })
-}
-
 async fn chunk_stage(
     pool: &PgPool,
     prepared: &Arc<Prepared>,
@@ -764,9 +812,9 @@ async fn chunk_stage(
     let mut stats = StageStats::default();
     let mut chunks_written = 0;
     let mut after = 0;
-    let threads = prepared.config.scan.hash_threads;
+    let batch = prepared.config.scan.chunk_batch;
     loop {
-        let ids = contents::next_to_chunk(pool, &key, source_ids, after, CHUNK_BATCH).await?;
+        let ids = contents::next_to_chunk(pool, &key, source_ids, after, batch).await?;
         let Some(last) = ids.last() else {
             break;
         };
@@ -782,7 +830,7 @@ async fn chunk_stage(
         }
         let worker = prepared.clone();
         let results = tokio::task::spawn_blocking(move || {
-            parallel_map(&grouped, threads, |(id, pages)| {
+            cpu::map(&worker.chunk_pool, &grouped, |(id, pages)| {
                 (*id, chunk::chunk_pages(pages, &worker.chunk))
             })
         })
@@ -818,8 +866,6 @@ async fn chunk_stage(
     Ok(stats)
 }
 
-pub const PATH_METHOD: &str = "path";
-
 pub async fn rules_only(config_dir: Option<&Path>, pool: &PgPool) -> Result<()> {
     let prepared = Arc::new(prepare(config_dir, &[])?);
     let names: Vec<String> = prepared.sources.iter().map(|s| s.name.clone()).collect();
@@ -841,7 +887,6 @@ async fn rules_stage(
     let started = Instant::now();
     let rules = &prepared.rules;
     let batch = prepared.config.scan.batch_size as i64;
-    let threads = prepared.config.scan.hash_threads;
     let documents_todo = entities::count_documents_to_rule(pool, &rules.key, source_ids).await?;
     let contents_todo =
         entities::count_contents_to_rule(pool, &rules.key, source_ids, &prepared.chunk.key).await?;
@@ -871,7 +916,7 @@ async fn rules_stage(
             source_ids,
             &prepared.chunk.key,
             after,
-            TEXT_RULES_BATCH,
+            prepared.config.scan.rules_batch,
         )
         .await?;
         let Some(last) = ids.last() else {
@@ -897,10 +942,14 @@ async fn rules_stage(
         let known = known.clone();
         let content_ids = ids.clone();
         let (outputs, segments) = tokio::task::spawn_blocking(move || {
-            let segments = parallel_map(&content_ids, threads, |id| {
-                segment_content(&worker.rules, *id, &pages, &chunks, &model_types)
+            let own_pages = by_content(&pages, |p| p.content_id);
+            let own_chunks = by_content(&chunks, |c| c.content_id);
+            let segments = cpu::map(&worker.rules_pool, &content_ids, |id| {
+                let pages = own_pages.get(id).map_or(&[][..], Vec::as_slice);
+                let chunks = own_chunks.get(id).map_or(&[][..], Vec::as_slice);
+                segment_content(&worker.rules, *id, pages, chunks, &model_types)
             });
-            let outputs = parallel_map(&chunks, threads, |chunk| entities::ChunkOutput {
+            let outputs = cpu::map(&worker.rules_pool, &chunks, |chunk| entities::ChunkOutput {
                 id: chunk.id,
                 dataset: chunk.dataset.clone(),
                 facts: worker
@@ -935,9 +984,19 @@ async fn rules_stage(
         )
         .await?;
     }
-    let unlisted = entities::clear_unlisted_contents(pool).await?;
-    if unlisted > 0 {
-        println!("rules: facts cleared for {unlisted} contents that no present file uses");
+    let source_changes: u64 = run
+        .sources
+        .values()
+        .map(|s| s.new + s.changed + s.deleted + s.moved)
+        .sum();
+    let changed = documents_todo + contents_todo > 0
+        || source_changes > 0
+        || db::runs::scan_left_unfinished(pool).await?;
+    if changed {
+        let unlisted = entities::clear_unlisted_contents(pool).await?;
+        if unlisted > 0 {
+            println!("rules: facts cleared for {unlisted} contents that no present file uses");
+        }
     }
     if documents_todo + contents_todo > 0 {
         let similar = prepared.config.resolve.similar.property.as_str();
@@ -948,7 +1007,11 @@ async fn rules_stage(
             );
         }
     }
-    let orphans = entities::delete_orphans(pool).await?;
+    let orphans = if changed {
+        entities::delete_orphans(pool).await?
+    } else {
+        0
+    };
     entities::sync_aliases(pool, &rules.lexicon.entries).await?;
     stats.seconds = started.elapsed().as_secs_f64();
     if documents_todo + contents_todo > 0 {
@@ -967,13 +1030,13 @@ async fn rules_stage(
     Ok(())
 }
 
-pub fn document_output(rules: &Rules, doc: entities::DocumentWork) -> entities::DocumentOutput {
+fn document_output(rules: &Rules, doc: entities::DocumentWork) -> entities::DocumentOutput {
     let mut facts = (doc.status != "deleted").then(|| rules.document_facts(&doc.path));
     let mut type_method = None;
     let mut type_confidence = 1.0;
     if let Some(facts) = facts.as_mut() {
         if facts.doc_type.is_some() {
-            type_method = Some(PATH_METHOD.to_string());
+            type_method = Some(rules::PATH_METHOD.to_string());
         } else if let Some(doc_type) = doc.llm_type.filter(|t| rules.doc_types.contains_key(t)) {
             facts.doc_type = Some(doc_type);
             type_method = doc.llm_method;
@@ -998,17 +1061,21 @@ pub fn document_output(rules: &Rules, doc: entities::DocumentWork) -> entities::
 
 pub type ModelTypes = HashMap<(i64, i32), entities::ModelType>;
 
-pub fn segment_content(
+fn by_content<T>(items: &[T], content_id: impl Fn(&T) -> i64) -> HashMap<i64, Vec<&T>> {
+    let mut grouped: HashMap<i64, Vec<&T>> = HashMap::new();
+    for item in items {
+        grouped.entry(content_id(item)).or_default().push(item);
+    }
+    grouped
+}
+
+fn segment_content(
     rules: &Rules,
     content_id: i64,
-    pages: &[entities::PageWork],
-    chunks: &[entities::ChunkWork],
+    own: &[&entities::PageWork],
+    own_chunks: &[&entities::ChunkWork],
     model_types: &ModelTypes,
 ) -> entities::ContentSegments {
-    let own: Vec<&entities::PageWork> = pages
-        .iter()
-        .filter(|p| p.content_id == content_id)
-        .collect();
     let inputs: Vec<rules::pages::PageInput> = own
         .iter()
         .map(|page| rules::pages::PageInput {
@@ -1026,10 +1093,6 @@ pub fn segment_content(
     let segments = rules.page_types.segments(&inputs);
     let mut entities = Vec::new();
     if segments.len() > 1 {
-        let own_chunks: Vec<&entities::ChunkWork> = chunks
-            .iter()
-            .filter(|c| c.content_id == content_id)
-            .collect();
         for segment in &segments {
             let model = model_types
                 .get(&(content_id, segment.page_from))
@@ -1175,9 +1238,46 @@ mod tests {
     }
 
     #[test]
-    fn parallel_map_keeps_order() {
-        let items: Vec<u32> = (0..100).collect();
-        let out = parallel_map(&items, 7, |x| x * 2);
-        assert_eq!(out, (0..100).map(|x| x * 2).collect::<Vec<_>>());
+    fn by_content_keeps_the_order_inside_each_content() {
+        let items = [(1, "a"), (2, "b"), (1, "c"), (3, "d"), (1, "e")];
+        let grouped = by_content(&items, |i| i.0);
+        let names = |id| grouped[&id].iter().map(|i| i.1).collect::<Vec<_>>();
+        assert_eq!(names(1), ["a", "c", "e"]);
+        assert_eq!(names(3), ["d"]);
+        assert!(!grouped.contains_key(&4));
+    }
+
+    #[test]
+    fn file_paths_stay_under_the_root() {
+        let base =
+            std::env::temp_dir().join(format!("zontologize-file-path-{}", std::process::id()));
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/in.txt"), b"x").unwrap();
+        std::fs::write(base.join("out.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(base.join("out.txt"), root.join("a/link.txt")).unwrap();
+        let inside = file_path(&root, "a/in.txt", None).unwrap();
+        assert!(inside.ends_with("root/a/in.txt"));
+        let absolute = root.join("a/in.txt").display().to_string();
+        assert_eq!(file_path(&root, "x", Some(&absolute)).unwrap(), inside);
+        assert!(file_path(&root, "x", Some("../out.txt")).is_err());
+        assert!(file_path(&root, "a/../../out.txt", None).is_err());
+        let outside = base.join("out.txt").display().to_string();
+        assert!(file_path(&root, "x", Some(&outside)).is_err());
+        assert!(file_path(&root, "a/link.txt", None).is_err());
+        assert!(file_path(&root, "x", Some("http://example.org/a.pdf")).is_err());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_failed_record_does_not_hide_the_stage_error() {
+        let failed = outcome(
+            Err(anyhow::anyhow!("stage")),
+            Err(anyhow::anyhow!("finish")),
+        );
+        assert_eq!(format!("{:#}", failed.unwrap_err()), "stage");
+        let failed = outcome(Ok(()), Err(anyhow::anyhow!("finish")));
+        assert_eq!(format!("{:#}", failed.unwrap_err()), "finish");
+        assert!(outcome(Ok(()), Ok(())).is_ok());
     }
 }

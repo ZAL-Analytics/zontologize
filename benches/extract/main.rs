@@ -1,5 +1,3 @@
-mod levenshtein;
-
 use std::collections::{BTreeMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -12,6 +10,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use zontologize::config::{self, ModelTier};
 use zontologize::scan::extract::{self, ExtractSettings, Method, Page};
+use zontologize::text::squash;
 
 const TRUTH_SUFFIX: &str = ".truth.txt";
 const DATASET_FILES: [&str; 2] = ["manifest.csv", "README.md"];
@@ -60,6 +59,13 @@ struct KindStats {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if !args.folder.is_dir() {
+        println!(
+            "skipped: {} not found; scripts/sync_data.sh --fetch-bench fills it",
+            args.folder.display()
+        );
+        return Ok(());
+    }
     let mut config = config::load(args.config.as_deref())?;
     if let Some(tier) = args.tier {
         config.ocr.model_tier = tier;
@@ -83,6 +89,7 @@ async fn main() -> Result<()> {
     );
 
     let settings = Arc::new(ExtractSettings::new(&config.extract, &config.ocr));
+    let timeout = Duration::from_secs(config.extract.timeout_secs);
     let semaphore = Arc::new(Semaphore::new(config.extract.threads));
     let cpu_before = cpu_seconds();
     let start = Instant::now();
@@ -94,7 +101,12 @@ async fn main() -> Result<()> {
         tasks.spawn(async move {
             let _permit = permit;
             let started = Instant::now();
-            let result = extract::extract_file(&path, &settings).await;
+            let result =
+                match tokio::time::timeout(timeout, extract::extract_pages(&path, &settings)).await
+                {
+                    Ok(result) => result,
+                    Err(elapsed) => Err(anyhow::Error::new(elapsed)),
+                };
             Outcome {
                 path,
                 elapsed: started.elapsed(),
@@ -174,7 +186,10 @@ fn report(args: &Args, outcomes: &[Outcome], wall: Duration, cpu: Option<f64>) -
         entry.files += 1;
         entry.busy += outcome.elapsed;
         if let Err(error) = &outcome.result {
-            if extract::is_timeout(error) {
+            if error
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some()
+            {
                 entry.timeouts += 1;
                 failures.push(format!("timeout: {}", outcome.path.display()));
             } else {
@@ -205,7 +220,7 @@ fn report(args: &Args, outcomes: &[Outcome], wall: Duration, cpu: Option<f64>) -
             let truth = std::fs::read_to_string(&truth)
                 .with_context(|| format!("cannot read {}", truth.display()))?;
             let text: Vec<&str> = pages.iter().map(|page| page.text.as_str()).collect();
-            if let Some(cer) = levenshtein::character_error_rate(&text.join("\n"), &truth) {
+            if let Some(cer) = character_error_rate(&text.join("\n"), &truth) {
                 entry.cer_sum += cer;
                 entry.cer_count += 1;
             }
@@ -287,6 +302,15 @@ fn print_row(kind: &str, stats: &KindStats, time: Duration) {
         confidence.map_or("-".to_string(), |c| format!("{c:.3}")),
         cer.map_or("-".to_string(), |c| format!("{:.2}%", 100.0 * c)),
     );
+}
+
+fn character_error_rate(ocr: &str, truth: &str) -> Option<f64> {
+    let truth = squash(truth);
+    if truth.is_empty() {
+        return None;
+    }
+    let distance = strsim::levenshtein(&squash(ocr), &truth);
+    Some(distance as f64 / truth.chars().count() as f64)
 }
 
 fn mean(sum: f64, count: usize) -> Option<f64> {

@@ -112,9 +112,10 @@ pub async fn errors(pool: &PgPool, limit: Option<i64>) -> Result<(i64, Vec<Error
 
 pub async fn resolve_links(pool: &PgPool) -> Result<Vec<(String, String, i64)>> {
     let rows = sqlx::query_as(
-        "select method, status, count(*) from relations where method like 'resolve:%' \
+        "select method, status, count(*) from relations where method like $1 \
          group by 1, 2 order by 1, 2",
     )
+    .bind(super::RESOLVE_METHODS)
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -169,7 +170,7 @@ pub async fn contract_version(pool: &PgPool, api: &str) -> Result<Option<i32>> {
     }
     let version = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "select {}.contract_version()",
-        super::quote_identifier(api)
+        super::identifier(api)?
     )))
     .fetch_one(pool)
     .await?;

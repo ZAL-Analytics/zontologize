@@ -10,7 +10,7 @@ use sqlx::types::chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 
 use crate::config::KindConfig;
-use crate::ontology::hex;
+use crate::hash::hex;
 
 const HASH_BUFFER: usize = 1 << 20;
 
@@ -95,11 +95,11 @@ pub fn mtime(time: SystemTime) -> DateTime<Utc> {
 
 pub fn relative(root: &Path, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(root).ok()?;
-    let parts: Vec<String> = relative
+    let parts: Option<Vec<&str>> = relative
         .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .map(|c| c.as_os_str().to_str())
         .collect();
-    Some(parts.join("/"))
+    Some(parts?.join("/"))
 }
 
 pub fn walk(
@@ -139,6 +139,13 @@ pub fn walk(
             continue;
         }
         let Some(path) = relative(&root, entry.path()) else {
+            let message = format!(
+                "{}: the name is not valid UTF-8, skipped",
+                entry.path().display()
+            );
+            if sender.blocking_send(WalkItem::Error(message)).is_err() {
+                return Ok(false);
+            }
             continue;
         };
         let metadata = match entry.metadata() {
@@ -188,10 +195,6 @@ pub fn hash_file(path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(hex(&hasher.finalize()))
-}
-
-pub fn hash_all(paths: &[PathBuf], threads: usize) -> Vec<Result<String>> {
-    super::parallel_map(paths, threads, |path| hash_file(path))
 }
 
 #[cfg(test)]
@@ -293,7 +296,11 @@ mod tests {
         let b = dir.join("b");
         std::fs::write(&a, b"abc").unwrap();
         std::fs::write(&b, b"").unwrap();
-        let hashes = hash_all(&[a, b, dir.join("missing")], 4);
+        let hashes = crate::cpu::map(
+            &crate::cpu::pool(4).unwrap(),
+            &[a, b, dir.join("missing")],
+            |p| hash_file(p),
+        );
         assert_eq!(
             hashes[0].as_ref().unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -304,5 +311,30 @@ mod tests {
         );
         assert!(hashes[2].is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn non_utf8_names_are_skipped_with_a_reason() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::env::temp_dir().join(format!("zontologize-utf8-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("ok.txt"), b"x").unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"bad\xff.txt");
+        std::fs::write(root.join(name), b"x").unwrap();
+        let (sender, mut receiver) = mpsc::channel(8);
+        let complete = walk(root.clone(), globs(&[]).unwrap(), 10, sender).unwrap();
+        let mut files = Vec::new();
+        let mut errors = Vec::new();
+        while let Ok(item) = receiver.try_recv() {
+            match item {
+                WalkItem::Files(batch) => files.extend(batch.into_iter().map(|f| f.path)),
+                WalkItem::Error(message) => errors.push(message),
+            }
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(complete);
+        assert_eq!(files, ["ok.txt"]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("not valid UTF-8"), "{errors:?}");
     }
 }

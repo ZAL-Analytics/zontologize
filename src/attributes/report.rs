@@ -6,11 +6,12 @@ use anyhow::{Context, Result};
 use sqlx::PgPool;
 
 use super::TASK;
-use super::check::{AMBIGUOUS_UNIT, UNKNOWN_UNIT};
+use super::check::Reason;
 use crate::config::Config;
 use crate::db;
 use crate::db::attributes::PropertyRow;
-use crate::llm::shortlist::{local_name, pick};
+use crate::llm::shortlist::pick;
+use crate::ns::local_name;
 use crate::ontology::Ontology;
 
 pub const REPORT_FILE: &str = "attributes-report.md";
@@ -57,7 +58,7 @@ pub fn markdown(
     for (key, count) in drops {
         let (reason, about) = key.split_once('|').unwrap_or((key, ""));
         *reasons.entry(reason).or_default() += count;
-        if reason == UNKNOWN_UNIT || reason == AMBIGUOUS_UNIT {
+        if reason == Reason::UnknownUnit.as_str() || reason == Reason::AmbiguousUnit.as_str() {
             units.push((*count, about, reason));
         }
     }
@@ -71,11 +72,7 @@ pub fn markdown(
          the local ontology file.\n\n| Unit text | Reason | Count |\n|---|---|---|\n",
     );
     for (count, text, reason) in units.iter().take(LISTED_UNITS) {
-        let _ = writeln!(
-            out,
-            "| `{}` | {reason} | {count} |",
-            text.replace('|', "\\|")
-        );
+        let _ = writeln!(out, "| {} | {reason} | {count} |", code_span(text));
     }
     out
 }
@@ -120,10 +117,36 @@ pub async fn write_report(
     Ok(())
 }
 
+fn code_span(text: &str) -> String {
+    let text: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .replace('|', "\\|");
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    if longest == 0 {
+        return format!("`{text}`");
+    }
+    let fence = "`".repeat(longest + 1);
+    format!("{fence} {text} {fence}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{iri, ontology};
     use super::*;
+
+    #[test]
+    fn code_span_keeps_backticks_and_newlines_inside() {
+        assert_eq!(code_span("kW"), "`kW`");
+        assert_eq!(code_span("a`b\nc|d"), "`` a`b c\\|d ``");
+        assert_eq!(code_span("``"), "``` `` ```");
+    }
 
     #[test]
     fn report_lists_values_drops_and_unknown_units() {
@@ -136,8 +159,8 @@ mod tests {
             example: "a/sheet.pdf p. 1".to_string(),
         }];
         let mut drops = BTreeMap::new();
-        drops.insert(format!("{UNKNOWN_UNIT}|kWe"), 4);
-        drops.insert(format!("{UNKNOWN_UNIT}|bar a"), 2);
+        drops.insert(format!("{}|kWe", Reason::UnknownUnit), 4);
+        drops.insert(format!("{}|bar a", Reason::UnknownUnit), 2);
         drops.insert("no unit|http://example.org/ex#power".to_string(), 1);
         let languages = vec!["en".to_string()];
         let text = markdown(&onto, &languages, "", &rows, &drops);

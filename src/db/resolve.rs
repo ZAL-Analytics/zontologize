@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgExecutor, PgPool};
 
-pub const SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
-pub const REFERENCES: &str = "http://purl.org/dc/terms/references";
-pub const REPLACES: &str = "http://purl.org/dc/terms/replaces";
+pub const SAME_AS: &str = crate::ns::OWL_SAME_AS;
+pub const REFERENCES: &str = crate::ns::DCTERMS_REFERENCES;
+pub const REPLACES: &str = crate::ns::DCTERMS_REPLACES;
 pub const BUILT_IN: [&str; 3] = [SAME_AS, REFERENCES, REPLACES];
 
 #[derive(Debug, Clone, FromRow)]
@@ -46,38 +46,55 @@ pub struct NewLink {
     pub span_end: Option<i32>,
 }
 
-pub async fn entities(pool: &PgPool) -> Result<Vec<EntityRow>> {
+pub async fn entities<'e>(db: impl PgExecutor<'e>) -> Result<Vec<EntityRow>> {
     let rows = sqlx::query_as(
         "select id, class_iri, key, name, document_id, canonical_id from entities order by id",
     )
-    .fetch_all(pool)
+    .fetch_all(db)
     .await?;
     Ok(rows)
 }
 
-pub async fn links(pool: &PgPool, property: &str) -> Result<Vec<Link>> {
+pub async fn links<'e>(db: impl PgExecutor<'e>, property: &str) -> Result<Vec<Link>> {
     let rows = sqlx::query_as(
         "select id, src_id, dst_id, method, status, document_id, chunk_id, span_start, span_end \
          from relations where property_iri = $1 order by id",
     )
     .bind(property)
-    .fetch_all(pool)
+    .fetch_all(db)
     .await?;
     Ok(rows)
 }
 
-pub async fn delete(pool: &PgPool, ids: &[i64]) -> Result<()> {
+pub async fn provenance<'e>(
+    db: impl PgExecutor<'e>,
+    ids: &[i64],
+) -> Result<HashMap<i64, (Option<i64>, Option<i64>)>> {
+    let rows: Vec<(i64, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "select entity_id, min(chunk_id), min(document_id) from mentions \
+         where entity_id = any($1) group by entity_id",
+    )
+    .bind(ids)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, chunk, document)| (id, (chunk, document)))
+        .collect())
+}
+
+pub async fn delete<'e>(db: impl PgExecutor<'e>, ids: &[i64]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
     sqlx::query("delete from relations where id = any($1) and status in ('auto', 'proposed')")
         .bind(ids)
-        .execute(pool)
+        .execute(db)
         .await?;
     Ok(())
 }
 
-pub async fn insert(pool: &PgPool, links: &[NewLink]) -> Result<()> {
+pub async fn insert<'e>(db: impl PgExecutor<'e>, links: &[NewLink]) -> Result<()> {
     if links.is_empty() {
         return Ok(());
     }
@@ -105,7 +122,7 @@ pub async fn insert(pool: &PgPool, links: &[NewLink]) -> Result<()> {
     .bind(column(|l| l.chunk_id))
     .bind(span(|l| l.span_start))
     .bind(span(|l| l.span_end))
-    .execute(pool)
+    .execute(db)
     .await?;
     Ok(())
 }
@@ -182,7 +199,11 @@ pub async fn pair_scores(
     Ok(rows)
 }
 
-pub async fn set_canonical(pool: &PgPool, ids: &[i64], canonical: &[i64]) -> Result<u64> {
+pub async fn set_canonical<'e>(
+    db: impl PgExecutor<'e>,
+    ids: &[i64],
+    canonical: &[i64],
+) -> Result<u64> {
     let done = sqlx::query(
         "update entities e set canonical_id = v.canonical \
          from unnest($1::bigint[], $2::bigint[]) as v(id, canonical) \
@@ -190,22 +211,29 @@ pub async fn set_canonical(pool: &PgPool, ids: &[i64], canonical: &[i64]) -> Res
     )
     .bind(ids)
     .bind(canonical)
-    .execute(pool)
+    .execute(db)
     .await?;
     Ok(done.rows_affected())
 }
 
-pub async fn resolve_aliases(pool: &PgPool, method: &str) -> Result<Vec<(i64, String)>> {
+pub async fn resolve_aliases<'e>(
+    db: impl PgExecutor<'e>,
+    method: &str,
+) -> Result<Vec<(i64, String)>> {
     let rows = sqlx::query_as(
         "select entity_id, alias from aliases where method = $1 order by entity_id, alias",
     )
     .bind(method)
-    .fetch_all(pool)
+    .fetch_all(db)
     .await?;
     Ok(rows)
 }
 
-pub async fn add_aliases(pool: &PgPool, rows: &[(i64, String)], method: &str) -> Result<u64> {
+pub async fn add_aliases<'e>(
+    db: impl PgExecutor<'e>,
+    rows: &[(i64, String)],
+    method: &str,
+) -> Result<u64> {
     if rows.is_empty() {
         return Ok(0);
     }
@@ -217,12 +245,16 @@ pub async fn add_aliases(pool: &PgPool, rows: &[(i64, String)], method: &str) ->
     .bind(rows.iter().map(|r| r.0).collect::<Vec<_>>())
     .bind(rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>())
     .bind(method)
-    .execute(pool)
+    .execute(db)
     .await?;
     Ok(done.rows_affected())
 }
 
-pub async fn remove_aliases(pool: &PgPool, rows: &[(i64, String)], method: &str) -> Result<()> {
+pub async fn remove_aliases<'e>(
+    db: impl PgExecutor<'e>,
+    rows: &[(i64, String)],
+    method: &str,
+) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -233,7 +265,7 @@ pub async fn remove_aliases(pool: &PgPool, rows: &[(i64, String)], method: &str)
     .bind(rows.iter().map(|r| r.0).collect::<Vec<_>>())
     .bind(rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>())
     .bind(method)
-    .execute(pool)
+    .execute(db)
     .await?;
     Ok(())
 }
@@ -248,7 +280,7 @@ pub struct Reference {
     pub confidence: f64,
 }
 
-pub async fn references(pool: &PgPool, classes: &[String]) -> Result<Vec<Reference>> {
+pub async fn references<'e>(db: impl PgExecutor<'e>, classes: &[String]) -> Result<Vec<Reference>> {
     let rows = sqlx::query_as(
         "select distinct on (sa.id, sb.id) sa.id as src_id, sb.id as dst_id, m.chunk_id, \
          m.span_start, m.span_end, m.confidence from mentions m \
@@ -264,7 +296,7 @@ pub async fn references(pool: &PgPool, classes: &[String]) -> Result<Vec<Referen
          order by sa.id, sb.id, m.chunk_id, m.span_start",
     )
     .bind(classes)
-    .fetch_all(pool)
+    .fetch_all(db)
     .await?;
     Ok(rows)
 }
@@ -277,13 +309,13 @@ pub struct DocumentEntity {
     pub entity_id: i64,
 }
 
-pub async fn document_entities(pool: &PgPool) -> Result<Vec<DocumentEntity>> {
+pub async fn document_entities<'e>(db: impl PgExecutor<'e>) -> Result<Vec<DocumentEntity>> {
     let rows = sqlx::query_as(
         "select d.id as document_id, d.source_id, d.path, e.id as entity_id from documents d \
          join entities e on e.document_id = d.id and e.key = d.id::text \
          where d.status = 'present' order by d.id",
     )
-    .fetch_all(pool)
+    .fetch_all(db)
     .await?;
     Ok(rows)
 }
@@ -299,7 +331,7 @@ pub struct ValueRow {
     pub confidence: f64,
 }
 
-pub async fn values(pool: &PgPool) -> Result<Vec<ValueRow>> {
+pub async fn values<'e>(db: impl PgExecutor<'e>) -> Result<Vec<ValueRow>> {
     let rows = sqlx::query_as(
         "select c.id as cluster_id, c.class_iri as cluster_class, a.property_iri, a.si_low, \
          a.si_high, a.chunk_id, a.confidence from attributes a \
@@ -310,16 +342,16 @@ pub async fn values(pool: &PgPool) -> Result<Vec<ValueRow>> {
          from documents d where d.content_id = k.content_id and d.status = 'present') \
          order by c.id, a.id",
     )
-    .fetch_all(pool)
+    .fetch_all(db)
     .await?;
     Ok(rows)
 }
 
-pub async fn confidences(pool: &PgPool, property: &str) -> Result<HashMap<i64, f64>> {
+pub async fn confidences<'e>(db: impl PgExecutor<'e>, property: &str) -> Result<HashMap<i64, f64>> {
     let rows: Vec<(i64, f64)> =
         sqlx::query_as("select id, confidence from relations where property_iri = $1")
             .bind(property)
-            .fetch_all(pool)
+            .fetch_all(db)
             .await?;
     Ok(rows.into_iter().collect())
 }

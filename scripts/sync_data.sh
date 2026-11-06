@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
-repo=zal-analytics-core/zontologize-data
+repo="${ZONTOLOGIZE_DATA_REPO:-zal-analytics-core/zontologize-data}"
 
 usage() {
     echo "usage: $0 --gen-test [out] [args...] | --gen-fixtures | --fetch-bench [out] [args...] | --download | --upload [message]" >&2
@@ -39,7 +39,7 @@ case "$cmd" in
         hf download "$repo" --repo-type dataset --local-dir "$root/data"
         ;;
     --upload)
-        hf upload "$repo" "$root/data" . --repo-type dataset --exclude "benchmarks/.cache/*" --commit-message "${1:-Update data}"
+        hf upload "$repo" "$root/data" . --repo-type dataset --exclude "benchmarks/*" --commit-message "${1:-Update data}"
         ;;
     *)
         usage

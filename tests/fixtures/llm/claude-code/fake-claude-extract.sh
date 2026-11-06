@@ -7,5 +7,6 @@ case "$input" in
 *"Document types"*"Work order"*) cat "$dir/classify-work-order.jsonl" ;;
 *"Document types"*) cat "$dir/classify-none.jsonl" ;;
 *"booster pump"*) cat "$dir/extract-booster.jsonl" ;;
-*) cat "$dir/extract-empty.jsonl" ;;
+*"Known things (ref | class | name)"*) cat "$dir/extract-empty.jsonl" ;;
+*) echo "fake-claude: no recorded answer for this prompt" >&2; exit 1 ;;
 esac

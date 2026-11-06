@@ -75,6 +75,13 @@ impl Prompt {
         Ok(())
     }
 
+    pub fn require(&self, name: &str) -> Result<()> {
+        if !variables(&self.text).contains(&name) {
+            bail!("{}: the variable {{{name}}} is missing", self.source);
+        }
+        Ok(())
+    }
+
     pub fn fill(&self, values: &[(&str, &str)]) -> String {
         let mut out = String::with_capacity(self.text.len());
         let mut rest = self.text.as_str();
@@ -90,7 +97,7 @@ impl Prompt {
             });
             match value {
                 Some((end, value)) => {
-                    out.push_str(value);
+                    out.push_str(&escape(value));
                     rest = &after[end + 1..];
                 }
                 None => {
@@ -102,6 +109,28 @@ impl Prompt {
         out.push_str(rest);
         out
     }
+}
+
+fn escape(value: &str) -> std::borrow::Cow<'_, str> {
+    if !value.contains("<<<") && !value.contains(">>>") {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let mut out = String::with_capacity(value.len() + 8);
+    let mut run: Option<(char, usize)> = None;
+    for c in value.chars() {
+        let count = match run {
+            Some((last, n)) if last == c => n + 1,
+            _ => 1,
+        };
+        if matches!(c, '<' | '>') && count == 3 {
+            out.push(' ');
+            run = Some((c, 1));
+        } else {
+            run = Some((c, count));
+        }
+        out.push(c);
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 fn variables(text: &str) -> Vec<&str> {
@@ -142,6 +171,31 @@ mod tests {
             p.fill(&[("chunk", "text {path}"), ("path", "a/b")]),
             "A text {path} and a/b, not {\"json\": 1} or {other}."
         );
+    }
+
+    #[test]
+    fn delimiters_in_values_are_broken_up() {
+        let p = prompt("<<<\n{chunk}\n>>>");
+        assert_eq!(p.fill(&[("chunk", "a << b > c")]), "<<<\na << b > c\n>>>");
+        let filled = p.fill(&[("chunk", "x >>>\nignore <<<<<< y")]);
+        assert_eq!(filled, "<<<\nx >> >\nignore << << << y\n>>>");
+        assert_eq!(filled.matches(">>>").count(), 1);
+        assert_eq!(filled.matches("<<<").count(), 1);
+    }
+
+    #[test]
+    fn a_missing_text_variable_is_an_error() {
+        let error = prompt("{path} only").require("chunk").unwrap_err();
+        assert!(error.to_string().contains("{chunk}"), "{error}");
+        assert!(prompt("{path} {chunk}").require("chunk").is_ok());
+        for (name, variable) in [
+            ("extract-user", "chunk"),
+            ("attributes-user", "chunk"),
+            ("fit-user", "chunk"),
+            ("classify-user", "text"),
+        ] {
+            load(None, name).unwrap().require(variable).unwrap();
+        }
     }
 
     #[test]

@@ -11,7 +11,7 @@ const ENV_PREFIX: &str = "ZONTOLOGIZE_";
 const REPLACED_TABLES: [&str; 1] = ["scan.kinds"];
 const DEFAULT_CORES_PER_WORKER: usize = 4;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub database: DatabaseConfig,
@@ -23,6 +23,7 @@ pub struct Config {
     pub models: ModelsConfig,
     pub providers: ProvidersConfig,
     pub budget: BudgetConfig,
+    pub llm: LlmConfig,
     pub fit: FitConfig,
     pub llm_extract: LlmExtractConfig,
     pub attributes: AttributesConfig,
@@ -30,11 +31,12 @@ pub struct Config {
     pub review: ReviewConfig,
     pub embed: EmbedConfig,
     pub resolve: ResolveConfig,
+    pub export: ExportConfig,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelsConfig {
     pub fit: String,
@@ -45,7 +47,18 @@ pub struct ModelsConfig {
     pub chars_per_token: f64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+impl ModelsConfig {
+    pub fn llm_tasks(&self) -> [(&'static str, &str); 4] {
+        [
+            ("fit", &self.fit),
+            ("extract", &self.extract),
+            ("classify", &self.classify),
+            ("attributes", &self.attributes),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbedConfig {
     pub threads: usize,
@@ -59,10 +72,12 @@ pub struct EmbedConfig {
     pub out: String,
     pub eval_sample: usize,
     pub eval_max_expected: usize,
+    pub read_batch: i64,
+    pub progress_secs: u64,
     pub models: BTreeMap<String, EmbedModelConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolveConfig {
     pub strip_words: Vec<String>,
@@ -72,10 +87,11 @@ pub struct ResolveConfig {
     pub max_block: usize,
     pub block_chars: usize,
     pub classes: Vec<String>,
+    pub neighbour_batch: usize,
     pub similar: SimilarConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SimilarConfig {
     pub property: String,
@@ -86,14 +102,24 @@ pub struct SimilarConfig {
     pub weights: BTreeMap<String, f64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttributesConfig {
     pub confidence: f64,
     pub max_text_chars: usize,
     pub max_properties: usize,
+    pub max_subjects: usize,
     pub context_chars: usize,
     pub out: String,
+    pub read_batch: i64,
+    pub unit_symbols: usize,
+    pub sources: Vec<String>,
+    pub doc_types: Vec<String>,
+    pub paths: Vec<String>,
+    pub seed: String,
+    #[serde(default)]
+    pub resend_share: Option<f64>,
+    pub threads: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -153,7 +179,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvidersConfig {
     #[serde(rename = "claude-code")]
@@ -162,7 +188,7 @@ pub struct ProvidersConfig {
     pub ollama: OllamaConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaudeCodeConfig {
     pub concurrency: usize,
@@ -170,7 +196,7 @@ pub struct ClaudeCodeConfig {
     pub max_window_use: f64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenRouterConfig {
     pub base_url: String,
@@ -179,7 +205,7 @@ pub struct OpenRouterConfig {
     pub poll_minutes: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OllamaConfig {
     pub concurrency: usize,
@@ -187,7 +213,7 @@ pub struct OllamaConfig {
     pub think: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetConfig {
     pub max_usd: f64,
@@ -196,7 +222,22 @@ pub struct BudgetConfig {
     pub default_output_tokens: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmConfig {
+    pub retry_backoff_secs: u64,
+    pub wait_margin_secs: u64,
+    pub unknown_reset_wait_minutes: u64,
+    pub progress_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportConfig {
+    pub ontology_iri: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FitConfig {
     pub sample: usize,
@@ -207,9 +248,10 @@ pub struct FitConfig {
     pub min_evidence: usize,
     pub proposal_namespace: String,
     pub out: String,
+    pub definition_chars: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmExtractConfig {
     pub min_chars: usize,
@@ -227,24 +269,30 @@ pub struct LlmExtractConfig {
     pub resend_share: f64,
     pub min_evidence: usize,
     pub out: String,
+    pub read_batch: i64,
+    pub definition_chars: usize,
+    pub max_known: usize,
+    pub threads: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClassifyConfig {
     pub head_chars: usize,
     pub min_chars: usize,
     pub confidence: f64,
+    pub read_batch: usize,
+    pub definition_chars: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewConfig {
     pub sample: usize,
     pub min_verdicts: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub schema: String,
@@ -253,7 +301,7 @@ pub struct DatabaseConfig {
     pub max_connections: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OntologyConfig {
     pub files: Vec<String>,
@@ -263,31 +311,36 @@ pub struct OntologyConfig {
     pub document_class: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScanConfig {
     pub batch_size: usize,
     pub hash_threads: usize,
+    pub extract_batch: i64,
+    pub chunk_batch: i64,
+    pub rules_batch: i64,
+    pub rules_threads: usize,
     pub ignore: Vec<String>,
     pub kinds: BTreeMap<String, KindConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct KindConfig {
     pub extensions: Vec<String>,
     pub max_mb: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChunkConfig {
     pub max_chars: usize,
     pub overlap: usize,
     pub text_search: String,
+    pub threads: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceKind {
     Folder,
@@ -303,7 +356,7 @@ impl SourceKind {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     pub name: String,
@@ -382,10 +435,23 @@ fn load_from(
     let mut merged: Table = DEFAULTS
         .parse()
         .context("built-in defaults/zontologize.toml is not valid TOML")?;
-    let mut config = build("built-in defaults", &merged)?;
-    for layer in layers(config_dir, vars)? {
-        merge(&mut merged, layer.table, "");
-        config = build(&layer.source, &merged)?;
+    parse("built-in defaults", &merged)?;
+    let mut sources = Vec::new();
+    if let Some(layer) = file_layer(config_dir)? {
+        apply(&mut merged, layer, &mut sources)?;
+    }
+    for (name, raw) in env_vars(vars, &merged)? {
+        let layer = env_layer(&name, &raw, &merged)?;
+        apply(&mut merged, layer, &mut sources)?;
+    }
+    let source = if sources.is_empty() {
+        "built-in defaults".to_string()
+    } else {
+        sources.join(", ")
+    };
+    let mut config = parse(&source, &merged)?;
+    if let Err(message) = check(&config) {
+        bail!("{source}: {message}");
     }
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     if config.extract.threads == 0 {
@@ -401,6 +467,7 @@ fn load_from(
     if config.scan.hash_threads == 0 {
         config.scan.hash_threads = cores;
     }
+    borrow(&mut config);
     if config.embed.threads == 0 {
         config.embed.threads = cores;
     }
@@ -412,58 +479,137 @@ fn load_from(
     Ok(config)
 }
 
-fn layers(
-    config_dir: Option<&Path>,
-    vars: impl IntoIterator<Item = (String, String)>,
-) -> Result<Vec<Layer>> {
-    let mut layers = Vec::new();
-    if let Some(dir) = config_dir {
-        if !dir.is_dir() {
-            bail!("config directory {} does not exist", dir.display());
-        }
-        let path = dir.join(CONFIG_FILE);
-        if path.exists() {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("cannot read {}", path.display()))?;
-            let table = text
-                .parse()
-                .with_context(|| format!("{} is not valid TOML", path.display()))?;
-            layers.push(Layer {
-                source: path.display().to_string(),
-                table,
-            });
+fn borrow(config: &mut Config) {
+    let threads = config.scan.hash_threads;
+    for value in [
+        &mut config.scan.rules_threads,
+        &mut config.chunk.threads,
+        &mut config.llm_extract.threads,
+        &mut config.attributes.threads,
+    ] {
+        if *value == 0 {
+            *value = threads;
         }
     }
-    let mut env: Vec<(String, String)> = vars
-        .into_iter()
-        .filter(|(name, _)| name.starts_with(ENV_PREFIX) && name.contains("__"))
-        .collect();
-    env.sort();
-    for (name, raw) in env {
-        layers.push(env_layer(&name, &raw)?);
+    let extract = &mut config.llm_extract;
+    if extract.max_known == 0 {
+        extract.max_known = extract.max_shortlist;
     }
-    Ok(layers)
+    let attributes = &mut config.attributes;
+    for (own, borrowed) in [
+        (&mut attributes.sources, &extract.sources),
+        (&mut attributes.doc_types, &extract.doc_types),
+        (&mut attributes.paths, &extract.paths),
+    ] {
+        if own.is_empty() {
+            own.clone_from(borrowed);
+        }
+    }
+    if attributes.seed.is_empty() {
+        attributes.seed.clone_from(&extract.seed);
+    }
 }
 
-fn env_layer(name: &str, raw: &str) -> Result<Layer> {
-    let rest = &name[ENV_PREFIX.len()..];
-    let Some((section, key)) = rest.split_once("__") else {
-        bail!("{name}: expected the form ZONTOLOGIZE_<SECTION>__<KEY>");
+pub fn hash(config: &Config) -> Result<String> {
+    let json = serde_json::to_vec(config).context("cannot serialize the config")?;
+    Ok(crate::hash::hex(&<sha2::Sha256 as sha2::Digest>::digest(
+        &json,
+    )))
+}
+
+fn file_layer(config_dir: Option<&Path>) -> Result<Option<Layer>> {
+    let Some(dir) = config_dir else {
+        return Ok(None);
     };
-    if section.is_empty() || key.is_empty() || key.contains("__") {
+    if !dir.is_dir() {
+        bail!("config directory {} does not exist", dir.display());
+    }
+    let path = dir.join(CONFIG_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let table = text
+        .parse()
+        .with_context(|| format!("{} is not valid TOML", path.display()))?;
+    Ok(Some(Layer {
+        source: path.display().to_string(),
+        table,
+    }))
+}
+
+fn apply(merged: &mut Table, layer: Layer, sources: &mut Vec<String>) -> Result<()> {
+    merge(merged, layer.table, "");
+    parse(&layer.source, merged)?;
+    sources.push(layer.source);
+    Ok(())
+}
+
+fn env_vars(
+    vars: impl IntoIterator<Item = (String, String)>,
+    defaults: &Table,
+) -> Result<Vec<(String, String)>> {
+    let mut env = Vec::new();
+    for (name, raw) in vars {
+        let Some(rest) = name.strip_prefix(ENV_PREFIX) else {
+            continue;
+        };
+        if rest.contains("__") {
+            env.push((name, raw));
+            continue;
+        }
+        let rest = rest.to_lowercase();
+        let section = defaults
+            .keys()
+            .find(|section| rest == **section || rest.starts_with(&format!("{section}_")));
+        if let Some(section) = section {
+            bail!(
+                "{name}: expected the form ZONTOLOGIZE_{}__<KEY>, with two underscores",
+                section.to_uppercase()
+            );
+        }
+    }
+    env.sort();
+    Ok(env)
+}
+
+fn env_layer(name: &str, raw: &str, merged: &Table) -> Result<Layer> {
+    let parts: Vec<String> = name[ENV_PREFIX.len()..]
+        .split("__")
+        .map(str::to_lowercase)
+        .collect();
+    if parts.iter().any(String::is_empty) {
         bail!("{name}: expected the form ZONTOLOGIZE_<SECTION>__<KEY>");
     }
-    let mut inner = Table::new();
-    inner.insert(key.to_lowercase(), env_value(raw));
-    let mut table = Table::new();
-    table.insert(section.to_lowercase(), Value::Table(inner));
+    let mut value = env_value(raw, existing(merged, &parts));
+    for part in parts.iter().rev() {
+        let mut table = Table::new();
+        table.insert(part.clone(), value);
+        value = Value::Table(table);
+    }
+    let Value::Table(table) = value else {
+        bail!("{name}: expected the form ZONTOLOGIZE_<SECTION>__<KEY>");
+    };
     Ok(Layer {
         source: name.to_string(),
         table,
     })
 }
 
-fn env_value(raw: &str) -> Value {
+fn existing<'a>(merged: &'a Table, parts: &[String]) -> Option<&'a Value> {
+    let (last, path) = parts.split_last()?;
+    let mut table = merged;
+    for part in path {
+        table = table.get(part)?.as_table()?;
+    }
+    table.get(last)
+}
+
+fn env_value(raw: &str, existing: Option<&Value>) -> Value {
+    if matches!(existing, Some(Value::String(_))) {
+        return Value::String(raw.to_string());
+    }
     format!("value = {raw}")
         .parse::<Table>()
         .ok()
@@ -491,15 +637,11 @@ fn merge(base: &mut Table, overlay: Table, path: &str) {
     }
 }
 
-fn build(source: &str, merged: &Table) -> Result<Config> {
-    let config: Config = merged
+fn parse(source: &str, merged: &Table) -> Result<Config> {
+    merged
         .clone()
         .try_into()
-        .map_err(|error| anyhow::anyhow!("{source}: {}", error.to_string().trim_end()))?;
-    if let Err(message) = check(&config) {
-        bail!("{source}: {message}");
-    }
-    Ok(config)
+        .map_err(|error| anyhow::anyhow!("{source}: {}", error.to_string().trim_end()))
 }
 
 fn check(config: &Config) -> Result<(), String> {
@@ -595,13 +737,7 @@ fn check(config: &Config) -> Result<(), String> {
 }
 
 fn check_models(config: &Config) -> Result<(), String> {
-    let models = [
-        ("fit", &config.models.fit),
-        ("extract", &config.models.extract),
-        ("classify", &config.models.classify),
-        ("attributes", &config.models.attributes),
-    ];
-    for (key, name) in models {
+    for (key, name) in config.models.llm_tasks() {
         if !name.is_empty() {
             crate::llm::ModelName::parse(name).map_err(|error| format!("models.{key}: {error}"))?;
         }
@@ -611,15 +747,11 @@ fn check_models(config: &Config) -> Result<(), String> {
         return Err("models.chars_per_token must be greater than 0".to_string());
     }
     let providers = &config.providers;
-    let concurrency = [
-        ("claude-code", providers.claude_code.concurrency),
-        ("openrouter", providers.openrouter.concurrency),
-        ("ollama", providers.ollama.concurrency),
-    ];
-    for (name, value) in concurrency {
-        if value == 0 {
+    for kind in crate::llm::ProviderKind::ALL {
+        if kind.concurrency(providers) == 0 {
             return Err(format!(
-                "providers.{name}.concurrency must be greater than 0"
+                "providers.{}.concurrency must be greater than 0",
+                kind.as_str()
             ));
         }
     }
@@ -639,22 +771,27 @@ fn check_models(config: &Config) -> Result<(), String> {
         return Err("fit.proposal_namespace must be an IRI namespace".to_string());
     }
     let extract = &config.llm_extract;
-    for name in &extract.sources {
-        if !config.sources.iter().any(|s| &s.name == name) {
-            return Err(format!(
-                "llm_extract.sources: {name:?} is not the name of a [[sources]] entry"
-            ));
+    let attributes = &config.attributes;
+    for (key, names) in [
+        ("llm_extract", &extract.sources),
+        ("attributes", &attributes.sources),
+    ] {
+        for name in names {
+            if !config.sources.iter().any(|s| &s.name == name) {
+                return Err(format!(
+                    "{key}.sources: {name:?} is not the name of a [[sources]] entry"
+                ));
+            }
         }
     }
     check_globs("llm_extract.paths", &extract.paths)?;
+    check_globs("attributes.paths", &attributes.paths)?;
+    check_sizes(config)?;
     if extract.max_shortlist == 0 || extract.max_per_document == 0 {
         return Err(
             "llm_extract.max_shortlist and llm_extract.max_per_document must be greater than 0"
                 .to_string(),
         );
-    }
-    if extract.max_shortlist == 0 {
-        return Err("llm_extract.max_shortlist must be greater than 0".to_string());
     }
     let shares = [
         ("llm_extract.confidence", extract.confidence),
@@ -665,6 +802,10 @@ fn check_models(config: &Config) -> Result<(), String> {
         ("classify.confidence", config.classify.confidence),
         ("attributes.confidence", config.attributes.confidence),
         (
+            "attributes.resend_share",
+            attributes.resend_share.unwrap_or(extract.resend_share),
+        ),
+        (
             "resolve.similar.min_score",
             config.resolve.similar.min_score,
         ),
@@ -674,10 +815,13 @@ fn check_models(config: &Config) -> Result<(), String> {
             return Err(format!("{key} must be between 0 and 1"));
         }
     }
-    let attributes = &config.attributes;
-    if attributes.max_text_chars == 0 || attributes.max_properties == 0 {
+    if attributes.max_text_chars == 0
+        || attributes.max_properties == 0
+        || attributes.max_subjects == 0
+    {
         return Err(
-            "attributes.max_text_chars and attributes.max_properties must be greater than 0"
+            "attributes.max_text_chars, attributes.max_properties and attributes.max_subjects \
+             must be greater than 0"
                 .to_string(),
         );
     }
@@ -711,6 +855,37 @@ fn check_models(config: &Config) -> Result<(), String> {
             "budget.max_usd must be 0 or more and budget.calibration_calls greater than 0"
                 .to_string(),
         );
+    }
+    Ok(())
+}
+
+fn check_sizes(config: &Config) -> Result<(), String> {
+    let sizes = [
+        ("scan.extract_batch", config.scan.extract_batch),
+        ("scan.chunk_batch", config.scan.chunk_batch),
+        ("scan.rules_batch", config.scan.rules_batch),
+        ("llm_extract.read_batch", config.llm_extract.read_batch),
+        ("attributes.read_batch", config.attributes.read_batch),
+        ("classify.read_batch", config.classify.read_batch as i64),
+        ("embed.read_batch", config.embed.read_batch),
+        (
+            "resolve.neighbour_batch",
+            config.resolve.neighbour_batch as i64,
+        ),
+        (
+            "attributes.unit_symbols",
+            config.attributes.unit_symbols as i64,
+        ),
+        ("llm.progress_secs", config.llm.progress_secs as i64),
+        ("embed.progress_secs", config.embed.progress_secs as i64),
+    ];
+    for (key, value) in sizes {
+        if value <= 0 {
+            return Err(format!("{key} must be greater than 0"));
+        }
+    }
+    if config.export.ontology_iri.trim().is_empty() {
+        return Err("export.ontology_iri must be an IRI".to_string());
     }
     Ok(())
 }
@@ -756,7 +931,7 @@ fn check_globs(key: &str, globs: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn is_qualified_identifier(name: &str) -> bool {
+fn is_qualified_identifier(name: &str) -> bool {
     match name.split_once('.') {
         Some((schema, view)) => is_identifier(schema) && is_identifier(view),
         None => false,
@@ -790,6 +965,51 @@ mod tests {
 
     fn error(result: Result<Config>) -> String {
         format!("{:#}", result.unwrap_err())
+    }
+
+    #[test]
+    fn stage_settings_borrow_until_set() {
+        let dir = dir_with(
+            "[[sources]]\nname = \"a\"\nroot = \"/a\"\n\n[[sources]]\nname = \"b\"\nroot = \"/b\"\n\n\
+             [scan]\nhash_threads = 3\n\n[llm_extract]\nsources = [\"a\"]\npaths = [\"x/**\"]\n\
+             seed = \"s\"\nresend_share = 0.4\nmax_shortlist = 7\n",
+        );
+        let config = load_from(Some(dir.path()), vars(&[])).unwrap();
+        assert_eq!(config.attributes.sources, ["a"]);
+        assert_eq!(config.attributes.paths, ["x/**"]);
+        assert_eq!(config.attributes.seed, "s");
+        assert_eq!(config.attributes.resend_share, None);
+        assert_eq!(config.llm_extract.max_known, 7);
+        assert_eq!(config.llm_extract.threads, 3);
+        assert_eq!(config.attributes.threads, 3);
+        assert_eq!(config.chunk.threads, 3);
+        assert_eq!(config.scan.rules_threads, 3);
+        let env = vars(&[
+            ("ZONTOLOGIZE_ATTRIBUTES__SOURCES", "[\"b\"]"),
+            ("ZONTOLOGIZE_ATTRIBUTES__SEED", "t"),
+            ("ZONTOLOGIZE_ATTRIBUTES__RESEND_SHARE", "0.1"),
+            ("ZONTOLOGIZE_ATTRIBUTES__THREADS", "2"),
+            ("ZONTOLOGIZE_LLM_EXTRACT__MAX_KNOWN", "4"),
+        ]);
+        let config = load_from(Some(dir.path()), env).unwrap();
+        assert_eq!(config.attributes.sources, ["b"]);
+        assert_eq!(config.attributes.seed, "t");
+        assert_eq!(config.attributes.resend_share, Some(0.1));
+        assert_eq!(config.attributes.threads, 2);
+        assert_eq!(config.llm_extract.max_known, 4);
+        let env = vars(&[("ZONTOLOGIZE_ATTRIBUTES__SOURCES", "[\"c\"]")]);
+        let message = error(load_from(Some(dir.path()), env));
+        assert!(message.contains("attributes.sources"), "{message}");
+    }
+
+    #[test]
+    fn config_hash_is_stable_and_follows_values() {
+        let config = load_from(None, vars(&[])).unwrap();
+        let again = load_from(None, vars(&[])).unwrap();
+        assert_eq!(hash(&config).unwrap(), hash(&again).unwrap());
+        let env = vars(&[("ZONTOLOGIZE_CHUNK__MAX_CHARS", "999")]);
+        let other = load_from(None, env).unwrap();
+        assert_ne!(hash(&config).unwrap(), hash(&other).unwrap());
     }
 
     #[test]
@@ -984,6 +1204,37 @@ mod tests {
     }
 
     #[test]
+    fn layers_are_checked_together_after_merging() {
+        let env = vars(&[
+            ("ZONTOLOGIZE_CHUNK__MAX_CHARS", "150"),
+            ("ZONTOLOGIZE_CHUNK__OVERLAP", "50"),
+        ]);
+        let config = load_from(None, env).unwrap();
+        assert_eq!((config.chunk.max_chars, config.chunk.overlap), (150, 50));
+    }
+
+    #[test]
+    fn env_keeps_strings_as_text_and_sets_nested_keys() {
+        let env = vars(&[
+            ("ZONTOLOGIZE_FIT__SEED", "42"),
+            ("ZONTOLOGIZE_PROVIDERS__OLLAMA__THINK", "true"),
+        ]);
+        let config = load_from(None, env).unwrap();
+        assert_eq!(config.fit.seed, "42");
+        assert!(config.providers.ollama.think);
+    }
+
+    #[test]
+    fn env_var_with_one_underscore_is_an_error() {
+        let env = vars(&[("ZONTOLOGIZE_EXTRACT_THREADS", "5")]);
+        let message = error(load_from(None, env));
+        assert!(message.contains("ZONTOLOGIZE_EXTRACT_THREADS"), "{message}");
+        assert!(message.contains("ZONTOLOGIZE_EXTRACT__"), "{message}");
+        let env = vars(&[("ZONTOLOGIZE_TEST_DATABASE_URL", "x")]);
+        assert!(load_from(None, env).is_ok());
+    }
+
+    #[test]
     fn threads_zero_means_all_cores() {
         let env = vars(&[("ZONTOLOGIZE_EXTRACT__THREADS", "0")]);
         let config = load_from(None, env).unwrap();
@@ -1072,6 +1323,13 @@ mod tests {
         assert!(!is_identifier("1a"));
         assert!(!is_identifier("bad-name"));
         assert!(!is_identifier("Upper"));
+    }
+
+    #[test]
+    fn llm_tasks_cover_every_model_task() {
+        let models = load(None).unwrap().models;
+        let tasks: Vec<&str> = models.llm_tasks().iter().map(|(task, _)| *task).collect();
+        assert_eq!(tasks, ["fit", "extract", "classify", "attributes"]);
     }
 
     mod tempdir {

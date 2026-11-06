@@ -1,5 +1,7 @@
+use std::collections::{HashMap, HashSet};
+
 use anyhow::Result;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgConnection, PgPool};
 
 use super::copy_row;
 use crate::scan::chunk::Chunk;
@@ -214,6 +216,14 @@ pub async fn pages_of(pool: &PgPool, ids: &[i64]) -> Result<Vec<(i64, i32, Strin
     Ok(rows)
 }
 
+const CHUNK_FACTS: [&str; 5] = [
+    "mentions",
+    "class_mentions",
+    "relation_terms",
+    "attributes",
+    "llm_job_items",
+];
+
 pub async fn write_chunks(
     pool: &PgPool,
     content_id: i64,
@@ -222,43 +232,156 @@ pub async fn write_chunks(
     chunks: &[Chunk],
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    sqlx::query("delete from chunks where content_id = $1")
-        .bind(content_id)
+    let old: Vec<(i64, i32, String)> =
+        sqlx::query_as("select id, ord, text from chunks where content_id = $1 order by ord")
+            .bind(content_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let old_by_ord: HashMap<i32, (i64, &str)> = old
+        .iter()
+        .map(|(id, ord, text)| (*ord, (*id, text.as_str())))
+        .collect();
+    let mut changed = Vec::new();
+    let mut kept = Vec::new();
+    let mut fresh = Vec::new();
+    for chunk in chunks {
+        match old_by_ord.get(&chunk.ord) {
+            Some((id, text)) if *text == chunk.text => kept.push((*id, chunk)),
+            Some((id, _)) => changed.push((*id, chunk)),
+            None => fresh.push(chunk),
+        }
+    }
+    let new_ords: HashSet<i32> = chunks.iter().map(|c| c.ord).collect();
+    let removed: Vec<i64> = old
+        .iter()
+        .filter(|(_, ord, _)| !new_ords.contains(ord))
+        .map(|(id, _, _)| *id)
+        .collect();
+    let changed_ids: Vec<i64> = changed.iter().map(|(id, _)| *id).collect();
+    clear_chunk_facts(&mut tx, &changed_ids).await?;
+    let keep_in = kept
+        .iter()
+        .chain(&changed)
+        .max_by_key(|(_, chunk)| chunk.ord)
+        .map(|(id, _)| *id);
+    if let Some(target) = keep_in {
+        sqlx::query(
+            "update relations set chunk_id = $2, span_start = null, span_end = null \
+             where chunk_id = any($1) and status in ('confirmed', 'rejected')",
+        )
+        .bind(&removed)
+        .bind(target)
         .execute(&mut *tx)
         .await?;
-    if !chunks.is_empty() {
-        let id = content_id.to_string();
-        let mut data = String::new();
-        for chunk in chunks {
-            let ord = chunk.ord.to_string();
-            let from = chunk.page_from.map(|p| p.to_string());
-            let to = chunk.page_to.map(|p| p.to_string());
-            copy_row(
-                &mut data,
-                &[
-                    Some(&id),
-                    Some(&ord),
-                    from.as_deref(),
-                    to.as_deref(),
-                    Some(&chunk.text),
-                    Some(ts_config),
-                ],
-            );
-        }
-        let mut copy = tx
-            .copy_in_raw(
-                "copy chunks (content_id, ord, page_from, page_to, text, ts_config) from stdin",
-            )
-            .await?;
-        copy.send(data.into_bytes()).await?;
-        copy.finish().await?;
     }
+    sqlx::query("delete from chunks where id = any($1)")
+        .bind(&removed)
+        .execute(&mut *tx)
+        .await?;
+    update_chunks(&mut tx, &kept, ts_config, false).await?;
+    update_chunks(&mut tx, &changed, ts_config, true).await?;
+    insert_chunks(&mut tx, content_id, ts_config, &fresh).await?;
     sqlx::query("update contents set chunk_key = $2, rules_key = null where id = $1")
         .bind(content_id)
         .bind(key)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+async fn clear_chunk_facts(conn: &mut PgConnection, ids: &[i64]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    for table in CHUNK_FACTS {
+        let sql = format!("delete from {table} where chunk_id = any($1)");
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(ids)
+            .execute(&mut *conn)
+            .await?;
+    }
+    sqlx::query(
+        "delete from relations where chunk_id = any($1) and status in ('auto', 'proposed')",
+    )
+    .bind(ids)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query("update relations set span_start = null, span_end = null where chunk_id = any($1)")
+        .bind(ids)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+async fn update_chunks(
+    conn: &mut PgConnection,
+    rows: &[(i64, &Chunk)],
+    ts_config: &str,
+    reset: bool,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+    let from: Vec<Option<i32>> = rows.iter().map(|(_, c)| c.page_from).collect();
+    let to: Vec<Option<i32>> = rows.iter().map(|(_, c)| c.page_to).collect();
+    let texts: Vec<&str> = rows.iter().map(|(_, c)| c.text.as_str()).collect();
+    sqlx::query(
+        "update chunks k set page_from = u.page_from, page_to = u.page_to, text = u.text, \
+         ts_config = $5::regconfig, \
+         llm_key = case when $6 then null else k.llm_key end, \
+         attr_key = case when $6 then null else k.attr_key end \
+         from unnest($1::bigint[], $2::int[], $3::int[], $4::text[]) \
+         as u(id, page_from, page_to, text) \
+         where k.id = u.id and (k.text <> u.text or k.page_from is distinct from u.page_from \
+         or k.page_to is distinct from u.page_to or k.ts_config <> $5::regconfig)",
+    )
+    .bind(&ids)
+    .bind(&from)
+    .bind(&to)
+    .bind(&texts)
+    .bind(ts_config)
+    .bind(reset)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+async fn insert_chunks(
+    conn: &mut PgConnection,
+    content_id: i64,
+    ts_config: &str,
+    chunks: &[&Chunk],
+) -> Result<()> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    let id = content_id.to_string();
+    let mut data = String::new();
+    for chunk in chunks {
+        let ord = chunk.ord.to_string();
+        let from = chunk.page_from.map(|p| p.to_string());
+        let to = chunk.page_to.map(|p| p.to_string());
+        copy_row(
+            &mut data,
+            &[
+                Some(&id),
+                Some(&ord),
+                from.as_deref(),
+                to.as_deref(),
+                Some(&chunk.text),
+                Some(ts_config),
+            ],
+        );
+    }
+    let mut copy = conn
+        .copy_in_raw(
+            "copy chunks (content_id, ord, page_from, page_to, text, ts_config) from stdin",
+        )
+        .await?;
+    copy.send(data.into_bytes()).await?;
+    copy.finish().await?;
     Ok(())
 }
 

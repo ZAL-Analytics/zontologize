@@ -71,6 +71,30 @@ async fn drop_schema(schema: &str) {
     conn.close().await.unwrap();
 }
 
+struct Schema(String);
+
+impl Schema {
+    async fn new(test: &str) -> Schema {
+        let schema = schema_name(test);
+        drop_schema(&schema).await;
+        Schema(schema)
+    }
+}
+
+impl Drop for Schema {
+    fn drop(&mut self) {
+        let schema = self.0.clone();
+        let _ = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(drop_schema(&schema));
+        })
+        .join();
+    }
+}
+
 async fn tables_in(conn: &mut PgConnection, schema: &str) -> Vec<String> {
     sqlx::query_scalar(
         "select c.relname::text from pg_class c join pg_namespace n on n.oid = c.relnamespace \
@@ -105,32 +129,30 @@ async fn migrate(schema: &str) -> anyhow::Result<Vec<i64>> {
 #[tokio::test]
 #[ignore]
 async fn first_run_creates_schema_and_tables() {
-    let schema = schema_name("first");
-    drop_schema(&schema).await;
+    let guard = Schema::new("first").await;
+    let schema = guard.0.clone();
     let applied = migrate(&schema).await.unwrap();
     assert_eq!(applied, all_versions());
     let mut conn = admin().await;
     assert_eq!(tables_in(&mut conn, &schema).await, TABLES);
     conn.close().await.unwrap();
-    drop_schema(&schema).await;
 }
 
 #[tokio::test]
 #[ignore]
 async fn second_run_is_a_no_op() {
-    let schema = schema_name("second");
-    drop_schema(&schema).await;
+    let guard = Schema::new("second").await;
+    let schema = guard.0.clone();
     migrate(&schema).await.unwrap();
     let applied = migrate(&schema).await.unwrap();
     assert!(applied.is_empty());
-    drop_schema(&schema).await;
 }
 
 #[tokio::test]
 #[ignore]
 async fn pre_created_schema_is_used() {
-    let schema = schema_name("precreated");
-    drop_schema(&schema).await;
+    let guard = Schema::new("precreated").await;
+    let schema = guard.0.clone();
     let mut conn = admin().await;
     let sql = format!("create schema {}", db::quote_identifier(&schema));
     sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
@@ -151,21 +173,19 @@ async fn pre_created_schema_is_used() {
     tables.sort();
     assert_eq!(tables_in(&mut conn, &schema).await, tables);
     conn.close().await.unwrap();
-    drop_schema(&schema).await;
 }
 
 #[tokio::test]
 #[ignore]
 async fn nothing_is_created_outside_the_schema() {
-    let schema = schema_name("outside");
-    drop_schema(&schema).await;
+    let guard = Schema::new("outside").await;
+    let schema = guard.0.clone();
     let mut conn = admin().await;
     let before = objects_outside_test_schemas(&mut conn).await;
     migrate(&schema).await.unwrap();
     let after = objects_outside_test_schemas(&mut conn).await;
     assert_eq!(before, after);
     conn.close().await.unwrap();
-    drop_schema(&schema).await;
 }
 
 #[tokio::test]
@@ -225,4 +245,21 @@ async fn one_writer_per_schema() {
     let again = db::runs::lock(Some(&url), "lock_a").await.unwrap();
     again.release().await;
     other.release().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_released_lock_is_free_before_its_connection_closes() {
+    let url = test_url();
+    let mut held = db::connect(Some(&url), "lock_c").await.unwrap();
+    db::runs::take_lock(&mut held, "lock_c").await.unwrap();
+    assert!(db::runs::lock(Some(&url), "lock_c").await.is_err());
+    db::runs::unlock(&mut held, "lock_c").await.unwrap();
+    let next = db::runs::lock(Some(&url), "lock_c").await.unwrap();
+    db::close(held).await;
+    next.release().await;
+    for _ in 0..20 {
+        let lock = db::runs::lock(Some(&url), "lock_c").await.unwrap();
+        lock.release().await;
+    }
 }

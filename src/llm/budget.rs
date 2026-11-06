@@ -21,6 +21,7 @@ pub struct Calibration {
 pub struct Defaults {
     pub chars_per_token: f64,
     pub output_tokens: f64,
+    pub min_calls: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -43,7 +44,7 @@ pub fn estimate(
     defaults: Defaults,
     concurrency: usize,
 ) -> Estimate {
-    let calibrated = calibration.calls >= MIN_CALLS && calibration.chars > 0.0;
+    let calibrated = calibration.calls >= defaults.min_calls && calibration.chars > 0.0;
     let calls = calibration.calls.max(1) as f64;
     let tokens_per_char = if calibrated {
         calibration.input_tokens / calibration.chars
@@ -99,13 +100,15 @@ pub fn window_full(windows: &Windows, max_use: f64, now: DateTime<Utc>) -> Optio
 
 pub fn cap_reached(
     spent_usd: f64,
+    in_flight_usd: f64,
     requests: u64,
     max_usd: f64,
     max_requests: u64,
 ) -> Option<String> {
-    if max_usd > 0.0 && spent_usd >= max_usd {
+    if max_usd > 0.0 && spent_usd + in_flight_usd >= max_usd {
         return Some(format!(
-            "spent ${spent_usd:.4} of the ${max_usd:.4} cap; rerun with a higher --max-usd"
+            "spent ${spent_usd:.4} and about ${in_flight_usd:.4} in flight of the ${max_usd:.4} \
+             cap; rerun with a higher --max-usd"
         ));
     }
     if max_requests > 0 && requests >= max_requests {
@@ -125,6 +128,7 @@ mod tests {
     const DEFAULTS: Defaults = Defaults {
         chars_per_token: 4.0,
         output_tokens: 100.0,
+        min_calls: MIN_CALLS,
     };
 
     #[test]
@@ -167,6 +171,31 @@ mod tests {
     }
 
     #[test]
+    fn fewer_calibration_calls_still_calibrate() {
+        let calibration = Calibration {
+            calls: 5,
+            chars: 5_000.0,
+            input_tokens: 2_500.0,
+            output_tokens: 500.0,
+            cost_usd: 0.05,
+            seconds: 10.0,
+            ..Calibration::default()
+        };
+        let few = Defaults {
+            min_calls: MIN_CALLS.min(5),
+            ..DEFAULTS
+        };
+        assert!(!estimate(1, 100, &calibration, None, DEFAULTS, 1).calibrated);
+        assert!(estimate(1, 100, &calibration, None, few, 1).calibrated);
+    }
+
+    #[test]
+    fn in_flight_cost_counts_toward_the_cap() {
+        assert!(cap_reached(0.6, 0.0, 1, 1.0, 0).is_none());
+        assert!(cap_reached(0.6, 2.0 * 0.25, 1, 1.0, 0).is_some());
+    }
+
+    #[test]
     fn windows_needed_counts_the_current_one() {
         assert_eq!(windows_needed(0.1, 0.2, 0.8), 1);
         assert_eq!(windows_needed(0.7, 0.2, 0.8), 2);
@@ -203,13 +232,17 @@ mod tests {
 
     #[test]
     fn caps_stop_and_zero_means_none() {
-        assert!(cap_reached(0.5, 10, 0.0, 0).is_none());
-        assert!(cap_reached(0.5, 10, 0.5, 0).unwrap().contains("--max-usd"));
+        assert!(cap_reached(0.5, 0.0, 10, 0.0, 0).is_none());
         assert!(
-            cap_reached(0.1, 3, 1.0, 3)
+            cap_reached(0.5, 0.0, 10, 0.5, 0)
+                .unwrap()
+                .contains("--max-usd")
+        );
+        assert!(
+            cap_reached(0.1, 0.0, 3, 1.0, 3)
                 .unwrap()
                 .contains("--max-requests")
         );
-        assert!(cap_reached(0.1, 2, 1.0, 3).is_none());
+        assert!(cap_reached(0.1, 0.0, 2, 1.0, 3).is_none());
     }
 }

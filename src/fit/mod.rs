@@ -6,7 +6,6 @@ use std::collections::HashSet;
 use serde::Deserialize;
 
 use crate::facts::check::Haystack;
-pub use crate::llm::shortlist::{local_name, normalise};
 
 pub const TASK: &str = "fit";
 pub const NONE: &str = "none";

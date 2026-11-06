@@ -29,6 +29,10 @@ document_class = "acme:Document"
 [scan]
 batch_size = 1000
 hash_threads = 0
+extract_batch = 200
+chunk_batch = 200
+rules_batch = 100
+rules_threads = 0
 ignore = ["**/~$*", "**/.~lock.*#", "**/Thumbs.db", "**/.DS_Store"]
 
 [scan.kinds.pdf]
@@ -41,6 +45,10 @@ max_mb = 50
 
 [scan.kinds.sheet]
 extensions = ["xls", "xlsx", "csv"]
+max_mb = 50
+
+[scan.kinds.slides]
+extensions = ["ppt", "pptx", "odp"]
 max_mb = 50
 
 [scan.kinds.mail]
@@ -59,6 +67,7 @@ max_mb = 50
 max_chars = 2000
 overlap = 200
 text_search = "simple"
+threads = 0
 
 [models]
 fit = "claude-code:sonnet"
@@ -93,6 +102,12 @@ max_requests = 0
 calibration_calls = 200
 default_output_tokens = 300
 
+[llm]
+retry_backoff_secs = 2
+wait_margin_secs = 60
+unknown_reset_wait_minutes = 30
+progress_secs = 60
+
 [fit]
 sample = 200
 seed = "acme"
@@ -102,6 +117,7 @@ max_shortlist = 30
 min_evidence = 2
 proposal_namespace = "https://example.org/acme/proposal#"
 out = "fit"
+definition_chars = 200
 
 [llm_extract]
 min_chars = 100
@@ -119,18 +135,33 @@ confidence = 0.7
 resend_share = 0.2
 min_evidence = 1
 out = "extract"
+read_batch = 2000
+definition_chars = 200
+max_known = 0
+threads = 0
 
 [attributes]
 confidence = 0.7
 max_text_chars = 120
 max_properties = 30
+max_subjects = 50
 context_chars = 400
 out = "attributes"
+read_batch = 2000
+unit_symbols = 12
+sources = []
+doc_types = []
+paths = []
+seed = ""
+# resend_share = 0.2
+threads = 0
 
 [classify]
 head_chars = 1500
 min_chars = 50
 confidence = 0.7
+read_batch = 500
+definition_chars = 200
 
 [review]
 sample = 50
@@ -148,6 +179,8 @@ cache_dir = ""
 out = "eval"
 eval_sample = 500
 eval_max_expected = 20
+read_batch = 2000
+progress_secs = 30
 
 [embed.models."multilingual-e5-small"]
 max_tokens = 256
@@ -173,6 +206,7 @@ max_candidates = 5
 max_block = 1000
 block_chars = 4
 classes = []
+neighbour_batch = 500
 
 [resolve.similar]
 property = "urn:zontologize#similarTo"
@@ -181,6 +215,9 @@ min_shared = 2
 min_score = 0.8
 max_links = 5
 weights = { "acme:ratedPower" = 2.0, "acme:dischargePressure" = 1.0 }
+
+[export]
+ontology_iri = "urn:zontologize:ontology"
 
 [[sources]]
 name = "projects"

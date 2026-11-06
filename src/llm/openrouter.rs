@@ -1,12 +1,15 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::types::chrono::{DateTime, Utc};
 
-use super::{CallError, Reply, Request, Resume, Usage, Windows, retry_after};
+use super::{
+    CallError, ChatMessage, Reply, Request, Resume, Usage, Windows, messages, retry_after,
+};
 
 pub const KEY_VARIABLE: &str = "OPENROUTER_API_KEY";
+pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const SCHEMA_NAME: &str = "answer";
 
 pub struct OpenRouter {
@@ -30,8 +33,10 @@ pub struct Credit {
 
 #[derive(Deserialize)]
 struct ChatResponse {
+    #[serde(default)]
     choices: Vec<Choice>,
     usage: Option<ChatUsage>,
+    error: Option<ErrorDetail>,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +117,33 @@ struct Budget {
     resets_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct Body<'a> {
+    model: &'a str,
+    messages: [ChatMessage<'a>; 2],
+    response_format: ResponseFormat<'a>,
+    provider: Routing,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponseFormat<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    json_schema: JsonSchema<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonSchema<'a> {
+    name: &'static str,
+    strict: bool,
+    schema: &'a serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct Routing {
+    require_parameters: bool,
+}
+
 impl OpenRouter {
     pub fn new(base_url: &str, key: &str, model: &str, timeout: Duration) -> Result<OpenRouter> {
         let client = reqwest::Client::builder()
@@ -126,19 +158,22 @@ impl OpenRouter {
         })
     }
 
-    pub fn body(&self, request: &Request) -> serde_json::Value {
-        serde_json::json!({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": request.system},
-                {"role": "user", "content": request.user},
-            ],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {"name": SCHEMA_NAME, "strict": true, "schema": request.schema},
+    pub fn body<'a>(&'a self, request: &'a Request) -> Body<'a> {
+        Body {
+            model: &self.model,
+            messages: messages(request),
+            response_format: ResponseFormat {
+                kind: "json_schema",
+                json_schema: JsonSchema {
+                    name: SCHEMA_NAME,
+                    strict: true,
+                    schema: &request.schema,
+                },
             },
-            "provider": {"require_parameters": true},
-        })
+            provider: Routing {
+                require_parameters: true,
+            },
+        }
     }
 
     pub async fn send(&self, request: &Request) -> Result<Reply, CallError> {
@@ -168,35 +203,40 @@ impl OpenRouter {
             return Err(error_for(status, &text, after));
         }
         let chat: ChatResponse = serde_json::from_str(&text)
-            .map_err(|error| CallError::Invalid(format!("openrouter response: {error}")))?;
+            .map_err(|error| CallError::invalid(format!("openrouter response: {error}")))?;
+        let usage = chat.usage.as_ref().map_or_else(Usage::default, |u| Usage {
+            input_tokens: u.prompt_tokens,
+            cached_input_tokens: u
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.cached_tokens),
+            output_tokens: u.completion_tokens,
+            cost_usd: u.cost.unwrap_or(0.0),
+        });
         let Some(content) = chat
             .choices
             .into_iter()
             .next()
             .and_then(|c| c.message.content)
         else {
-            return Err(CallError::Invalid(
-                "openrouter returned no content".to_string(),
-            ));
+            let reason = chat.error.map_or("no content".to_string(), |e| e.message);
+            return Err(CallError::Retry {
+                after,
+                message: format!("openrouter returned no answer: {reason}"),
+            });
         };
         if serde_json::from_str::<serde::de::IgnoredAny>(&content).is_err() {
-            return Err(CallError::Invalid(format!(
-                "openrouter content is not JSON: {}",
-                content.chars().take(200).collect::<String>()
-            )));
+            return Err(CallError::Invalid {
+                message: format!(
+                    "openrouter content is not JSON: {}",
+                    content.chars().take(200).collect::<String>()
+                ),
+                usage,
+            });
         }
-        let usage = chat.usage;
         Ok(Reply {
             response: content,
-            usage: Usage {
-                input_tokens: usage.as_ref().map_or(0, |u| u.prompt_tokens),
-                cached_input_tokens: usage
-                    .as_ref()
-                    .and_then(|u| u.prompt_tokens_details.as_ref())
-                    .map_or(0, |d| d.cached_tokens),
-                output_tokens: usage.as_ref().map_or(0, |u| u.completion_tokens),
-                cost_usd: usage.and_then(|u| u.cost).unwrap_or(0.0),
-            },
+            usage,
             windows: Windows::default(),
             subscription: false,
         })
@@ -209,9 +249,10 @@ impl OpenRouter {
         let Some(entry) = list.data.into_iter().find(|m| m.id == self.model) else {
             anyhow::bail!("openrouter has no model {}", self.model);
         };
-        let input: f64 = entry.pricing.prompt.parse().unwrap_or(0.0);
-        let output: f64 = entry.pricing.completion.parse().unwrap_or(0.0);
-        Ok(Prices { input, output })
+        Ok(Prices {
+            input: price(&entry.pricing.prompt, &self.model)?,
+            output: price(&entry.pricing.completion, &self.model)?,
+        })
     }
 
     pub async fn credit(&self) -> Result<Credit> {
@@ -235,6 +276,13 @@ impl OpenRouter {
             anyhow::bail!("openrouter /{path}: HTTP {status}: {}", message_of(&text));
         }
         Ok(text)
+    }
+}
+
+fn price(text: &str, model: &str) -> Result<f64> {
+    match text.trim().parse::<f64>() {
+        Ok(value) if value.is_finite() && value >= 0.0 => Ok(value),
+        _ => anyhow::bail!("openrouter gives no usable price for {model}: {text:?}"),
     }
 }
 
@@ -267,7 +315,7 @@ fn message_of(text: &str) -> String {
         .unwrap_or_else(|_| text.chars().take(200).collect())
 }
 
-pub fn error_for(status: u16, text: &str, after: Option<Duration>) -> CallError {
+fn error_for(status: u16, text: &str, after: Option<Duration>) -> CallError {
     let body = serde_json::from_str::<ErrorBody>(text).ok();
     let message = body.as_ref().map_or_else(
         || text.chars().take(200).collect(),
@@ -371,7 +419,21 @@ mod tests {
             user: "u".to_string(),
             schema: serde_json::json!({"type": "object"}),
         };
-        let body = provider.body(&request);
+        let sent = serde_json::to_string(&provider.body(&request)).unwrap();
+        let before = serde_json::json!({
+            "model": "acme/model",
+            "messages": [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "u"},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": SCHEMA_NAME, "strict": true, "schema": request.schema},
+            },
+            "provider": {"require_parameters": true},
+        });
+        assert_eq!(sent, before.to_string());
+        let body: serde_json::Value = serde_json::from_str(&sent).unwrap();
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
         assert_eq!(body["provider"]["require_parameters"], true);
         assert_eq!(body["messages"][1]["content"], "u");

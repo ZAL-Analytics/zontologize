@@ -7,7 +7,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::Result;
-use sqlx::PgPool;
+use serde::Serialize;
+use sqlx::{PgConnection, PgPool};
 
 use crate::config::Config;
 use crate::db;
@@ -18,9 +19,8 @@ use crate::rules::Rules;
 pub const METHOD: &str = "resolve";
 const AUTO: &str = "auto";
 const PROPOSED: &str = "proposed";
-const NEIGHBOUR_BATCH: usize = 500;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Stats {
     pub added: BTreeMap<String, u64>,
     pub removed: u64,
@@ -74,12 +74,15 @@ pub fn method(rule: &str) -> String {
 
 pub async fn run(config_dir: Option<&Path>, url: Option<&str>) -> Result<Stats> {
     let config = crate::config::load(config_dir)?;
-    let ontology = crate::embed::run::load_ontology(config_dir, &config)?;
+    let ontology = crate::ontology::load_or_empty(config_dir, &config.ontology)?;
     let rules = crate::rules::load(config_dir, &ontology, &config.ontology.document_class)?;
-    let _lock = db::runs::lock(url, &config.database.schema).await?;
+    let lock = db::runs::lock(url, &config.database.schema).await?;
     let pool = db::pool::connect(url, &config.database.schema, 2).await?;
-    let result = run_with(&pool, &config, &ontology, &rules).await;
+    let hash = crate::config::hash(&config)?;
+    let work = run_with(&pool, &config, &ontology, &rules);
+    let result = db::runs::track(&pool, &hash, METHOD, work).await;
     pool.close().await;
+    lock.release().await;
     result
 }
 
@@ -145,25 +148,7 @@ fn name_pairs(
             }
         }
     }
-    let mut groups: BTreeMap<&str, Vec<&Eligible>> = BTreeMap::new();
-    for item in items.iter().filter(|e| !e.key.is_empty()) {
-        groups.entry(&item.key).or_default().push(item);
-    }
-    for group in groups.values() {
-        for (i, item) in group.iter().enumerate() {
-            let first = group[..i]
-                .iter()
-                .find(|e| names::compatible(ontology, &e.row.class_iri, &item.row.class_iri));
-            if let Some(first) = first {
-                let candidate = Candidate {
-                    rule: "name",
-                    status: AUTO,
-                    score: 1.0,
-                };
-                offer(&mut pairs, first.row.id, item.row.id, candidate);
-            }
-        }
-    }
+    exact_pairs(items, ontology, &mut pairs);
     for block in names::blocks(items, |e| &e.key, config.resolve.block_chars).values() {
         if block.len() > config.resolve.max_block {
             continue;
@@ -192,6 +177,37 @@ fn name_pairs(
     pairs
 }
 
+fn exact_pairs(
+    items: &[Eligible],
+    ontology: &Ontology,
+    pairs: &mut BTreeMap<(i64, i64), Candidate>,
+) {
+    let mut groups: BTreeMap<&str, Vec<&Eligible>> = BTreeMap::new();
+    for item in items.iter().filter(|e| !e.key.is_empty()) {
+        groups.entry(&item.key).or_default().push(item);
+    }
+    for group in groups.values() {
+        let mut firsts: Vec<&Eligible> = Vec::new();
+        for item in group {
+            let first = firsts
+                .iter()
+                .find(|e| names::compatible(ontology, &e.row.class_iri, &item.row.class_iri))
+                .copied();
+            if !firsts.iter().any(|e| e.row.class_iri == item.row.class_iri) {
+                firsts.push(item);
+            }
+            if let Some(first) = first {
+                let candidate = Candidate {
+                    rule: "name",
+                    status: AUTO,
+                    score: 1.0,
+                };
+                offer(pairs, first.row.id, item.row.id, candidate);
+            }
+        }
+    }
+}
+
 async fn embed_pairs(
     pool: &PgPool,
     items: &[Eligible<'_>],
@@ -211,7 +227,7 @@ async fn embed_pairs(
     let keys: HashMap<i64, &str> = items.iter().map(|e| (e.row.id, e.key.as_str())).collect();
     let ids: Vec<i64> = items.iter().map(|e| e.row.id).collect();
     let mut found = Vec::new();
-    for batch in ids.chunks(NEIGHBOUR_BATCH) {
+    for batch in ids.chunks(config.resolve.neighbour_batch) {
         let k = config.resolve.max_candidates as i64;
         found.extend(db::resolve::neighbours(pool, model_id, dimensions, batch, k).await?);
     }
@@ -244,7 +260,18 @@ async fn embed_pairs(
     Ok(None)
 }
 
-fn new_same_as(key: (i64, i64), candidate: &Candidate) -> NewLink {
+type Sources = HashMap<i64, (Option<i64>, Option<i64>)>;
+
+fn new_same_as(key: (i64, i64), candidate: &Candidate, sources: &Sources) -> NewLink {
+    let of = |id: i64| sources.get(&id).copied().unwrap_or_default();
+    let (a, b) = (of(key.0), of(key.1));
+    let chunk_id = a.0.or(b.0);
+    let document_id = if chunk_id.is_none() {
+        a.1.or(b.1)
+    } else {
+        None
+    };
+    let chunks: BTreeSet<i64> = [a.0, b.0].into_iter().flatten().collect();
     NewLink {
         src_id: key.0,
         dst_id: key.1,
@@ -252,20 +279,42 @@ fn new_same_as(key: (i64, i64), candidate: &Candidate) -> NewLink {
         method: method(candidate.rule),
         status: candidate.status,
         confidence: candidate.score,
-        props: serde_json::json!({"rule": candidate.rule, "score": candidate.score}),
-        document_id: None,
-        chunk_id: None,
+        props: serde_json::json!({
+            "rule": candidate.rule,
+            "score": candidate.score,
+            "chunks": chunks,
+        }),
+        document_id,
+        chunk_id,
         span_start: None,
         span_end: None,
     }
 }
 
+fn same_link(link: &Link, wanted: &NewLink) -> bool {
+    wanted.method == link.method
+        && wanted.status == link.status
+        && wanted.chunk_id == link.chunk_id
+        && wanted.document_id == link.document_id
+}
+
 async fn write_same_as(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     pairs: &BTreeMap<(i64, i64), Candidate>,
     stats: &mut Stats,
 ) -> Result<()> {
-    let existing = db::resolve::links(pool, SAME_AS).await?;
+    let ids: Vec<i64> = pairs
+        .keys()
+        .flat_map(|&(a, b)| [a, b])
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let sources = db::resolve::provenance(&mut *conn, &ids).await?;
+    let wanted: BTreeMap<(i64, i64), NewLink> = pairs
+        .iter()
+        .map(|(key, candidate)| (*key, new_same_as(*key, candidate, &sources)))
+        .collect();
+    let existing = db::resolve::links(&mut *conn, SAME_AS).await?;
     let mut settled = BTreeSet::new();
     let mut remove = Vec::new();
     for link in &existing {
@@ -275,9 +324,11 @@ async fn write_same_as(
             stats.kept += 1;
             continue;
         }
-        let same = pairs
-            .get(&key)
-            .is_some_and(|c| method(c.rule) == link.method && c.status == link.status);
+        if !link.method.starts_with(&method("")) {
+            settled.insert(key);
+            continue;
+        }
+        let same = wanted.get(&key).is_some_and(|w| same_link(link, w));
         if same && settled.insert(key) {
             stats.kept += 1;
         } else {
@@ -285,16 +336,16 @@ async fn write_same_as(
         }
     }
     let mut add = Vec::new();
-    for (key, candidate) in pairs {
-        if settled.contains(key) {
+    for (key, link) in wanted {
+        if settled.contains(&key) {
             continue;
         }
-        add.push(new_same_as(*key, candidate));
-        *stats.added.entry(method(candidate.rule)).or_default() += 1;
+        *stats.added.entry(link.method.clone()).or_default() += 1;
+        add.push(link);
     }
     stats.removed += remove.len() as u64;
-    db::resolve::delete(pool, &remove).await?;
-    db::resolve::insert(pool, &add).await?;
+    db::resolve::delete(&mut *conn, &remove).await?;
+    db::resolve::insert(&mut *conn, &add).await?;
     Ok(())
 }
 
@@ -331,8 +382,27 @@ pub fn clusters(ids: &[i64], links: &[(i64, i64)]) -> HashMap<i64, i64> {
 }
 
 pub async fn canonical(pool: &PgPool, stats: &mut Stats) -> Result<()> {
-    let entities = db::resolve::entities(pool).await?;
-    let links: Vec<(i64, i64)> = db::resolve::links(pool, SAME_AS)
+    let mut tx = pool.begin().await?;
+    let entities = db::resolve::entities(&mut *tx).await?;
+    canonical_with(&mut tx, &entities, stats).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+fn changed_roots(entities: &[EntityRow], roots: &HashMap<i64, i64>) -> (Vec<i64>, Vec<i64>) {
+    entities
+        .iter()
+        .filter(|e| e.canonical_id != Some(roots[&e.id]))
+        .map(|e| (e.id, roots[&e.id]))
+        .unzip()
+}
+
+async fn canonical_with(
+    conn: &mut PgConnection,
+    entities: &[EntityRow],
+    stats: &mut Stats,
+) -> Result<()> {
+    let links: Vec<(i64, i64)> = db::resolve::links(&mut *conn, SAME_AS)
         .await?
         .into_iter()
         .filter(|l| l.status == AUTO || l.status == "confirmed")
@@ -340,8 +410,8 @@ pub async fn canonical(pool: &PgPool, stats: &mut Stats) -> Result<()> {
         .collect();
     let ids: Vec<i64> = entities.iter().map(|e| e.id).collect();
     let roots = clusters(&ids, &links);
-    let canonical: Vec<i64> = ids.iter().map(|id| roots[id]).collect();
-    stats.canonical_changed += db::resolve::set_canonical(pool, &ids, &canonical).await?;
+    let (changed, canonical) = changed_roots(entities, &roots);
+    stats.canonical_changed += db::resolve::set_canonical(&mut *conn, &changed, &canonical).await?;
     let names: HashMap<i64, &str> = entities.iter().map(|e| (e.id, e.name.as_str())).collect();
     let mut wanted: BTreeSet<(i64, String)> = BTreeSet::new();
     let mut sizes: HashMap<i64, u64> = HashMap::new();
@@ -352,15 +422,15 @@ pub async fn canonical(pool: &PgPool, stats: &mut Stats) -> Result<()> {
         }
     }
     stats.clusters = sizes.values().filter(|&&n| n > 1).count() as u64;
-    let have: BTreeSet<(i64, String)> = db::resolve::resolve_aliases(pool, METHOD)
+    let have: BTreeSet<(i64, String)> = db::resolve::resolve_aliases(&mut *conn, METHOD)
         .await?
         .into_iter()
         .collect();
     let add: Vec<(i64, String)> = wanted.difference(&have).cloned().collect();
     let remove: Vec<(i64, String)> = have.difference(&wanted).cloned().collect();
-    stats.aliases_added += db::resolve::add_aliases(pool, &add, METHOD).await?;
+    stats.aliases_added += db::resolve::add_aliases(&mut *conn, &add, METHOD).await?;
     stats.aliases_removed += remove.len() as u64;
-    db::resolve::remove_aliases(pool, &remove, METHOD).await?;
+    db::resolve::remove_aliases(&mut *conn, &remove, METHOD).await?;
     Ok(())
 }
 
@@ -373,14 +443,14 @@ fn new_key(link: &NewLink) -> (i64, i64, Option<i64>, Option<i64>) {
 }
 
 async fn write_document_links(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     property: &'static str,
     rule: &str,
     wanted: Vec<NewLink>,
     stats: &mut Stats,
 ) -> Result<()> {
     let method = method(rule);
-    let existing: Vec<Link> = db::resolve::links(pool, property)
+    let existing: Vec<Link> = db::resolve::links(&mut *conn, property)
         .await?
         .into_iter()
         .filter(|l| l.method == method)
@@ -399,13 +469,13 @@ async fn write_document_links(
         .collect();
     *stats.added.entry(method).or_default() += add.len() as u64;
     stats.removed += remove.len() as u64;
-    db::resolve::delete(pool, &remove).await?;
-    db::resolve::insert(pool, &add).await?;
+    db::resolve::delete(&mut *conn, &remove).await?;
+    db::resolve::insert(&mut *conn, &add).await?;
     Ok(())
 }
 
 async fn document_links(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     ontology: &Ontology,
     rules: &Rules,
     stats: &mut Stats,
@@ -416,7 +486,7 @@ async fn document_links(
         .filter(|iri| rules.is_document_class(ontology, iri))
         .cloned()
         .collect();
-    let references = db::resolve::references(pool, &classes)
+    let references = db::resolve::references(&mut *conn, &classes)
         .await?
         .into_iter()
         .map(|r| NewLink {
@@ -433,8 +503,8 @@ async fn document_links(
             span_end: Some(r.span_end),
         })
         .collect();
-    write_document_links(pool, REFERENCES, "references", references, stats).await?;
-    let documents = db::resolve::document_entities(pool).await?;
+    write_document_links(conn, REFERENCES, "references", references, stats).await?;
+    let documents = db::resolve::document_entities(&mut *conn).await?;
     let revisions = documents::chains(&documents, &rules.revisions)
         .into_iter()
         .map(|(newer, older)| NewLink {
@@ -451,7 +521,7 @@ async fn document_links(
             span_end: None,
         })
         .collect();
-    write_document_links(pool, REPLACES, "revisions", revisions, stats).await
+    write_document_links(conn, REPLACES, "revisions", revisions, stats).await
 }
 
 pub async fn run_with(
@@ -466,10 +536,18 @@ pub async fn run_with(
     let items = eligible(&entities, config, ontology, rules);
     let mut pairs = name_pairs(&items, &entities, config, ontology, rules);
     stats.embed_skipped = embed_pairs(pool, &items, config, &mut pairs).await?;
-    write_same_as(pool, &pairs, &mut stats).await?;
-    canonical(pool, &mut stats).await?;
-    document_links(pool, ontology, rules, &mut stats).await?;
-    similar::write(pool, config, ontology, &mut stats).await?;
+    let mut tx = pool.begin().await?;
+    write_same_as(&mut tx, &pairs, &mut stats).await?;
+    tx.commit().await?;
+    let mut tx = pool.begin().await?;
+    canonical_with(&mut tx, &entities, &mut stats).await?;
+    tx.commit().await?;
+    let mut tx = pool.begin().await?;
+    document_links(&mut tx, ontology, rules, &mut stats).await?;
+    tx.commit().await?;
+    let mut tx = pool.begin().await?;
+    similar::write(&mut tx, config, ontology, &mut stats).await?;
+    tx.commit().await?;
     stats.seconds = started.elapsed().as_secs_f64();
     Ok(stats)
 }
@@ -485,6 +563,53 @@ mod tests {
         assert_eq!(roots[&4], 2);
         assert_eq!(roots[&1], 1);
         assert_eq!(roots[&3], 3);
+    }
+
+    #[test]
+    fn same_as_links_take_a_mention_chunk_of_either_side() {
+        let candidate = Candidate {
+            rule: "name",
+            status: AUTO,
+            score: 1.0,
+        };
+        let sources: Sources = HashMap::from([
+            (1, (None, Some(50))),
+            (2, (Some(7), Some(51))),
+            (3, (Some(9), None)),
+        ]);
+        let link = new_same_as((1, 2), &candidate, &sources);
+        assert_eq!((link.chunk_id, link.document_id), (Some(7), None));
+        assert_eq!(link.props["chunks"], serde_json::json!([7]));
+        let link = new_same_as((2, 3), &candidate, &sources);
+        assert_eq!((link.chunk_id, link.document_id), (Some(7), None));
+        assert_eq!(link.props["chunks"], serde_json::json!([7, 9]));
+        let link = new_same_as((1, 4), &candidate, &sources);
+        assert_eq!((link.chunk_id, link.document_id), (None, Some(50)));
+        let link = new_same_as((4, 5), &candidate, &sources);
+        assert_eq!((link.chunk_id, link.document_id), (None, None));
+    }
+
+    #[test]
+    fn only_changed_canonical_ids_are_written() {
+        let row = |id: i64, canonical_id: Option<i64>| EntityRow {
+            id,
+            class_iri: "c".to_string(),
+            key: id.to_string(),
+            name: id.to_string(),
+            document_id: None,
+            canonical_id,
+        };
+        let entities = [
+            row(1, Some(1)),
+            row(2, None),
+            row(3, Some(3)),
+            row(4, Some(1)),
+        ];
+        let roots = clusters(&[1, 2, 3, 4], &[(1, 3)]);
+        assert_eq!(
+            changed_roots(&entities, &roots),
+            (vec![2, 3, 4], vec![2, 1, 4])
+        );
     }
 
     #[test]
@@ -516,5 +641,34 @@ mod tests {
         assert_eq!(pairs[&(1, 2)], name);
         offer(&mut pairs, 3, 3, name);
         assert_eq!(pairs.len(), 1);
+    }
+
+    #[test]
+    fn equal_names_pair_with_the_first_compatible_entity() {
+        let ontology = crate::rules::tests::ontology();
+        let class = |name: &str| format!("http://example.org/onto#{name}");
+        let rows: Vec<EntityRow> = ["Project", "Report", "Document", "Report", "Project"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| EntityRow {
+                id: i as i64 + 1,
+                class_iri: class(name),
+                key: format!("k{i}"),
+                name: "same".to_string(),
+                document_id: None,
+                canonical_id: None,
+            })
+            .collect();
+        let items: Vec<Eligible> = rows
+            .iter()
+            .map(|row| Eligible {
+                row,
+                key: "same".to_string(),
+            })
+            .collect();
+        let mut pairs = BTreeMap::new();
+        exact_pairs(&items, &ontology, &mut pairs);
+        let found: Vec<(i64, i64)> = pairs.keys().copied().collect();
+        assert_eq!(found, [(1, 5), (2, 3), (2, 4)]);
     }
 }

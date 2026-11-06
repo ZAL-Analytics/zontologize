@@ -32,7 +32,7 @@ fn parts(text: &str) -> Vec<Part> {
     out
 }
 
-pub fn natural_cmp(a: &str, b: &str) -> Ordering {
+fn natural_cmp(a: &str, b: &str) -> Ordering {
     let (left, right) = (parts(a), parts(b));
     for (x, y) in left.iter().zip(&right) {
         let order = match (x, y) {

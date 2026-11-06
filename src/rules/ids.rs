@@ -1,12 +1,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use regex::{Regex, RegexSet};
+use regex_syntax::hir::{Class, ClassUnicode, ClassUnicodeRange, Hir, HirKind};
 use serde::Deserialize;
 
 use super::{EntityHit, KeyCase};
 use crate::ontology::Ontology;
 
 const KEY_GROUP: &str = "key";
+const MAX_CONFUSED: usize = 8;
 pub const OCR_METHOD: &str = "regex-ocr";
 
 pub type KnownKeys = HashMap<String, HashSet<String>>;
@@ -50,15 +52,59 @@ impl Confusions {
         Ok(Confusions { map })
     }
 
-    pub fn normalise(&self, text: &str) -> Option<String> {
-        if !text.chars().any(|c| self.map.contains_key(&c)) {
-            return None;
+    fn widen(&self, pattern: &str) -> Result<String, String> {
+        let hir = regex_syntax::parse(pattern).map_err(|e| e.to_string())?;
+        Ok(self.widen_hir(hir).to_string())
+    }
+
+    fn widen_hir(&self, hir: Hir) -> Hir {
+        match hir.into_kind() {
+            HirKind::Literal(literal) => match std::str::from_utf8(&literal.0) {
+                Ok(text) => Hir::concat(
+                    text.chars()
+                        .map(|c| {
+                            self.widen_class(ClassUnicode::new([ClassUnicodeRange::new(c, c)]))
+                        })
+                        .collect(),
+                ),
+                Err(_) => Hir::literal(literal.0),
+            },
+            HirKind::Class(Class::Unicode(class)) => self.widen_class(class),
+            HirKind::Class(class) => Hir::class(class),
+            HirKind::Repetition(mut repetition) => {
+                repetition.sub = Box::new(self.widen_hir(*repetition.sub));
+                Hir::repetition(repetition)
+            }
+            HirKind::Capture(mut capture) => {
+                capture.sub = Box::new(self.widen_hir(*capture.sub));
+                Hir::capture(capture)
+            }
+            HirKind::Concat(subs) => {
+                Hir::concat(subs.into_iter().map(|h| self.widen_hir(h)).collect())
+            }
+            HirKind::Alternation(subs) => {
+                Hir::alternation(subs.into_iter().map(|h| self.widen_hir(h)).collect())
+            }
+            HirKind::Look(look) => Hir::look(look),
+            HirKind::Empty => Hir::empty(),
         }
-        Some(
-            text.chars()
-                .map(|c| self.map.get(&c).copied().unwrap_or(c))
-                .collect(),
-        )
+    }
+
+    fn widen_class(&self, mut class: ClassUnicode) -> Hir {
+        let accepts = |c: char| {
+            class
+                .ranges()
+                .iter()
+                .any(|r| r.start() <= c && c <= r.end())
+        };
+        let extra: Vec<ClassUnicodeRange> = self
+            .map
+            .iter()
+            .filter(|(_, to)| accepts(**to))
+            .map(|(from, _)| ClassUnicodeRange::new(*from, *from))
+            .collect();
+        class.union(&ClassUnicode::new(extra));
+        Hir::class(Class::Unicode(class))
     }
 }
 
@@ -85,17 +131,23 @@ pub struct IdPatternSpec {
 struct IdPattern {
     class: String,
     regex: Regex,
+    tolerant: Regex,
     key_case: KeyCase,
     on: On,
 }
 
 pub struct IdPatterns {
     set: RegexSet,
+    tolerant: RegexSet,
     patterns: Vec<IdPattern>,
 }
 
 impl IdPatterns {
-    pub fn compile(specs: &[IdPatternSpec], ontology: &Ontology) -> Result<IdPatterns, String> {
+    pub fn compile(
+        specs: &[IdPatternSpec],
+        ontology: &Ontology,
+        confusions: &Confusions,
+    ) -> Result<IdPatterns, String> {
         let mut patterns = Vec::new();
         for (index, spec) in specs.iter().enumerate() {
             let class = ontology
@@ -103,16 +155,27 @@ impl IdPatterns {
                 .map_err(|e| format!("id_patterns[{index}]: {e}"))?;
             let regex = Regex::new(&spec.pattern)
                 .map_err(|e| format!("id_patterns[{index}].pattern: {e}"))?;
+            let tolerant = confusions
+                .widen(&spec.pattern)
+                .and_then(|p| Regex::new(&p).map_err(|e| e.to_string()))
+                .map_err(|e| format!("id_patterns[{index}].pattern: {e}"))?;
             patterns.push(IdPattern {
                 class: class.iri.clone(),
                 regex,
+                tolerant,
                 key_case: spec.key_case,
                 on: spec.on,
             });
         }
         let set = RegexSet::new(specs.iter().map(|s| &s.pattern))
             .map_err(|e| format!("id_patterns: {e}"))?;
-        Ok(IdPatterns { set, patterns })
+        let tolerant = RegexSet::new(patterns.iter().map(|p| p.tolerant.as_str()))
+            .map_err(|e| format!("id_patterns: {e}"))?;
+        Ok(IdPatterns {
+            set,
+            tolerant,
+            patterns,
+        })
     }
 
     pub fn find(&self, text: &str, on: On) -> Vec<EntityHit> {
@@ -136,7 +199,7 @@ impl IdPatterns {
                     key,
                     start: found.start(),
                     end: found.end(),
-                    method: "regex",
+                    method: super::REGEX_METHOD,
                     confidence: 1.0,
                 });
             }
@@ -152,33 +215,94 @@ impl IdPatterns {
         exact: &[EntityHit],
     ) -> Tolerant {
         let mut result = Tolerant::default();
-        let Some(normalised) = confusions.normalise(text) else {
+        if !text.chars().any(|c| confusions.map.contains_key(&c)) {
             return result;
-        };
-        for mut hit in self.find(&normalised, On::Text) {
-            let covered = exact
-                .iter()
-                .any(|e| e.class == hit.class && e.start < hit.end && hit.start < e.end);
-            if covered {
+        }
+        for index in self.tolerant.matches(text).iter() {
+            let pattern = &self.patterns[index];
+            if pattern.on == On::Path {
                 continue;
             }
-            if !known
-                .get(&hit.class)
-                .is_some_and(|keys| keys.contains(&hit.key))
-            {
-                result.rejected += 1;
-                continue;
+            for found in pattern.tolerant.find_iter(text) {
+                let Some(mut hit) = pattern.swapped(text, found.range(), confusions) else {
+                    continue;
+                };
+                let covered = exact
+                    .iter()
+                    .any(|e| e.class == hit.class && e.start < hit.end && hit.start < e.end);
+                if covered {
+                    continue;
+                }
+                if !known
+                    .get(&hit.class)
+                    .is_some_and(|keys| keys.contains(&hit.key))
+                {
+                    result.rejected += 1;
+                    continue;
+                }
+                hit.method = OCR_METHOD;
+                result.hits.push(hit);
             }
-            hit.method = OCR_METHOD;
-            result.hits.push(hit);
         }
         result
     }
 }
 
+impl IdPattern {
+    fn swapped(
+        &self,
+        text: &str,
+        span: std::ops::Range<usize>,
+        confusions: &Confusions,
+    ) -> Option<EntityHit> {
+        let confused: Vec<(usize, char)> = text[span.clone()]
+            .char_indices()
+            .filter_map(|(at, c)| Some((span.start + at, *confusions.map.get(&c)?)))
+            .collect();
+        if confused.is_empty() || confused.len() > MAX_CONFUSED {
+            return None;
+        }
+        let mut masks: Vec<u32> = (1..1u32 << confused.len()).collect();
+        masks.sort_by_key(|m| std::cmp::Reverse(m.count_ones()));
+        for mask in masks {
+            let mut candidate = text.to_string();
+            for (bit, (at, to)) in confused.iter().enumerate() {
+                if mask & (1 << bit) != 0 {
+                    let width = to.len_utf8();
+                    candidate.replace_range(*at..*at + width, to.encode_utf8(&mut [0; 4]));
+                }
+            }
+            let Some(captures) = self.regex.captures_at(&candidate, span.start) else {
+                continue;
+            };
+            let Some(whole) = captures.get(0) else {
+                continue;
+            };
+            if whole.range() != span {
+                continue;
+            }
+            let found = captures.name(KEY_GROUP).unwrap_or(whole);
+            let key = self.key_case.apply(found.as_str());
+            if key.is_empty() {
+                return None;
+            }
+            return Some(EntityHit {
+                class: self.class.clone(),
+                name: key.clone(),
+                key,
+                start: found.start(),
+                end: found.end(),
+                method: super::REGEX_METHOD,
+                confidence: 1.0,
+            });
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::tests::rules;
+    use super::super::tests::{CONFUSIONS, rules};
     use super::*;
 
     const PATTERNS: &str = r#"
@@ -247,19 +371,44 @@ on = "path"
     }
 
     const PROJECT: &str = "http://example.org/onto#Project";
+    const DRAWING_CLASS: &str = "http://example.org/onto#Valve";
+    const DRAWING: &str = r#"
+[[id_patterns]]
+class = "ex:Valve"
+pattern = '\bDWG-\d{3}-[A-Z]\d\b'
+"#;
 
     #[test]
-    fn normalising_keeps_offsets() {
-        let text = "é P-2O24-0l17 dóne";
-        let normalised = confusions().normalise(text).unwrap();
-        assert_eq!(normalised.len(), text.len());
-        assert_eq!(&normalised[3..14], "P-2024-0117");
-        assert_eq!(confusions().normalise("P-2024-0117"), None);
+    fn only_positions_that_take_a_digit_are_swapped() {
+        let rules = rules(&format!("{CONFUSIONS}{DRAWING}")).unwrap();
+        let text = "tekening DWG-1O2-B1 rev";
+        let exact = rules.ids.find(text, On::Text);
+        assert!(exact.is_empty());
+        let found = rules.ids.find_tolerant(
+            text,
+            &confusions(),
+            &known(DRAWING_CLASS, "DWG-102-B1"),
+            &exact,
+        );
+        assert_eq!(found.rejected, 0);
+        assert_eq!(found.hits.len(), 1);
+        let hit = &found.hits[0];
+        assert_eq!(hit.key, "DWG-102-B1");
+        assert_eq!(&text[hit.start..hit.end], "DWG-1O2-B1");
+    }
+
+    #[test]
+    fn widened_pattern_accepts_confusions_only_for_digits() {
+        let widened = confusions().widen(r"[A-Z]\d0").unwrap();
+        let regex = Regex::new(&widened).unwrap();
+        assert!(regex.is_match("BOO"));
+        assert!(regex.is_match("BIo"));
+        assert!(!regex.is_match("0OO"));
     }
 
     #[test]
     fn confused_id_matches_a_known_key() {
-        let rules = rules(PATTERNS).unwrap();
+        let rules = rules(&format!("{CONFUSIONS}{PATTERNS}")).unwrap();
         let text = "werkbon P-2O24-0l17 klaar";
         let exact = rules.ids.find(text, On::Text);
         assert!(exact.is_empty());
@@ -276,7 +425,7 @@ on = "path"
 
     #[test]
     fn unknown_key_is_rejected() {
-        let rules = rules(PATTERNS).unwrap();
+        let rules = rules(&format!("{CONFUSIONS}{PATTERNS}")).unwrap();
         let found = rules.ids.find_tolerant(
             "werkbon P-2O24-0l18",
             &confusions(),

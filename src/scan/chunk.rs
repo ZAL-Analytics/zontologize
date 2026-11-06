@@ -34,18 +34,21 @@ impl ChunkSettings {
                 chunker_type,
                 ..ChunkingConfig::default()
             },
-            key: format!(
-                "chunk-v{STAGE_VERSION} {} {} {} {}",
-                chunk.max_chars,
-                chunk.overlap,
-                format.as_str(),
-                chunk.text_search
+            key: crate::hash::stage_key(
+                "chunk",
+                STAGE_VERSION,
+                &[
+                    &chunk.max_chars.to_string(),
+                    &chunk.overlap.to_string(),
+                    format.as_str(),
+                    &chunk.text_search,
+                ],
             ),
         }
     }
 }
 
-pub fn join_pages(pages: &[(i32, String)]) -> (String, Vec<PageBoundary>) {
+fn join_pages(pages: &[(i32, String)]) -> (String, Vec<PageBoundary>) {
     let mut text = String::new();
     let mut boundaries = Vec::new();
     for (page_no, page) in pages {
@@ -97,6 +100,7 @@ mod tests {
                 max_chars,
                 overlap: 0,
                 text_search: "simple".to_string(),
+                threads: 1,
             },
             TextFormat::Markdown,
         )

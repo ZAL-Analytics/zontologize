@@ -1,18 +1,23 @@
 pub mod attributes;
 pub mod classify;
 pub mod config;
+pub mod cpu;
 pub mod db;
 pub mod embed;
 pub mod export;
 pub mod facts;
 pub mod fit;
 pub mod graph;
+pub mod hash;
 pub mod llm;
+pub mod ns;
 pub mod ontology;
 pub mod resolve;
 pub mod review;
 pub mod rules;
 pub mod scan;
+pub mod status;
+pub mod text;
 pub mod units;
 
 use std::path::Path;
@@ -32,6 +37,7 @@ pub async fn db_migrate(config_dir: Option<&Path>) -> Result<ExitCode> {
         anyhow::Ok(applied)
     }
     .await;
+    let _ = db::runs::unlock(&mut conn, schema).await;
     db::close(conn).await;
     let applied = result?;
     if applied.is_empty() {
@@ -161,6 +167,9 @@ pub async fn ontology_export(config_dir: Option<&Path>, out: &Path) -> Result<Ex
 
 pub async fn graph_sync(config_dir: Option<&Path>) -> Result<ExitCode> {
     let stats = graph::sync(config_dir, database_url().as_deref()).await?;
+    if stats.unchanged {
+        println!("graph sync: entities, relations and labels unchanged since the last sync");
+    }
     println!(
         "graph sync: {} vertices, {} edges, {} labels; {:.1} s",
         stats.vertices, stats.edges, stats.labels, stats.seconds
@@ -300,16 +309,21 @@ pub async fn models_check(
     claude_program: std::path::PathBuf,
 ) -> Result<ExitCode> {
     let config = config::load(config_dir)?;
-    let tasks = [("fit", &config.models.fit)];
     let pool = db::pool::connect(database_url().as_deref(), &config.database.schema, 1)
         .await
         .ok();
     let mut failed = false;
-    for (task, model) in tasks {
+    let mut checked: Vec<(&str, &str)> = Vec::new();
+    for (task, model) in config.models.llm_tasks() {
         if model.is_empty() {
             println!("{task}: no model configured");
             continue;
         }
+        if let Some((first, _)) = checked.iter().find(|(_, m)| *m == model) {
+            println!("{task} {model}: same model as {first}");
+            continue;
+        }
+        checked.push((task, model));
         let name =
             llm::ModelName::parse(model).map_err(|e| anyhow::anyhow!("models.{task}: {e}"))?;
         match check_model(&config, &name, claude_program.clone(), pool.as_ref()).await {
@@ -334,8 +348,9 @@ pub async fn models_check(
     })
 }
 
-const CHECK_SYSTEM: &str = "Answer with the JSON schema.";
-const CHECK_INPUT: &str = "Say ok.";
+const CHECK_SYSTEM: &str = include_str!("../prompts/check-system.md");
+const CHECK_USER: &str = include_str!("../prompts/check-user.md");
+const CHECK_SCHEMA: &str = include_str!("../prompts/check-schema.json");
 
 async fn check_model(
     config: &config::Config,
@@ -348,14 +363,10 @@ async fn check_model(
         llm::Provider::ClaudeCode(_) => {
             let request = llm::Request {
                 task: "check".to_string(),
-                system: CHECK_SYSTEM.to_string(),
-                user: CHECK_INPUT.to_string(),
-                schema: serde_json::json!({
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["answer"],
-                    "properties": {"answer": {"type": "string"}},
-                }),
+                system: CHECK_SYSTEM.trim_end().to_string(),
+                user: CHECK_USER.trim_end().to_string(),
+                schema: serde_json::from_str(CHECK_SCHEMA)
+                    .context("built-in prompts/check-schema.json is not valid JSON")?,
             };
             let started = std::time::Instant::now();
             let reply = provider
@@ -377,7 +388,9 @@ async fn check_model(
                     status: "ok",
                     error: None,
                 };
-                let _ = db::llm::record(pool, &call, None, None).await;
+                if let Err(error) = db::llm::record(pool, &call, None, None).await {
+                    eprintln!("models check: the call was not recorded: {error:#}");
+                }
             }
             let billing = if reply.subscription {
                 "subscription"
@@ -451,345 +464,6 @@ pub async fn extract_worker() -> Result<ExitCode> {
 }
 
 pub async fn status(config_dir: Option<&Path>, all_errors: bool) -> Result<ExitCode> {
-    let config = config::load(config_dir)?;
-    let pool = db::pool::connect(database_url().as_deref(), &config.database.schema, 2).await?;
-    let result = print_status(&pool, config_dir, &config, all_errors).await;
-    pool.close().await;
-    result?;
+    status::run(config_dir, database_url().as_deref(), all_errors).await?;
     Ok(ExitCode::SUCCESS)
-}
-
-const STATUS_RUNS: i64 = 5;
-const STATUS_ERRORS: i64 = 20;
-const STAGES: [&str; 5] = ["walk", "extract", "chunk", "rules", "embed"];
-
-fn run_details(stats: &serde_json::Value) -> Vec<String> {
-    let number = |path: [&str; 2]| stats[path[0]][path[1]].as_u64().unwrap_or(0);
-    let mut details = Vec::new();
-    let restarts: Vec<String> = ["timeout", "memory", "crash", "panic", "files"]
-        .iter()
-        .map(|reason| (reason, number(["workers", reason])))
-        .filter(|(_, count)| *count > 0)
-        .map(|(reason, count)| format!("{count} {reason}"))
-        .collect();
-    if !restarts.is_empty() {
-        details.push(format!("worker restarts: {}", restarts.join(", ")));
-    }
-    let accepted = number(["ocr_ids", "accepted"]);
-    let rejected = number(["ocr_ids", "rejected"]);
-    if accepted + rejected > 0 {
-        details.push(format!(
-            "ids in OCR text: {accepted} matched a known key, {rejected} rejected"
-        ));
-    }
-    let left = stats["extract_left"].as_u64().unwrap_or(0);
-    if left > 0 {
-        details.push(format!("stopped by --extract-minutes with {left} left"));
-    }
-    details
-}
-
-async fn print_status(
-    pool: &sqlx::PgPool,
-    config_dir: Option<&Path>,
-    config: &config::Config,
-    all_errors: bool,
-) -> Result<()> {
-    println!("documents:");
-    for row in db::status::document_counts(pool).await? {
-        println!(
-            "  {} {} {}: {}",
-            row.source, row.kind, row.status, row.count
-        );
-    }
-    let totals: Vec<String> = db::status::totals(pool)
-        .await?
-        .into_iter()
-        .map(|(name, count)| format!("{count} {name}"))
-        .collect();
-    println!("totals: {}", totals.join(", "));
-    for (source, pages, confidence) in db::status::ocr_pages(pool).await? {
-        let mean = confidence.map_or("-".to_string(), |c| format!("{c:.3}"));
-        println!("ocr pages: {source}: {pages}, mean confidence {mean}");
-    }
-    let (segments, split) = db::status::segments(pool).await?;
-    if !segments.is_empty() {
-        let per_type: Vec<String> = segments
-            .iter()
-            .map(|(doc_type, count)| format!("{count} {doc_type}"))
-            .collect();
-        println!(
-            "segments: {}; {split} contents split into several documents",
-            per_type.join(", ")
-        );
-    }
-    match scan::prepare(config_dir, &[]) {
-        Ok(prepared) => {
-            let names: Vec<String> = config.sources.iter().map(|s| s.name.clone()).collect();
-            let ids = db::documents::source_ids(pool, &names).await?;
-            let extract = db::contents::count_to_extract(pool, &prepared.extract.key, &ids).await?;
-            let chunk = db::contents::count_to_chunk(pool, &prepared.chunk.key, &ids).await?;
-            let documents =
-                db::entities::count_documents_to_rule(pool, &prepared.rules.key, &ids).await?;
-            let contents = db::entities::count_contents_to_rule(
-                pool,
-                &prepared.rules.key,
-                &ids,
-                &prepared.chunk.key,
-            )
-            .await?;
-            println!(
-                "waiting: {extract} to extract, {chunk} to chunk, {documents} documents and {contents} contents to rule"
-            );
-        }
-        Err(error) => println!("waiting: unknown, {error:#}"),
-    }
-    println!("last runs:");
-    for run in db::status::last_runs(pool, STATUS_RUNS).await? {
-        let wall = run
-            .finished_at
-            .map(|f| {
-                format!(
-                    "{:.1} s",
-                    (f - run.started_at).num_milliseconds() as f64 / 1000.0
-                )
-            })
-            .unwrap_or_else(|| "-".to_string());
-        let mut parts = Vec::new();
-        for stage in STAGES {
-            let stats = &run.stats.0[stage];
-            if stats.is_null() {
-                continue;
-            }
-            let seconds = stats["seconds"].as_f64().unwrap_or(0.0);
-            let items = stats["items"].as_u64().unwrap_or(0);
-            let rate = if seconds > 0.0 && items > 0 {
-                format!(", {:.1}/s", items as f64 / seconds)
-            } else {
-                String::new()
-            };
-            parts.push(format!("{stage} {items} in {seconds:.1} s{rate}"));
-        }
-        println!(
-            "  run {} {} {}, {wall}: {}",
-            run.id,
-            run.started_at.format("%Y-%m-%d %H:%M UTC"),
-            run.status,
-            parts.join("; ")
-        );
-        let extra = run_details(&run.stats.0);
-        if !extra.is_empty() {
-            println!("    {}", extra.join("; "));
-        }
-    }
-    let limit = (!all_errors).then_some(STATUS_ERRORS);
-    let (total, errors) = db::status::errors(pool, limit).await?;
-    println!("errors: {total}");
-    for error in &errors {
-        println!(
-            "  {} {} {}: {}",
-            error.source, error.stage, error.path, error.message
-        );
-    }
-    if (errors.len() as i64) < total {
-        println!(
-            "  ... {} more, run zontologize status --errors",
-            total - errors.len() as i64
-        );
-    }
-    let usage = db::llm::usage(pool).await?;
-    if !usage.is_empty() {
-        println!("models:");
-    }
-    for row in usage {
-        println!(
-            "  {}:{}: {} calls, {} input and {} output tokens, ${:.4}; last 7 days {} calls, ${:.4}",
-            row.provider,
-            row.model,
-            row.calls,
-            row.input_tokens,
-            row.output_tokens,
-            row.cost_usd,
-            row.week_calls,
-            row.week_cost_usd
-        );
-    }
-    let jobs = db::llm::jobs(pool, STATUS_RUNS).await?;
-    if !jobs.is_empty() {
-        println!("model jobs:");
-    }
-    for job in jobs {
-        let mut line = format!(
-            "  {} {} {}:{} {}: {} done, {} left, {} invalid, {} errors",
-            job.task,
-            job.id,
-            job.provider,
-            job.model,
-            job.status,
-            job.done,
-            job.pending,
-            job.invalid,
-            job.error
-        );
-        if let Some(reason) = &job.pause_reason {
-            line.push_str(&format!("; {reason}"));
-        }
-        if let Some(at) = job.resume_after {
-            line.push_str(&format!(
-                "; goes on after {}",
-                at.format("%Y-%m-%d %H:%M UTC")
-            ));
-        }
-        println!("{line}");
-    }
-    print_model_facts(pool, config).await?;
-    print_embeddings(pool).await?;
-    print_graph(pool, &config.database.api_schema).await
-}
-
-async fn print_graph(pool: &sqlx::PgPool, api_schema: &str) -> Result<()> {
-    if let Some(sha) = db::status::ontology_version(pool).await? {
-        println!("ontology: version {}", &sha[..sha.len().min(12)]);
-    }
-    if let Some((stats, finished)) = db::status::last_graph(pool).await? {
-        println!(
-            "graph: {} vertices, {} edges, synced {}",
-            stats["vertices"],
-            stats["edges"],
-            finished.format("%Y-%m-%d %H:%M UTC")
-        );
-    }
-    match db::status::contract_version(pool, api_schema).await? {
-        Some(version) => println!("views: {api_schema} contract {version}"),
-        None => println!("views: missing, run zontologize db migrate"),
-    }
-    Ok(())
-}
-
-async fn print_embeddings(pool: &sqlx::PgPool) -> Result<()> {
-    for row in db::embed::counts(pool).await? {
-        let last = db::status::last_embed(pool, row.id).await?;
-        let eligible = |kind: &str| {
-            last.as_ref()
-                .and_then(|l| l[kind]["eligible"].as_u64())
-                .map_or("?".to_string(), |n| n.to_string())
-        };
-        let mut indexes = Vec::new();
-        for kind in [db::embed::CHUNK, db::embed::ENTITY] {
-            if db::embed::index_exists(pool, row.id, kind).await? {
-                indexes.push(kind);
-            }
-        }
-        let index = if indexes.is_empty() {
-            "no index".to_string()
-        } else {
-            format!("index on {}", indexes.join(" and "))
-        };
-        let current = if row.current { ", current" } else { "" };
-        let embedded = row.chunks + row.entities;
-        println!(
-            "embeddings {}{current}: {} of {} chunks, {} of {} entities, {} of {} classes; {:.1}% truncated; {index}",
-            row.name,
-            row.chunks,
-            eligible("chunks"),
-            row.entities,
-            eligible("entities"),
-            row.classes,
-            eligible("classes"),
-            100.0 * row.truncated as f64 / embedded.max(1) as f64
-        );
-    }
-    let links = db::status::resolve_links(pool).await?;
-    if !links.is_empty() {
-        let parts: Vec<String> = links
-            .iter()
-            .map(|(method, status, count)| format!("{count} {method} {status}"))
-            .collect();
-        println!("links: {}", parts.join(", "));
-    }
-    let (clusters, members) = db::status::clusters(pool).await?;
-    if clusters > 0 {
-        println!("canonical: {clusters} entities with duplicates, {members} entities in them");
-    }
-    Ok(())
-}
-
-async fn print_model_facts(pool: &sqlx::PgPool, config: &config::Config) -> Result<()> {
-    let extract = &config.llm_extract;
-    let eligible = db::facts::eligible_count(
-        pool,
-        &extract.sources,
-        &extract.doc_types,
-        extract.min_chars as i32,
-    )
-    .await?;
-    let extracted = db::facts::extracted_chunks(pool).await?;
-    if extracted > 0 {
-        println!("extract: {extracted} chunks extracted, {eligible} eligible");
-    }
-    for (method, mentions, relations) in db::facts::method_counts(pool).await? {
-        println!("model facts: {method}: {mentions} mentions, {relations} relations");
-    }
-    let sent = db::attributes::sent_chunks(pool).await?;
-    if sent > 0 {
-        let parts: Vec<String> = db::attributes::counts(pool)
-            .await?
-            .into_iter()
-            .map(|(iri, count)| format!("{count} {}", llm::shortlist::local_name(&iri)))
-            .collect();
-        println!(
-            "attributes: {sent} chunks answered; {}",
-            if parts.is_empty() {
-                "no values".to_string()
-            } else {
-                parts.join(", ")
-            }
-        );
-    }
-    let types: Vec<String> = db::classify::counts(pool)
-        .await?
-        .into_iter()
-        .map(|(doc_type, count)| format!("{count} {}", doc_type.as_deref().unwrap_or("none")))
-        .collect();
-    if !types.is_empty() {
-        println!("classify: {}", types.join(", "));
-    }
-    let precision = db::review::precision(pool).await?;
-    if !precision.is_empty() {
-        println!("review precision:");
-    }
-    for row in precision {
-        println!(
-            "  {} {}: {} of {} right ({:.0}%)",
-            row.method,
-            llm::shortlist::local_name(&row.iri),
-            row.right,
-            row.total,
-            100.0 * row.right as f64 / row.total.max(1) as f64
-        );
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn run_details_list_only_what_happened() {
-        assert!(run_details(&serde_json::json!({})).is_empty());
-        let stats = serde_json::json!({
-            "workers": {"timeout": 2, "memory": 0, "crash": 1, "files": 0},
-            "ocr_ids": {"accepted": 3, "rejected": 4},
-            "extract_left": 5
-        });
-        assert_eq!(
-            run_details(&stats),
-            [
-                "worker restarts: 2 timeout, 1 crash",
-                "ids in OCR text: 3 matched a known key, 4 rejected",
-                "stopped by --extract-minutes with 5 left"
-            ]
-        );
-    }
 }

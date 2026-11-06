@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use anyhow::{Result, bail};
 use sqlx::{FromRow, PgPool};
 
-use super::{copy_row, quote_identifier};
+use super::{OCR_CONFIDENCE, copy_row, quote_identifier};
 
 pub const CHUNK: &str = "chunk";
 pub const ENTITY: &str = "entity";
@@ -85,6 +85,18 @@ pub fn parse_vector(text: &str) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+const HALF_MAX: f32 = 65504.0;
+
+fn storable(embedding: &str) -> bool {
+    parse_vector(embedding).is_ok_and(|v| v.iter().all(|x| x.is_finite() && x.abs() <= HALF_MAX))
+}
+
+fn report_unstorable(skipped: usize) {
+    if skipped > 0 {
+        println!("embed: {skipped} vectors with NaN, inf or values out of halfvec range skipped");
+    }
+}
+
 pub async fn find_model(pool: &PgPool, fingerprint: &str) -> Result<Option<Stored>> {
     let row = sqlx::query_as(
         "select id, name, dimensions, current from embedding_models where fingerprint = $1",
@@ -145,19 +157,17 @@ pub async fn chunk_candidates(
     after: i64,
     limit: i64,
 ) -> Result<Vec<ChunkCandidate>> {
-    let rows = sqlx::query_as(
+    let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select k.id, k.text, \
-         (select min(p.ocr_confidence) from pages p where p.content_id = k.content_id \
-         and p.method = 'ocr' and p.page_no between coalesce(k.page_from, 0) \
-         and coalesce(k.page_to, 2147483647)) as ocr_confidence, \
+         {OCR_CONFIDENCE} as ocr_confidence, \
          e.text_key from chunks k \
          left join embeddings e on e.model_id = $1 and e.owner_kind = 'chunk' \
          and e.owner_id = k.id \
          where k.id > $3 and length(k.text) >= $2 \
          and exists (select 1 from documents d where d.content_id = k.content_id \
          and d.status = 'present') \
-         order by k.id limit $4",
-    )
+         order by k.id limit $4"
+    )))
     .bind(model_id)
     .bind(min_chars)
     .bind(after)
@@ -236,7 +246,12 @@ pub async fn write(pool: &PgPool, model_id: i64, kind: &str, vectors: &[Vector<'
     .execute(&mut *tx)
     .await?;
     let mut data = String::new();
+    let mut skipped = 0;
     for vector in vectors {
+        if !storable(vector.embedding) {
+            skipped += 1;
+            continue;
+        }
         let owner = vector.owner_id.to_string();
         let truncated = if vector.truncated { "t" } else { "f" };
         copy_row(
@@ -260,6 +275,7 @@ pub async fn write(pool: &PgPool, model_id: i64, kind: &str, vectors: &[Vector<'
     copy.send(data.as_bytes()).await?;
     copy.finish().await?;
     tx.commit().await?;
+    report_unstorable(skipped);
     Ok(())
 }
 
@@ -268,23 +284,36 @@ pub async fn write_classes(
     model_id: i64,
     rows: &[(String, String, bool, String)],
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut skipped = 0;
+    let (mut iris, mut keys, mut cut, mut embeddings) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (iri, key, truncated, embedding) in rows {
-        sqlx::query(
-            "insert into class_embeddings (model_id, iri, text_key, truncated, embedding) \
-             values ($1, $2, $3, $4, $5::halfvec) on conflict (model_id, iri) do update \
-             set text_key = excluded.text_key, truncated = excluded.truncated, \
-             embedding = excluded.embedding",
-        )
-        .bind(model_id)
-        .bind(iri)
-        .bind(key)
-        .bind(truncated)
-        .bind(embedding)
-        .execute(&mut *tx)
-        .await?;
+        if !storable(embedding) {
+            skipped += 1;
+            continue;
+        }
+        iris.push(iri.as_str());
+        keys.push(key.as_str());
+        cut.push(*truncated);
+        embeddings.push(embedding.as_str());
     }
-    tx.commit().await?;
+    sqlx::query(
+        "insert into class_embeddings (model_id, iri, text_key, truncated, embedding) \
+         select $1, n.iri, n.text_key, n.truncated, n.embedding::halfvec \
+         from unnest($2::text[], $3::text[], $4::bool[], $5::text[]) \
+         as n(iri, text_key, truncated, embedding) \
+         on conflict (model_id, iri) do update \
+         set text_key = excluded.text_key, truncated = excluded.truncated, \
+         embedding = excluded.embedding",
+    )
+    .bind(model_id)
+    .bind(&iris)
+    .bind(&keys)
+    .bind(&cut)
+    .bind(&embeddings)
+    .execute(pool)
+    .await?;
+    report_unstorable(skipped);
     Ok(())
 }
 
@@ -319,7 +348,7 @@ pub async fn delete_stale(
     Ok(done.rows_affected())
 }
 
-pub fn index_name(model_id: i64, kind: &str) -> Result<String> {
+fn index_name(model_id: i64, kind: &str) -> Result<String> {
     let name = format!("embeddings_m{model_id}_{kind}");
     if !crate::config::is_identifier(&name) {
         bail!("index name {name:?} is not a plain identifier");
@@ -419,7 +448,7 @@ pub async fn linked_mentions(
     let rows = sqlx::query_as(
         "with m as (select distinct m.entity_id, m.chunk_id, k.content_id from mentions m \
          join chunks k on k.id = m.chunk_id join entities e on e.id = m.entity_id \
-         where e.document_id is null and m.method not like 'llm:%' and m.method <> $2 \
+         where e.document_id is null and m.method not like $3 and m.method <> $2 \
          and length(k.text) >= $1 \
          and exists (select 1 from documents d where d.content_id = k.content_id \
          and d.status = 'present')), \
@@ -430,6 +459,7 @@ pub async fn linked_mentions(
     )
     .bind(min_chars)
     .bind(skip_method)
+    .bind(super::MODEL_METHODS)
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -463,13 +493,11 @@ pub struct EvalChunk {
 }
 
 pub async fn eval_chunks(pool: &PgPool, ids: &[i64]) -> Result<Vec<EvalChunk>> {
-    let rows = sqlx::query_as(
+    let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select k.id, k.content_id, k.text, \
-         (select min(p.ocr_confidence) from pages p where p.content_id = k.content_id \
-         and p.method = 'ocr' and p.page_no between coalesce(k.page_from, 0) \
-         and coalesce(k.page_to, 2147483647)) as ocr_confidence \
-         from chunks k where k.id = any($1) order by k.id",
-    )
+         {OCR_CONFIDENCE} as ocr_confidence \
+         from chunks k where k.id = any($1) order by k.id"
+    )))
     .bind(ids)
     .fetch_all(pool)
     .await?;
@@ -519,6 +547,14 @@ mod tests {
         assert_eq!(parse_vector(&text).unwrap(), [0.5, -0.25, 1.0]);
         assert!(parse_vector("[a]").is_err());
         assert!(parse_vector("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_finite_half_precision_vectors_are_stored() {
+        assert!(storable(&vector_text(&[0.5, -65504.0])));
+        assert!(!storable(&vector_text(&[0.5, f32::NAN])));
+        assert!(!storable(&vector_text(&[f32::INFINITY])));
+        assert!(!storable(&vector_text(&[70000.0])));
     }
 
     #[test]

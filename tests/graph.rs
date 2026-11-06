@@ -139,6 +139,33 @@ async fn the_graph_mirrors_entities_and_relations() {
         .await;
     assert_eq!(mapped, 1);
 
+    let unchanged = sync(&env).await;
+    assert!(unchanged.unchanged, "{unchanged:?}");
+    assert_eq!(unchanged.vertices, stats.vertices);
+    assert!(!stats.unchanged);
+    let with_chunk = env
+        .count("select count(*) from relations where status <> 'rejected' and chunk_id is not null")
+        .await;
+    assert!(with_chunk > 0);
+    let traced = cypher(
+        &env,
+        "match ()-[r]->() where r.chunk_id is not null and r.span_start is not null return r",
+    )
+    .await;
+    let spanned = env
+        .count(
+            "select count(*) from relations where status <> 'rejected' \
+             and chunk_id is not null and span_start is not null",
+        )
+        .await;
+    assert_eq!(traced, spanned);
+    let documents = env
+        .count("select count(*) from entities where document_id is not null")
+        .await;
+    assert!(documents > 0);
+    let found = cypher(&env, "match (v) where v.document_id is not null return v").await;
+    assert_eq!(found, documents);
+
     let ids = vertex_ids(&env).await;
     let mut reader = zontologize::db::connect(Some(&common::test_url()), &env.schema)
         .await
@@ -287,4 +314,17 @@ async fn the_views_keep_their_contract() {
         .await;
     assert_eq!(scanned, 1);
     env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn the_database_runs_the_pinned_age_version() {
+    let mut conn = zontologize::db::connect(Some(&common::test_url()), "public")
+        .await
+        .unwrap();
+    let version = zontologize::db::extension_version(&mut conn, "age")
+        .await
+        .unwrap();
+    zontologize::db::close(conn).await;
+    zontologize::db::graph::check_age(version.as_deref()).unwrap();
 }

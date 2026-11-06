@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use super::model::{Model, text_key};
@@ -13,11 +12,8 @@ use crate::config::Config;
 use crate::db;
 use crate::db::embed::{CHUNK, ENTITY, Vector};
 use crate::facts::sample::letter_share;
-use crate::llm::shortlist::local_name;
-use crate::ontology::{Class, Ontology, hex};
-
-const PAGE: i64 = 2000;
-const PROGRESS_SECS: u64 = 30;
+use crate::ns::local_name;
+use crate::ontology::{Class, Ontology};
 
 #[derive(Debug, Clone, Default)]
 pub struct Options {
@@ -27,7 +23,8 @@ pub struct Options {
     pub prune: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Counts {
     pub eligible: u64,
     pub embedded: u64,
@@ -71,8 +68,8 @@ pub async fn run(config_dir: Option<&Path>, url: Option<&str>, options: &Options
     let name = options.model.as_deref().unwrap_or(&config.models.embed);
     let model =
         super::model::parse(name, &config.embed.models).map_err(|e| anyhow!("--model: {e}"))?;
-    let ontology = load_ontology(config_dir, &config)?;
-    let _lock = db::runs::lock(url, &config.database.schema).await?;
+    let ontology = crate::ontology::load_or_empty(config_dir, &config.ontology)?;
+    let lock = db::runs::lock(url, &config.database.schema).await?;
     let pool = db::pool::connect(url, &config.database.schema, 2).await?;
     let result = async {
         let fetched = model.clone();
@@ -81,7 +78,7 @@ pub async fn run(config_dir: Option<&Path>, url: Option<&str>, options: &Options
         let files = tokio::task::spawn_blocking(move || super::local::fetch(&fetched, &cache_dir))
             .await??;
         let local = super::local::Local::new(model.clone(), files, config.embed.threads);
-        let (run_id, _) = db::runs::start(&pool, &config_hash(&config)).await?;
+        let (run_id, _) = db::runs::start(&pool, &crate::config::hash(&config)?).await?;
         let outcome = run_with(&pool, &config, &ontology, &model, Box::new(local), options).await;
         let (status, stats) = match &outcome {
             Ok(stats) => ("finished", stats_json(stats)),
@@ -92,40 +89,20 @@ pub async fn run(config_dir: Option<&Path>, url: Option<&str>, options: &Options
     }
     .await;
     pool.close().await;
+    lock.release().await;
     result
 }
 
-pub fn load_ontology(config_dir: Option<&Path>, config: &Config) -> Result<Ontology> {
-    if config.ontology.files.is_empty() {
-        return Ok(Ontology::default());
-    }
-    let loaded = crate::ontology::load(config_dir, &config.ontology)?;
-    if let Some(error) = loaded.first_error() {
-        bail!("ontology: {error}");
-    }
-    Ok(loaded.ontology)
-}
-
-pub fn config_hash(config: &Config) -> String {
-    hex(&Sha256::digest(format!("{config:?}").as_bytes()))
-}
-
-pub fn stats_json(stats: &Stats) -> serde_json::Value {
-    let counts = |c: &Counts| {
-        serde_json::json!({
-            "eligible": c.eligible, "embedded": c.embedded, "copied": c.copied,
-            "kept": c.kept, "deleted": c.deleted, "truncated": c.truncated,
-        })
-    };
+fn stats_json(stats: &Stats) -> serde_json::Value {
     let items = stats.chunks.embedded + stats.entities.embedded + stats.classes.embedded;
     serde_json::json!({
         "embed": {
             "seconds": stats.seconds,
             "items": items,
             "model_id": stats.model_id,
-            "chunks": counts(&stats.chunks),
-            "entities": counts(&stats.entities),
-            "classes": counts(&stats.classes),
+            "chunks": stats.chunks,
+            "entities": stats.entities,
+            "classes": stats.classes,
             "junk": stats.junk,
             "embed_seconds": stats.embed_seconds,
             "index_seconds": stats.index_seconds,
@@ -250,7 +227,7 @@ impl Stage<'_> {
     }
 
     fn progress(&mut self, kind: &str, counts: &Counts) {
-        if self.last_progress.elapsed() < Duration::from_secs(PROGRESS_SECS) {
+        if self.last_progress.elapsed() < Duration::from_secs(self.config.embed.progress_secs) {
             return;
         }
         self.last_progress = Instant::now();
@@ -278,7 +255,7 @@ impl Stage<'_> {
                 self.model_id,
                 settings.min_chars as i32,
                 after,
-                PAGE,
+                settings.read_batch,
             )
             .await?;
             let Some(last) = page.last().map(|c| c.id) else {
@@ -341,7 +318,7 @@ impl Stage<'_> {
                 self.model_id,
                 settings.max_aliases as i64,
                 after,
-                PAGE,
+                settings.read_batch,
             )
             .await?;
             let Some(last) = page.last().map(|c| c.id) else {
@@ -546,7 +523,7 @@ pub fn class_label(ontology: &Ontology, iri: &str, language: &str) -> String {
         .unwrap_or_else(|| local_name(iri).to_string())
 }
 
-pub fn entity_text(name: &str, label: &str, aliases: &[String]) -> String {
+fn entity_text(name: &str, label: &str, aliases: &[String]) -> String {
     let mut text = format!("{name} ({label})");
     if !aliases.is_empty() {
         text.push_str("; ");

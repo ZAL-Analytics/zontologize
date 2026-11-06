@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Result, bail};
-use sqlx::PgPool;
+use sqlx::PgConnection;
 
 use super::{PROPOSED, Stats, method};
 use crate::config::SimilarConfig;
 use crate::db;
 use crate::db::resolve::{NewLink, ValueRow};
 use crate::ontology::Ontology;
+
+const SCORE_TOLERANCE: f64 = 0.00005;
 
 pub const RULE: &str = "similar";
 
@@ -42,7 +44,7 @@ pub struct Settings {
     pub max_links: usize,
 }
 
-pub fn property_score(a: Range, b: Range, tolerance: f64) -> f64 {
+fn property_score(a: Range, b: Range, tolerance: f64) -> f64 {
     if a.low <= b.high && b.low <= a.high {
         return 1.0;
     }
@@ -182,7 +184,7 @@ pub fn settings(config: &SimilarConfig, ontology: &Ontology) -> Result<Settings>
 }
 
 pub async fn write(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     config: &crate::config::Config,
     ontology: &Ontology,
     stats: &mut Stats,
@@ -194,7 +196,7 @@ pub async fn write(
         .iter()
         .filter_map(|name| ontology.resolve(name).ok())
         .collect();
-    let rows: Vec<ValueRow> = db::resolve::values(pool)
+    let rows: Vec<ValueRow> = db::resolve::values(&mut *conn)
         .await?
         .into_iter()
         .filter(|r| {
@@ -219,12 +221,15 @@ pub async fn write(
         let Some(source) = by_id.get(&pair.a) else {
             continue;
         };
-        let chunk = pair
+        let Some(chunk) = pair
             .shared
             .iter()
             .filter_map(|p| source.best.get(p))
             .max_by(|x, y| x.0.total_cmp(&y.0).then_with(|| y.1.cmp(&x.1)))
-            .map(|(_, chunk)| *chunk);
+            .map(|(_, chunk)| *chunk)
+        else {
+            continue;
+        };
         wanted.push(NewLink {
             src_id: pair.a,
             dst_id: pair.b,
@@ -234,22 +239,24 @@ pub async fn write(
             confidence: rounded(pair.score),
             props: serde_json::json!({"score": rounded(pair.score), "shared": pair.shared}),
             document_id: None,
-            chunk_id: chunk,
+            chunk_id: Some(chunk),
             span_start: None,
             span_end: None,
         });
     }
-    let existing = db::resolve::links(pool, property).await?;
-    let keep: BTreeSet<(i64, i64, String)> = wanted
+    let existing = db::resolve::links(&mut *conn, property).await?;
+    let keep: BTreeMap<(i64, i64), f64> = wanted
         .iter()
-        .map(|l| (l.src_id, l.dst_id, format!("{:.4}", l.confidence)))
+        .map(|l| ((l.src_id, l.dst_id), l.confidence))
         .collect();
     let mut have: BTreeSet<(i64, i64)> = BTreeSet::new();
     let mut remove = Vec::new();
-    let confidences = db::resolve::confidences(pool, property).await?;
+    let confidences = db::resolve::confidences(&mut *conn, property).await?;
     for link in existing.iter().filter(|l| l.method == method) {
         let confidence = confidences.get(&link.id).copied().unwrap_or(0.0);
-        let current = keep.contains(&(link.src_id, link.dst_id, format!("{confidence:.4}")));
+        let current = keep
+            .get(&(link.src_id, link.dst_id))
+            .is_some_and(|wanted| same_score(*wanted, confidence));
         if current || !(link.status == super::AUTO || link.status == PROPOSED) {
             have.insert((link.src_id, link.dst_id));
         } else {
@@ -263,17 +270,29 @@ pub async fn write(
     stats.kept += have.len() as u64;
     stats.removed += remove.len() as u64;
     *stats.added.entry(method).or_default() += add.len() as u64;
-    db::resolve::delete(pool, &remove).await?;
-    db::resolve::insert(pool, &add).await
+    db::resolve::delete(&mut *conn, &remove).await?;
+    db::resolve::insert(&mut *conn, &add).await
 }
 
 fn rounded(score: f64) -> f64 {
     (score * 10_000.0).round() / 10_000.0
 }
 
+fn same_score(a: f64, b: f64) -> bool {
+    (a - b).abs() < SCORE_TOLERANCE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scores_match_after_rounding_to_four_places() {
+        assert!(same_score(rounded(0.123449), 0.1234));
+        assert!(same_score(rounded(0.81), 0.81));
+        assert!(!same_score(rounded(0.12346), 0.1234));
+        assert!(!same_score(0.5, 0.5001));
+    }
 
     fn range(low: f64, high: f64) -> Range {
         Range { low, high }

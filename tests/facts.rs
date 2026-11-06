@@ -116,7 +116,7 @@ fn options() -> Options {
     let mut options = Options::new(common::repo(
         "tests/fixtures/llm/claude-code/fake-claude-extract.sh",
     ));
-    options.backoff = std::time::Duration::from_millis(1);
+    options.backoff = Some(std::time::Duration::from_millis(1));
     options.no_wait = true;
     options
 }
@@ -270,6 +270,27 @@ async fn a_change_over_the_resend_share_needs_yes() {
         env.count("select count(*) from relations where status = 'confirmed'")
             .await,
         1
+    );
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_check_change_replays_the_cache_without_yes() {
+    let env = setup_extract("facts_check").await;
+    assert_eq!(extract(&env, &options()).await.unwrap(), Outcome::Finished);
+    let facts = env.count(MODEL_FACTS).await;
+    sqlx::query("update chunks set llm_key = 'older check' where llm_key is not null")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    assert_eq!(extract(&env, &options()).await.unwrap(), Outcome::Finished);
+    assert_eq!(env.count("select count(*) from llm_calls").await, 2);
+    assert_eq!(env.count(MODEL_FACTS).await, facts);
+    assert_eq!(
+        env.count("select count(*) from chunks where llm_key = 'older check'")
+            .await,
+        0
     );
     env.finish().await;
 }

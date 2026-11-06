@@ -3,22 +3,55 @@ use std::collections::BTreeMap;
 use super::{Answer, Built};
 use crate::facts::check::Haystack;
 use crate::ontology::{Ontology, ValueKind};
-use crate::units::{Lookup, UnitIndex, is_reading, normalise, readings, to_si};
+use crate::text::nfkc_squash;
+use crate::units::{Lookup, UnitIndex, is_reading, readings, to_si};
 
-pub const PROPERTY_NOT_ALLOWED: &str = "property not allowed";
-pub const REF_NOT_ALLOWED: &str = "ref not allowed for the property";
-pub const QUOTE_NOT_FOUND: &str = "quote not in the chunk";
-pub const NO_NUMBER: &str = "no number";
-pub const NUMBER_NOT_IN_QUOTE: &str = "number not in the quote";
-pub const MIN_ABOVE_MAX: &str = "min above max";
-pub const NO_UNIT: &str = "no unit";
-pub const UNIT_NOT_IN_TEXT: &str = "unit not in the text";
-pub const UNKNOWN_UNIT: &str = "unknown unit";
-pub const AMBIGUOUS_UNIT: &str = "ambiguous unit";
-pub const NO_TEXT: &str = "no text value";
-pub const TEXT_NOT_FOUND: &str = "text not in the chunk";
-pub const TEXT_TOO_LONG: &str = "text too long";
-pub const DUPLICATE: &str = "duplicate";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    PropertyNotAllowed,
+    RefNotAllowed,
+    QuoteNotFound,
+    NoNumber,
+    NumberNotInQuote,
+    MinAboveMax,
+    NoUnit,
+    UnitNotInText,
+    UnknownUnit,
+    AmbiguousUnit,
+    NoText,
+    TextNotFound,
+    TextTooLong,
+    Duplicate,
+    NotOfType,
+}
+
+impl Reason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reason::PropertyNotAllowed => "property not allowed",
+            Reason::RefNotAllowed => "ref not allowed for the property",
+            Reason::QuoteNotFound => "quote not in the chunk",
+            Reason::NoNumber => "no number",
+            Reason::NumberNotInQuote => "number not in the quote",
+            Reason::MinAboveMax => "min above max",
+            Reason::NoUnit => "no unit",
+            Reason::UnitNotInText => "unit not in the text",
+            Reason::UnknownUnit => "unknown unit",
+            Reason::AmbiguousUnit => "ambiguous unit",
+            Reason::NoText => "no text value",
+            Reason::TextNotFound => "text not in the chunk",
+            Reason::TextTooLong => "text too long",
+            Reason::Duplicate => "duplicate",
+            Reason::NotOfType => "number does not fit the datatype",
+        }
+    }
+}
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Value {
@@ -43,7 +76,11 @@ pub struct Checked {
 }
 
 impl Checked {
-    fn drop(&mut self, reason: &str, about: &str) {
+    fn drop(&mut self, reason: Reason, about: &str) {
+        let about: String = about
+            .chars()
+            .take(crate::facts::check::MAX_DROP_TEXT)
+            .collect();
         *self.drops.entry(format!("{reason}|{about}")).or_default() += 1;
     }
 }
@@ -56,8 +93,17 @@ fn slice(text: &str, start: usize, end: usize) -> String {
     text.chars().skip(start).take(end - start).collect()
 }
 
-fn find_exact(haystack: &str, needle: &str) -> bool {
-    !needle.is_empty() && normalise(haystack).contains(&normalise(needle))
+fn has_unit(haystack: &str, unit: &str) -> bool {
+    let haystack = nfkc_squash(haystack).to_lowercase();
+    let unit = nfkc_squash(unit).to_lowercase();
+    if unit.is_empty() {
+        return false;
+    }
+    haystack.match_indices(&unit).any(|(at, _)| {
+        let before = haystack[..at].chars().next_back();
+        let after = haystack[at + unit.len()..].chars().next();
+        !before.is_some_and(char::is_alphabetic) && !after.is_some_and(char::is_alphanumeric)
+    })
 }
 
 pub fn check(
@@ -75,10 +121,10 @@ pub fn check(
         let Some(property) = built
             .properties
             .iter()
-            .find(|p| p.eq_ignore_ascii_case(out.property.trim()))
+            .find(|p| *p == out.property.trim())
             .and_then(|iri| ontology.properties.get(iri))
         else {
-            checked.drop(PROPERTY_NOT_ALLOWED, &out.property);
+            checked.drop(Reason::PropertyNotAllowed, &out.property);
             continue;
         };
         let iri = property.iri.as_str();
@@ -88,15 +134,15 @@ pub fn check(
             .get(iri)
             .is_some_and(|refs| refs.iter().any(|r| r == reference));
         let Some(subject) = built.subjects.iter().find(|s| s.reference == reference) else {
-            checked.drop(REF_NOT_ALLOWED, iri);
+            checked.drop(Reason::RefNotAllowed, iri);
             continue;
         };
         if !allowed {
-            checked.drop(REF_NOT_ALLOWED, iri);
+            checked.drop(Reason::RefNotAllowed, iri);
             continue;
         }
         let Some((start, end)) = haystack.find(&out.evidence) else {
-            checked.drop(QUOTE_NOT_FOUND, iri);
+            checked.drop(Reason::QuoteNotFound, iri);
             continue;
         };
         let quote = slice(text, start, end);
@@ -117,61 +163,69 @@ pub fn check(
         if property.value == Some(ValueKind::Text) {
             let wanted = out.text.trim();
             if wanted.is_empty() {
-                checked.drop(NO_TEXT, iri);
+                checked.drop(Reason::NoText, iri);
                 continue;
             }
             if wanted.chars().count() > limits.max_text_chars {
-                checked.drop(TEXT_TOO_LONG, iri);
+                checked.drop(Reason::TextTooLong, iri);
                 continue;
             }
-            let Some((start, end)) = haystack.find(wanted) else {
-                checked.drop(TEXT_NOT_FOUND, iri);
+            let Some((from, to)) = Haystack::new(&quote).find(wanted) else {
+                checked.drop(Reason::TextNotFound, iri);
                 continue;
             };
-            value.value_text = slice(text, start, end);
-            value.start = start;
-            value.end = end;
+            value.value_text = slice(&quote, from, to);
+            value.start = start + from;
+            value.end = start + to;
         } else {
             if out.min.is_none() && out.max.is_none() {
-                checked.drop(NO_NUMBER, iri);
+                checked.drop(Reason::NoNumber, iri);
                 continue;
             }
-            let found = readings(&quote);
+            let found = readings(&nfkc_squash(&quote));
             if [out.min, out.max]
                 .into_iter()
                 .flatten()
                 .any(|v| !v.is_finite() || !is_reading(v, &found))
             {
-                checked.drop(NUMBER_NOT_IN_QUOTE, iri);
+                checked.drop(Reason::NumberNotInQuote, iri);
                 continue;
             }
             if let (Some(min), Some(max)) = (out.min, out.max)
                 && min > max
             {
-                checked.drop(MIN_ABOVE_MAX, iri);
+                checked.drop(Reason::MinAboveMax, iri);
+                continue;
+            }
+            if [out.min, out.max]
+                .into_iter()
+                .flatten()
+                .any(|v| !property.accepts_number(v))
+            {
+                checked.drop(Reason::NotOfType, iri);
                 continue;
             }
             value.low = out.min;
             value.high = out.max;
             let unit_text = out.unit.trim();
-            match &property.dimension {
-                Some(dimension) => {
+            match &property.quantity_kind {
+                Some(kind) => {
                     if unit_text.is_empty() {
-                        checked.drop(NO_UNIT, iri);
+                        checked.drop(Reason::NoUnit, iri);
                         continue;
                     }
-                    if !find_exact(text, unit_text) && !find_exact(context, unit_text) {
-                        checked.drop(UNIT_NOT_IN_TEXT, iri);
+                    if !has_unit(text, unit_text) && !has_unit(context, unit_text) {
+                        checked.drop(Reason::UnitNotInText, iri);
                         continue;
                     }
-                    let unit = match units.lookup(dimension, unit_text) {
+                    let unit = match units.lookup(kind, unit_text) {
                         Lookup::Found(unit) => unit,
                         Lookup::Ambiguous => {
-                            checked.drop(AMBIGUOUS_UNIT, unit_text);
+                            checked.drop(Reason::AmbiguousUnit, unit_text);
                             continue;
                         }
                         Lookup::Unknown => {
-                            checked.drop(UNKNOWN_UNIT, unit_text);
+                            checked.drop(Reason::UnknownUnit, unit_text);
                             continue;
                         }
                     };
@@ -188,7 +242,7 @@ pub fn check(
             }
         }
         if checked.values.contains(&value) {
-            checked.drop(DUPLICATE, iri);
+            checked.drop(Reason::Duplicate, iri);
             continue;
         }
         checked.values.push(value);
@@ -200,6 +254,53 @@ pub fn check(
 mod tests {
     use super::super::tests::{built_for, input, iri, ontology, subject};
     use super::*;
+
+    #[test]
+    fn drop_reason_texts_are_stored_unchanged() {
+        let texts: Vec<&str> = [
+            Reason::PropertyNotAllowed,
+            Reason::RefNotAllowed,
+            Reason::QuoteNotFound,
+            Reason::NoNumber,
+            Reason::NumberNotInQuote,
+            Reason::MinAboveMax,
+            Reason::NoUnit,
+            Reason::UnitNotInText,
+            Reason::UnknownUnit,
+            Reason::AmbiguousUnit,
+            Reason::NoText,
+            Reason::TextNotFound,
+            Reason::TextTooLong,
+            Reason::Duplicate,
+            Reason::NotOfType,
+        ]
+        .iter()
+        .map(|r| r.as_str())
+        .collect();
+        assert_eq!(
+            texts,
+            [
+                "property not allowed",
+                "ref not allowed for the property",
+                "quote not in the chunk",
+                "no number",
+                "number not in the quote",
+                "min above max",
+                "no unit",
+                "unit not in the text",
+                "unknown unit",
+                "ambiguous unit",
+                "no text value",
+                "text not in the chunk",
+                "text too long",
+                "duplicate",
+                "number does not fit the datatype"
+            ]
+        );
+        let mut checked = Checked::default();
+        checked.drop(Reason::NoUnit, "x");
+        assert!(checked.drops.contains_key("no unit|x"));
+    }
 
     fn answer(json: serde_json::Value) -> Answer {
         serde_json::from_value(json).unwrap()
@@ -375,7 +476,7 @@ mod tests {
             ],
         );
         assert_eq!(checked.values.len(), 2);
-        assert_eq!(reasons(&checked), [DUPLICATE]);
+        assert_eq!(reasons(&checked), [Reason::Duplicate.as_str()]);
     }
 
     #[test]
@@ -383,11 +484,11 @@ mod tests {
         let cases = [
             (
                 value("r1", "power", Some(7.5), Some(7.5), "kW", "", "not there"),
-                QUOTE_NOT_FOUND,
+                Reason::QuoteNotFound.as_str(),
             ),
             (
                 value("r9", "power", Some(7.5), Some(7.5), "kW", "", "7,5 kW"),
-                REF_NOT_ALLOWED,
+                Reason::RefNotAllowed.as_str(),
             ),
             (
                 value(
@@ -399,15 +500,15 @@ mod tests {
                     "",
                     "8 - 10 barg",
                 ),
-                REF_NOT_ALLOWED,
+                Reason::RefNotAllowed.as_str(),
             ),
             (
                 value("r1", "power", None, None, "kW", "", "7,5 kW"),
-                NO_NUMBER,
+                Reason::NoNumber.as_str(),
             ),
             (
                 value("r1", "power", Some(75.0), Some(75.0), "kW", "", "7,5 kW"),
-                NUMBER_NOT_IN_QUOTE,
+                Reason::NumberNotInQuote.as_str(),
             ),
             (
                 value(
@@ -419,15 +520,15 @@ mod tests {
                     "",
                     "8 - 10 barg",
                 ),
-                MIN_ABOVE_MAX,
+                Reason::MinAboveMax.as_str(),
             ),
             (
                 value("r1", "power", Some(7.5), Some(7.5), "", "", "7,5 kW"),
-                NO_UNIT,
+                Reason::NoUnit.as_str(),
             ),
             (
                 value("r1", "power", Some(7.5), Some(7.5), "MW", "", "7,5 kW"),
-                UNIT_NOT_IN_TEXT,
+                Reason::UnitNotInText.as_str(),
             ),
             (
                 value(
@@ -439,7 +540,7 @@ mod tests {
                     "",
                     "8 - 10 barg",
                 ),
-                UNKNOWN_UNIT,
+                Reason::UnknownUnit.as_str(),
             ),
             (
                 value(
@@ -451,7 +552,7 @@ mod tests {
                     "",
                     "Material: cast iron GG25",
                 ),
-                NO_TEXT,
+                Reason::NoText.as_str(),
             ),
             (
                 value(
@@ -463,7 +564,7 @@ mod tests {
                     "steel",
                     "Material: cast iron GG25",
                 ),
-                TEXT_NOT_FOUND,
+                Reason::TextNotFound.as_str(),
             ),
             (
                 value(
@@ -475,7 +576,7 @@ mod tests {
                     "Material: cast iron GG25",
                     "Material: cast iron GG25",
                 ),
-                TEXT_TOO_LONG,
+                Reason::TextTooLong.as_str(),
             ),
         ];
         for (out, reason) in cases {
@@ -487,7 +588,106 @@ mod tests {
         wrong["property"] = serde_json::json!("http://example.org/ex#nope");
         assert_eq!(
             reasons(&run(CHUNK, "", vec![wrong])),
-            [PROPERTY_NOT_ALLOWED]
+            [Reason::PropertyNotAllowed.as_str()]
+        );
+    }
+
+    #[test]
+    fn units_need_word_boundaries_and_fold_case() {
+        let barrels = run(
+            "P-101 pressure 10 barrels",
+            "",
+            vec![value(
+                "r1",
+                "pressure",
+                Some(10.0),
+                Some(10.0),
+                "bar",
+                "",
+                "pressure 10 barrels",
+            )],
+        );
+        assert_eq!(reasons(&barrels), [Reason::UnitNotInText.as_str()]);
+        let folded = run(
+            "P-101 power 7,5 kw",
+            "",
+            vec![value(
+                "r1",
+                "power",
+                Some(7.5),
+                Some(7.5),
+                "KW",
+                "",
+                "7,5 kw",
+            )],
+        );
+        assert_eq!(folded.values.len(), 1, "{:?}", folded.drops);
+    }
+
+    #[test]
+    fn text_values_come_from_the_quote() {
+        let checked = run(
+            CHUNK,
+            "",
+            vec![value(
+                "r1",
+                "material",
+                None,
+                None,
+                "",
+                "cast iron GG25",
+                "3 stages",
+            )],
+        );
+        assert_eq!(reasons(&checked), [Reason::TextNotFound.as_str()]);
+    }
+
+    #[test]
+    fn integer_ranges_reject_fractions_and_signs() {
+        let chunk = "P-101 has 3,5 stages or -2 stages";
+        for (number, evidence) in [(3.5, "3,5 stages"), (-2.0, "-2 stages")] {
+            let checked = run(
+                chunk,
+                "",
+                vec![value(
+                    "r1",
+                    "stages",
+                    Some(number),
+                    Some(number),
+                    "",
+                    "",
+                    evidence,
+                )],
+            );
+            assert_eq!(reasons(&checked), [Reason::NotOfType.as_str()], "{number}");
+        }
+    }
+
+    #[test]
+    fn quotes_are_read_after_nfkc() {
+        let checked = run(
+            "P-101 power \u{ff17},\u{ff15} kW",
+            "",
+            vec![value(
+                "r1",
+                "power",
+                Some(7.5),
+                Some(7.5),
+                "kW",
+                "",
+                "\u{ff17},\u{ff15} kW",
+            )],
+        );
+        assert_eq!(checked.values.len(), 1, "{:?}", checked.drops);
+    }
+
+    #[test]
+    fn property_iris_are_case_sensitive() {
+        let mut wrong = value("r1", "power", Some(7.5), Some(7.5), "kW", "", "7,5 kW");
+        wrong["property"] = serde_json::json!("http://example.org/ex#Power");
+        assert_eq!(
+            reasons(&run(CHUNK, "", vec![wrong])),
+            [Reason::PropertyNotAllowed.as_str()]
         );
     }
 
@@ -498,6 +698,6 @@ mod tests {
             "",
             vec![value("r1", "power", Some(5.0), Some(5.0), "mw", "", "5 mw")],
         );
-        assert_eq!(reasons(&checked), [AMBIGUOUS_UNIT]);
+        assert_eq!(reasons(&checked), [Reason::AmbiguousUnit.as_str()]);
     }
 }
