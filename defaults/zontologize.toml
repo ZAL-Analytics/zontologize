@@ -252,6 +252,21 @@ passage_prefix = ""
 query_prefix = "Instruct: Given a question, retrieve passages that answer it\nQuery:"
 max_tokens = 512
 
+[persons]
+repo = "onnx-community/gliner_multi_pii-v1"
+revision = ""
+file = "onnx/model.onnx"
+tokenizer = "tokenizer.json"
+labels = ["person"]
+threshold = 0.5
+max_width = 12
+max_words = 384
+context_words = 20
+threads = 0
+workers = 4
+batch_size = 8
+read_batch = 200
+
 [resolve]
 strip_words = []
 fuzzy_score = 0.92

@@ -127,6 +127,25 @@ Per provider (`[providers.claude-code]`, `[providers.openrouter]`, `[providers.o
 | `llm.unknown_reset_wait_minutes` | `30` | Wait when a limit gives no reset time |
 | `llm.progress_secs` | `60` | Seconds between progress lines of a model job |
 
+### People (GLiNER)
+
+`zontologize persons` finds people in the chunks with a local GLiNER model (ONNX, CPU). It
+reads only the text around candidate names (two capitalised words close together) and keeps
+names of two or more capitalised words. The class it writes comes from `[persons]` in
+`rules.toml`. Unreadable chunks are skipped with the `embed.min_letter_share` and
+`embed.min_ocr_confidence` thresholds. On CPU the whole archive takes days: `--minutes N`
+stops after N minutes and the next run goes on, `--path PREFIX` (repeatable) reads only documents
+whose path starts with the prefix, for example one project folder.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `persons.repo` / `file` / `tokenizer` | `"onnx-community/gliner_multi_pii-v1"` / `"onnx/model.onnx"` / `"tokenizer.json"` | Hugging Face model; the int8 files of this repo find nothing, use the full model |
+| `persons.labels` | `["person"]` | GLiNER labels |
+| `persons.threshold` | `0.5` | Lowest span score kept |
+| `persons.max_width` | `12` | Longest span in words |
+| `persons.max_words` / `context_words` | `384` / `20` | Longest window, words read on each side of a candidate |
+| `persons.threads` / `workers` / `batch_size` / `read_batch` | `0` / `4` / `8` / `200` | Threads (0: all cores) shared by the model copies, model copies run side by side (each about 1 GB of memory), windows per model call (sorted by length), contents per round |
+
 ### Stage tuning
 
 The defaults work for most data. Commonly changed:
@@ -281,7 +300,37 @@ part_property = "acme:partOf"
 
 [[revisions]]                # link later revisions with dcterms:replaces
 pattern = '(?P<series>DWG-\d{3}) rev (?P<rev>[A-Z0-9]+)\.'
+
+[[number_keys]]              # resolve: names with a project number join the entity of that key
+class = "acme:Project"
+pattern = '(?i)^(?:P-?)?(?P<n>\d{4}-\d{4})(?:\s|$)'
+key = "P-{n}"
+
+[persons]                    # people from mail headers, e-mail addresses and signatures
+class = "acme:Person"
+sent_by = "acme:sentBy"
+sent_to = "acme:sentTo"
+works_for = "acme:worksFor"  # from the address's domain, when a gazetteer alias is that domain
+closings = ["kind regards", "met vriendelijke groet"]
+role_addresses = ["info", "sales"]
 ```
+
+A path rule entity can carry `props` from the path, for example
+`{ id = "p", class = "acme:Project", key = "{project}", props = { year = "{year}" } }`;
+an empty value is left out.
+
+A class gets a privacy category with `zontologize:privacyCategory "PERSON"` (upper-case
+letters and `_`); `zontologize_api.classes.privacy_category` shows it.
+
+`zontologize db fold-class --from <class> --into <class>` moves the entities of a class that left
+the ontology into another class, merging those with the same key.
+
+`zontologize db relocate --plan <file>` follows files that moved on disk to another source or
+folder. The plan is tab-separated, one line per file or folder: `from_source`, `from_path`,
+`to_source`, `to_path` (more columns and `#` lines are ignored). Documents keep their ids, so
+text, chunks, vectors, people and decisions stay; their path rules run again on the next scan.
+Every `to_source` must be in `[[sources]]`; a source that is no longer configured and has no
+documents left is removed. Move the files first, change `[[sources]]`, then relocate and scan.
 
 ## Gazetteer
 

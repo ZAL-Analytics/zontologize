@@ -38,6 +38,25 @@ pub fn cached(model: &Model, cache_dir: &str) -> Result<Files> {
 
 fn files(model: &Model, cache_dir: &str, local_only: bool) -> Result<Files> {
     let settings = &model.settings;
+    let wanted = Wanted {
+        repo: &settings.repo,
+        revision: &settings.revision,
+        file: &settings.file,
+        data_files: &settings.data_files,
+        tokenizer: &settings.tokenizer,
+    };
+    hub_files(&wanted, cache_dir, local_only)
+}
+
+pub struct Wanted<'a> {
+    pub repo: &'a str,
+    pub revision: &'a str,
+    pub file: &'a str,
+    pub data_files: &'a [String],
+    pub tokenizer: &'a str,
+}
+
+pub fn hub_files(wanted: &Wanted, cache_dir: &str, local_only: bool) -> Result<Files> {
     let mut builder = hf_hub::HFClientBuilder::new();
     if !cache_dir.is_empty() {
         builder = builder.cache_dir(cache_dir);
@@ -45,9 +64,9 @@ fn files(model: &Model, cache_dir: &str, local_only: bool) -> Result<Files> {
     let client = builder
         .build_sync()
         .map_err(|e| anyhow!("cannot start the Hugging Face client: {e}"))?;
-    let (owner, name) = hf_hub::split_id(&settings.repo);
+    let (owner, name) = hf_hub::split_id(wanted.repo);
     let repository = client.model(owner, name);
-    let revision = (!settings.revision.is_empty()).then(|| settings.revision.clone());
+    let revision = (!wanted.revision.is_empty()).then(|| wanted.revision.to_string());
     let get = |file: &str| -> Result<PathBuf> {
         repository
             .download_file()
@@ -55,14 +74,14 @@ fn files(model: &Model, cache_dir: &str, local_only: bool) -> Result<Files> {
             .maybe_revision(revision.clone())
             .local_files_only(local_only)
             .send()
-            .map_err(|e| anyhow!("cannot get {file} of {}: {e}", settings.repo))
+            .map_err(|e| anyhow!("cannot get {file} of {}: {e}", wanted.repo))
     };
-    let model_path = get(&settings.file)?;
+    let model_path = get(wanted.file)?;
     let mut data = Vec::new();
-    for file in &settings.data_files {
+    for file in wanted.data_files {
         data.push(get(file)?);
     }
-    let tokenizer = get(&settings.tokenizer)?;
+    let tokenizer = get(wanted.tokenizer)?;
     let revision = snapshot_commit(&model_path)
         .or(revision)
         .with_context(|| format!("cannot tell the commit of {}", model_path.display()))?;

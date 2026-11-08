@@ -107,7 +107,7 @@ pub fn prepare(config_dir: Option<&Path>, only: &[String]) -> Result<Prepared> {
     })
 }
 
-fn resolve_root(config_dir: Option<&Path>, root: &str) -> PathBuf {
+pub fn resolve_root(config_dir: Option<&Path>, root: &str) -> PathBuf {
     let path = PathBuf::from(root);
     if path.is_absolute() {
         return path;

@@ -6,7 +6,8 @@ between versions; `select zontologize_api.contract_version()` says which contrac
 A run after new files arrive, from cron or by hand:
 
 ```sh
-zontologize scan && zontologize extract && zontologize attributes && zontologize embed \
+zontologize scan && zontologize persons && zontologize extract && zontologize attributes \
+  && zontologize embed \
   && zontologize resolve && zontologize graph sync
 ```
 
@@ -21,14 +22,14 @@ shows `running`, `running_since`, `last_scan_finished_at`, `ontology_version` an
 |---|---|
 | `sources` | Configured sources |
 | `documents` | Files that are not deleted; `status` is `present`, `skipped` (not read) or `error` |
-| `pages`, `chunks` | Text per content (`content_id`); `chunks.tsv` for full-text search |
+| `pages`, `chunks` | Text per content (`content_id`); `chunks.tsv` for full-text search without stemming (IDs), `chunks.tsv_stem` with Dutch and English stemming (since contract 3) |
 | `entities` | Things found; `canonical_id` groups duplicates |
 | `aliases` | Other names of an entity |
 | `mentions`, `class_mentions` | Where an entity or class is named: chunk or document, span, method, confidence |
 | `relations` | Facts between entities, without rejected ones; `status` is `auto`, `proposed` or `confirmed` |
 | `attributes` | Values of entities: `value_text` as found, `unit_text`, `unit_iri`, `low`/`high` as written and `si_low`/`si_high` in SI units, chunk, span, method, confidence; `superseded` when a newer revision replaces the document |
 | `units` | Units of the ontology: symbols, labels, `dimension`, `conversion_multiplier`, `conversion_offset` |
-| `classes`, `properties` | The selected ontology the facts use; attribute properties have `value_kind`, `quantity_kind`, `dimension` |
+| `classes`, `properties` | The selected ontology the facts use; attribute properties have `value_kind`, `quantity_kind`, `dimension`; `classes.privacy_category` (since contract 3) says how a class is hidden, from `zontologize:privacyCategory` |
 | `class_ancestors` | `iri`, `ancestor`, `depth` (0 is the class itself) |
 | `embedding_models`, `embeddings`, `class_embeddings` | Vectors, see [embeddings.md](embeddings.md) |
 | `graph_labels` | Graph label of each class and property |
@@ -59,6 +60,12 @@ set search_path = ag_catalog, "$user", public;
 A role that is not superuser cannot `load 'age'`; a superuser runs
 `alter role reader set session_preload_libraries = 'age';` once instead, and grants
 `usage` on `ag_catalog` and the graph schema.
+zontologize itself skips `load 'age'` when AGE is in `shared_preload_libraries` or
+`session_preload_libraries`, so it can run as a role that is not superuser (for example with
+`PGOPTIONS='-c role=zontologize_writer'`); that role needs `pg_read_all_settings` to see them.
+
+Entity names and aliases have trigram indexes on `lower(name)` and `lower(alias)` (`pg_trgm`),
+so `similarity(lower(name), lower($1))` finds names with typos.
 
 Every vertex label has an index on its properties, so a lookup by `id`, `key` or `name` is fast,
 fastest with a label. While `graph sync` runs, Cypher queries wait a few seconds. Fixed patterns

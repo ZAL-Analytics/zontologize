@@ -33,8 +33,8 @@ pub struct Row {
 const STORED: &str = "select id, path, external_id, file, sha256, size, mtime, kind, status, reason \
                       from documents where source_id = $1";
 
-pub async fn upsert_source(
-    pool: &PgPool,
+pub async fn upsert_source<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     name: &str,
     kind: &str,
     root: &str,
@@ -51,9 +51,53 @@ pub async fn upsert_source(
     .bind(root)
     .bind(dataset)
     .bind(view)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(id)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Relocation {
+    pub from_source: String,
+    pub from_path: String,
+    pub to_source: String,
+    pub to_path: String,
+}
+
+pub async fn relocate(
+    conn: &mut sqlx::PgConnection,
+    from_source: i64,
+    from_path: &str,
+    to_source: i64,
+    to_path: &str,
+) -> Result<u64> {
+    let moved = sqlx::query(
+        "update documents set source_id = $3, \
+         path = $4 || substr(path, char_length($2) + 1), rules_key = null \
+         where source_id = $1 and (path = $2 or starts_with(path, $2 || '/'))",
+    )
+    .bind(from_source)
+    .bind(from_path)
+    .bind(to_source)
+    .bind(to_path)
+    .execute(conn)
+    .await?
+    .rows_affected();
+    Ok(moved)
+}
+
+pub async fn drop_empty_sources(
+    conn: &mut sqlx::PgConnection,
+    keep: &[String],
+) -> Result<Vec<String>> {
+    let names = sqlx::query_scalar(
+        "delete from sources s where s.name <> all($1) \
+         and not exists (select 1 from documents d where d.source_id = s.id) returning name",
+    )
+    .bind(keep)
+    .fetch_all(conn)
+    .await?;
+    Ok(names)
 }
 
 pub async fn source_ids(pool: &PgPool, names: &[String]) -> Result<Vec<i64>> {
@@ -313,4 +357,54 @@ pub async fn merge_moves(pool: &PgPool, source_id: i64, run_id: i64) -> Result<u
     .await?;
     tx.commit().await?;
     Ok(old_ids.len() as u64)
+}
+
+pub fn parse_plan(text: &str) -> Result<Vec<Relocation>> {
+    let mut plan = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [from_source, from_path, to_source, to_path, ..] = fields[..] else {
+            anyhow::bail!("line {}: needs four tab-separated columns", number + 1);
+        };
+        if [from_source, from_path, to_source, to_path]
+            .iter()
+            .any(|field| field.is_empty() || field.ends_with('/'))
+        {
+            anyhow::bail!("line {}: an empty column or a path ending in /", number + 1);
+        }
+        plan.push(Relocation {
+            from_source: from_source.to_string(),
+            from_path: from_path.to_string(),
+            to_source: to_source.to_string(),
+            to_path: to_path.to_string(),
+        });
+    }
+    Ok(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plan_skips_comments_and_extra_columns() {
+        let plan = parse_plan(
+            "# source\tpath\tto_source\tto_path\n\n\
+             old\tP-1 Acme\tprojects\tP-1 Acme\tarchive/old\tarchive/new\n\
+             old\tloose.pdf\tgeneral\tLoose/loose.pdf\n",
+        )
+        .unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[1].to_path, "Loose/loose.pdf");
+        assert_eq!(plan[0].to_source, "projects");
+    }
+
+    #[test]
+    fn a_plan_line_needs_four_columns() {
+        assert!(parse_plan("old\tP-1\tprojects\n").is_err());
+        assert!(parse_plan("old\tP-1/\tprojects\tP-1\n").is_err());
+    }
 }

@@ -59,6 +59,21 @@ enum Command {
         about = "Link entities that are the same thing and documents that name or replace each other"
     )]
     Resolve,
+    #[command(about = "Find people in the chunks with the local GLiNER model")]
+    Persons {
+        #[arg(
+            long,
+            value_name = "MINUTES",
+            help = "Stop after this many minutes; the next run goes on"
+        )]
+        minutes: Option<u64>,
+        #[arg(
+            long = "path",
+            value_name = "PREFIX",
+            help = "Only read documents whose path starts with this prefix; repeat for more"
+        )]
+        paths: Vec<String>,
+    },
     #[command(subcommand, about = "Evaluation commands")]
     Eval(EvalCommand),
     #[command(subcommand, about = "Fact review commands")]
@@ -319,6 +334,35 @@ enum DbCommand {
     Migrate,
     #[command(about = "Show server, extension, schema and migration state")]
     Check,
+    #[command(
+        name = "fold-class",
+        about = "Move every entity of a class that left the ontology into another class, merging entities with the same key"
+    )]
+    FoldClass {
+        #[arg(
+            long,
+            value_name = "CLASS",
+            help = "Class the entities leave (prefixed name or IRI)"
+        )]
+        from: String,
+        #[arg(
+            long,
+            value_name = "CLASS",
+            help = "Class they join (prefixed name or IRI)"
+        )]
+        into: String,
+    },
+    #[command(
+        about = "Move documents to other sources and paths after the files moved on disk, keeping their ids, text and vectors"
+    )]
+    Relocate {
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Tab-separated plan: from_source, from_path, to_source, to_path"
+        )]
+        plan: PathBuf,
+    },
 }
 
 fn now_seed() -> String {
@@ -348,6 +392,12 @@ fn main() -> ExitCode {
         match cli.command {
             Command::Db(DbCommand::Migrate) => zontologize::db_migrate(config).await,
             Command::Db(DbCommand::Check) => zontologize::db_check(config).await,
+            Command::Db(DbCommand::FoldClass { from, into }) => {
+                zontologize::db_fold_class(config, &from, &into).await
+            }
+            Command::Db(DbCommand::Relocate { plan }) => {
+                zontologize::db_relocate(config, &plan).await
+            }
             Command::Ontology(OntologyCommand::Check) => zontologize::ontology_check(config),
             Command::Ontology(OntologyCommand::Export { out }) => {
                 zontologize::ontology_export(config, &out).await
@@ -392,6 +442,10 @@ fn main() -> ExitCode {
                 zontologize::embed(config, &options).await
             }
             Command::Resolve => zontologize::resolve(config).await,
+            Command::Persons { minutes, paths } => {
+                let options = zontologize::persons::run::Options { minutes, paths };
+                zontologize::persons(config, &options).await
+            }
             Command::Eval(EvalCommand::Embed {
                 models,
                 sample,

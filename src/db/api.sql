@@ -1,5 +1,5 @@
 create or replace function {api}.contract_version() returns integer
-    language sql immutable as 'select 2';
+    language sql immutable as 'select 3';
 
 create or replace view {api}.sources as
 select id, name, kind, root, dataset
@@ -20,7 +20,7 @@ where exists (select 1 from {schema}.documents d
     where d.content_id = p.content_id and d.status = 'present');
 
 create or replace view {api}.chunks as
-select c.id, c.content_id, c.ord, c.page_from, c.page_to, c.text, c.ts_config, c.tsv
+select c.id, c.content_id, c.ord, c.page_from, c.page_to, c.text, c.ts_config, c.tsv, c.tsv_stem
 from {schema}.chunks c
 where exists (select 1 from {schema}.documents d
     where d.content_id = c.content_id and d.status = 'present');
@@ -49,7 +49,7 @@ from {schema}.relations
 where status <> 'rejected';
 
 create or replace view {api}.classes as
-select c.iri, c.parents, c.types, c.labels, c.alt_labels, c.definition
+select c.iri, c.parents, c.types, c.labels, c.alt_labels, c.definition, c.privacy_category
 from {schema}.classes c
 where c.selected and c.ontology_version_id = ({current});
 

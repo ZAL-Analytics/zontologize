@@ -27,6 +27,7 @@ chunks.page_to
 chunks.text
 chunks.ts_config
 chunks.tsv
+chunks.tsv_stem
 class_ancestors.iri
 class_ancestors.ancestor
 class_ancestors.depth
@@ -48,6 +49,7 @@ classes.types
 classes.labels
 classes.alt_labels
 classes.definition
+classes.privacy_category
 documents.id
 documents.source_id
 documents.path

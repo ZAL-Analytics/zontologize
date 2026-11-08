@@ -31,6 +31,7 @@ pub struct Config {
     pub review: ReviewConfig,
     pub embed: EmbedConfig,
     pub resolve: ResolveConfig,
+    pub persons: PersonsConfig,
     pub export: ExportConfig,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
@@ -75,6 +76,24 @@ pub struct EmbedConfig {
     pub read_batch: i64,
     pub progress_secs: u64,
     pub models: BTreeMap<String, EmbedModelConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonsConfig {
+    pub repo: String,
+    pub revision: String,
+    pub file: String,
+    pub tokenizer: String,
+    pub labels: Vec<String>,
+    pub threshold: f32,
+    pub max_width: usize,
+    pub max_words: usize,
+    pub context_words: usize,
+    pub threads: usize,
+    pub workers: usize,
+    pub batch_size: usize,
+    pub read_batch: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
