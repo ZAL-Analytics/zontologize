@@ -11,7 +11,7 @@ cargo test
 ZONTOLOGIZE_TEST_DATABASE_URL=postgres://... cargo test -- --include-ignored
 ```
 
-The second test run needs PostgreSQL with the `vector` and `age` extensions. A change to a hot
+The second test run needs PostgreSQL with the `vector`, `age` and `pg_trgm` extensions. A change to a hot
 path (walk, hash, extract, chunk, rules, database writes) comes with `cargo bench` numbers.
 
 ## Code

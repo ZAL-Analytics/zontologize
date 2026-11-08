@@ -9,7 +9,7 @@ Status: early development.
 ## Requirements
 
 - Rust stable (edition 2024), cmake and a C++ compiler
-- PostgreSQL 18 with the `vector` (0.8+) and `age` (1.8+) extensions
+- PostgreSQL 18 with the `vector` (0.8+), `age` (1.8+) and `pg_trgm` extensions
 
 ## Setup
 
@@ -22,6 +22,7 @@ Create the extensions once as a superuser (zontologize never does this itself):
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS age;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 ```
 
 Set `DATABASE_URL` (or the `PG*` variables), then create the schema:

@@ -253,6 +253,7 @@ pub async fn write(
                 method: method.to_string(),
                 confidence: confidence.of(&entity.class) * chunk.scale,
                 document_id: None,
+                props: std::collections::BTreeMap::new(),
             });
         }
     }

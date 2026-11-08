@@ -201,6 +201,7 @@ impl IdPatterns {
                     end: found.end(),
                     method: super::REGEX_METHOD,
                     confidence: 1.0,
+                    props: BTreeMap::new(),
                 });
             }
         }
@@ -294,6 +295,7 @@ impl IdPattern {
                 end: found.end(),
                 method: super::REGEX_METHOD,
                 confidence: 1.0,
+                props: BTreeMap::new(),
             });
         }
         None

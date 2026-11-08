@@ -12,6 +12,7 @@ pub mod hash;
 pub mod llm;
 pub mod ns;
 pub mod ontology;
+pub mod persons;
 pub mod resolve;
 pub mod review;
 pub mod rules;
@@ -48,6 +49,109 @@ pub async fn db_migrate(config_dir: Option<&Path>) -> Result<ExitCode> {
     }
     println!("schema {api}: views up to date");
     Ok(ExitCode::SUCCESS)
+}
+
+pub async fn db_fold_class(config_dir: Option<&Path>, from: &str, into: &str) -> Result<ExitCode> {
+    let config = config::load(config_dir)?;
+    let ontology = ontology::load_or_empty(config_dir, &config.ontology)?;
+    let from = ontology.resolve(from).map_err(anyhow::Error::msg)?;
+    let into = ontology
+        .class(into)
+        .map_err(anyhow::Error::msg)?
+        .iri
+        .clone();
+    let schema = &config.database.schema;
+    let mut conn = db::connect(database_url().as_deref(), schema).await?;
+    let result = async {
+        db::runs::take_lock(&mut conn, schema).await?;
+        let mut tx = sqlx::Connection::begin(&mut conn).await?;
+        let folded = db::entities::fold_class(&mut tx, &from, &into).await?;
+        tx.commit().await?;
+        anyhow::Ok(folded)
+    }
+    .await;
+    let _ = db::runs::unlock(&mut conn, schema).await;
+    db::close(conn).await;
+    let folded = result?;
+    println!(
+        "{from}: {} merged into an entity of {into}, {} moved to {into}",
+        folded.merged, folded.moved
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+pub async fn db_relocate(config_dir: Option<&Path>, plan: &Path) -> Result<ExitCode> {
+    let config = config::load(config_dir)?;
+    let text =
+        std::fs::read_to_string(plan).with_context(|| format!("cannot read {}", plan.display()))?;
+    let plan = db::documents::parse_plan(&text)?;
+    let schema = &config.database.schema;
+    let mut conn = db::connect(database_url().as_deref(), schema).await?;
+    let result = async {
+        db::runs::take_lock(&mut conn, schema).await?;
+        let mut tx = sqlx::Connection::begin(&mut conn).await?;
+        let done = relocate(&mut tx, &config, config_dir, &plan).await?;
+        tx.commit().await?;
+        anyhow::Ok(done)
+    }
+    .await;
+    let _ = db::runs::unlock(&mut conn, schema).await;
+    db::close(conn).await;
+    let (moved, dropped) = result?;
+    println!(
+        "{moved} documents moved by {} plan lines; their rules run again on the next scan",
+        plan.len()
+    );
+    for name in dropped {
+        println!("source {name}: empty and not configured, removed");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub async fn relocate(
+    conn: &mut sqlx::PgConnection,
+    config: &config::Config,
+    config_dir: Option<&Path>,
+    plan: &[db::documents::Relocation],
+) -> Result<(u64, Vec<String>)> {
+    let mut ids = std::collections::HashMap::new();
+    let mut moved = 0;
+    for line in plan {
+        let from: i64 = sqlx::query_scalar("select id from sources where name = $1")
+            .bind(&line.from_source)
+            .fetch_optional(&mut *conn)
+            .await?
+            .with_context(|| format!("no source {}", line.from_source))?;
+        let to = match ids.get(&line.to_source) {
+            Some(id) => *id,
+            None => {
+                let source = config
+                    .sources
+                    .iter()
+                    .find(|s| s.name == line.to_source)
+                    .with_context(|| format!("no [[sources]] entry {}", line.to_source))?;
+                let root = scan::resolve_root(config_dir, &source.root);
+                let view =
+                    (source.kind == config::SourceKind::Table).then_some(source.view.as_str());
+                let id = db::documents::upsert_source(
+                    &mut *conn,
+                    &source.name,
+                    source.kind.as_str(),
+                    &root.display().to_string(),
+                    &source.dataset,
+                    view,
+                )
+                .await?;
+                ids.insert(line.to_source.clone(), id);
+                id
+            }
+        };
+        moved +=
+            db::documents::relocate(&mut *conn, from, &line.from_path, to, &line.to_path).await?;
+    }
+    let keep: Vec<String> = config.sources.iter().map(|s| s.name.clone()).collect();
+    let dropped = db::documents::drop_empty_sources(&mut *conn, &keep).await?;
+    Ok((moved, dropped))
 }
 
 pub async fn db_check(config_dir: Option<&Path>) -> Result<ExitCode> {
@@ -259,6 +363,24 @@ pub async fn eval_embed(
 ) -> Result<ExitCode> {
     let path = embed::eval::run(config_dir, database_url().as_deref(), options).await?;
     println!("eval embed: report in {}", path.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+pub async fn persons(
+    config_dir: Option<&Path>,
+    options: &persons::run::Options,
+) -> Result<ExitCode> {
+    let stats = persons::run::run(config_dir, database_url().as_deref(), options).await?;
+    println!(
+        "persons: {} contents, {} chunks ({} unreadable), {} windows, {} names, {} contents left, {:.0} s",
+        stats.contents,
+        stats.chunks,
+        stats.skipped,
+        stats.windows,
+        stats.people,
+        stats.left,
+        stats.seconds
+    );
     Ok(ExitCode::SUCCESS)
 }
 

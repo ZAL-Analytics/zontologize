@@ -253,7 +253,7 @@ async fn the_views_keep_their_contract() {
     let version = env
         .count(&format!("select {api}.contract_version()::bigint"))
         .await;
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 
     let documents = env
         .count(&format!("select count(*) from {api}.documents"))
@@ -327,4 +327,41 @@ async fn the_database_runs_the_pinned_age_version() {
         .unwrap();
     zontologize::db::close(conn).await;
     zontologize::db::graph::check_age(version.as_deref()).unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_label_no_longer_used_is_emptied() {
+    let env = acme("label_drop").await;
+    sync(&env).await;
+    let labels = format!(
+        "select count(*) from ag_catalog.ag_label l join ag_catalog.ag_graph g on g.graphid = l.graph \
+         where g.name = '{}_graph'",
+        env.schema
+    );
+    let before = env.count(&labels).await;
+    let class: String = sqlx::query_scalar(
+        "select class_iri from entities where document_id is null group by 1 order by count(*) limit 1",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    let removed = sqlx::query(
+        "delete from entities where class_iri = (select class_iri from entities \
+         where document_id is null group by 1 order by count(*) limit 1)",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert!(removed > 0);
+    sync(&env).await;
+    assert_eq!(env.count(&labels).await, before);
+    let left = cypher(
+        &env,
+        &format!("match (v) where v.class = '{class}' return v"),
+    )
+    .await;
+    assert_eq!(left, 0);
+    env.finish().await;
 }

@@ -104,6 +104,15 @@ pub async fn properties(pool: &PgPool, language: &str) -> Result<Vec<(String, Op
 }
 
 async fn load_age(conn: &mut PgConnection) -> Result<()> {
+    let preloaded: bool = sqlx::query_scalar(
+        "select 'age' = any(string_to_array(replace(current_setting('shared_preload_libraries') \
+         || ',' || current_setting('session_preload_libraries'), ' ', ''), ','))",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if preloaded {
+        return Ok(());
+    }
     if let Err(error) = sqlx::query("load 'age'").execute(&mut *conn).await {
         bail!(
             "cannot load AGE ({error}); a superuser has to add 'age' to \
@@ -176,18 +185,6 @@ fn age_kind(kind: Kind) -> &'static str {
 
 async fn ensure_labels(conn: &mut PgConnection, graph: &str, labels: &[Label]) -> Result<()> {
     let have = existing(conn, graph).await?;
-    for (name, kind) in &have {
-        let wanted = labels
-            .iter()
-            .any(|l| &l.name == name && age_kind(l.kind) == kind);
-        if !wanted {
-            sqlx::query("select ag_catalog.drop_label($1, $2, true)")
-                .bind(graph)
-                .bind(name)
-                .execute(&mut *conn)
-                .await?;
-        }
-    }
     for label in labels {
         let present = have
             .iter()

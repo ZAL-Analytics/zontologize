@@ -1,7 +1,9 @@
 pub mod gazetteer;
 pub mod ids;
+pub mod numbers;
 pub mod pages;
 pub mod path;
+pub mod persons;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::hash::hex;
 use crate::ontology::Ontology;
 
-pub const STAGE_VERSION: u32 = 3;
+pub const STAGE_VERSION: u32 = 5;
 const DEFAULT_RULES: &str = include_str!("../../defaults/rules.toml");
 const RULES_FILE: &str = "rules.toml";
 const GAZETTEER_DIR: &str = "gazetteer";
@@ -57,6 +59,9 @@ struct RulesFile {
     pages: Option<pages::PagesSpec>,
     #[serde(default)]
     revisions: Vec<RevisionSpec>,
+    #[serde(default)]
+    number_keys: Vec<numbers::NumberKeySpec>,
+    persons: Option<persons::PersonsSpec>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -99,6 +104,7 @@ pub struct EntityHit {
     pub end: usize,
     pub method: &'static str,
     pub confidence: f64,
+    pub props: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -131,10 +137,25 @@ pub struct DocumentFacts {
     pub classes: Vec<ClassHit>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum TextEnd {
+    Document,
+    Entity(usize),
+    Known(String, String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextRelation {
+    pub from: TextEnd,
+    pub property: String,
+    pub to: TextEnd,
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub struct TextFacts {
     pub entities: Vec<EntityHit>,
     pub classes: Vec<ClassHit>,
+    pub relations: Vec<TextRelation>,
     pub rejected: usize,
 }
 
@@ -149,6 +170,8 @@ pub struct Rules {
     pub part_property: Option<String>,
     pub lexicon: gazetteer::Lexicon,
     pub revisions: Vec<Revision>,
+    pub numbers: Vec<numbers::NumberKey>,
+    pub persons: Option<persons::Persons>,
 }
 
 struct Sources {
@@ -302,6 +325,15 @@ pub fn compile(
             order: spec.order,
         });
     }
+    let numbers = numbers::compile(&file.number_keys, ontology)
+        .map_err(|e| anyhow::anyhow!("{rules_name}: {e}"))?;
+    let persons = match &file.persons {
+        Some(spec) => Some(
+            persons::compile(spec, ontology, &lexicon.entries)
+                .map_err(|e| anyhow::anyhow!("{rules_name}: {e}"))?,
+        ),
+        None => None,
+    };
     if path_rules.iter().any(|r| r.uses_document())
         && document_class.is_none()
         && doc_types.is_empty()
@@ -321,6 +353,8 @@ pub fn compile(
         part_property,
         lexicon,
         revisions,
+        numbers,
+        persons,
     })
 }
 
@@ -396,6 +430,10 @@ impl Rules {
         }
         let (gazetteer, mut classes) = self.lexicon.find(text);
         entities.extend(gazetteer);
+        let mut relations = Vec::new();
+        if let Some(persons) = &self.persons {
+            relations = person_facts(persons, text, &mut entities);
+        }
         char_offsets(text, &mut entities, &mut classes);
         if let Some(scale) = ocr {
             entities.iter_mut().for_each(|hit| hit.confidence *= scale);
@@ -404,6 +442,7 @@ impl Rules {
         TextFacts {
             entities,
             classes,
+            relations,
             rejected,
         }
     }
@@ -420,6 +459,42 @@ impl Rules {
             .and_then(|t| self.doc_types.get(t))
             .or(self.document_class.as_ref())
             .map(String::as_str)
+    }
+}
+
+fn person_facts(
+    persons: &persons::Persons,
+    text: &str,
+    entities: &mut Vec<EntityHit>,
+) -> Vec<TextRelation> {
+    let mut relations = Vec::new();
+    for (index, hit) in entities.iter().enumerate() {
+        if hit.class != persons.class {
+            continue;
+        }
+        if let Some(org) = persons.works_for_key(&hit.key) {
+            relations.push(TextRelation {
+                from: TextEnd::Entity(index),
+                property: persons.works_for().to_string(),
+                to: TextEnd::Known(org.class, org.key),
+            });
+        }
+    }
+    let found = persons.find(text);
+    let shift = entities.len();
+    entities.extend(found.entities);
+    relations.extend(found.relations.into_iter().map(|relation| TextRelation {
+        from: shifted(relation.from, shift),
+        property: relation.property,
+        to: shifted(relation.to, shift),
+    }));
+    relations
+}
+
+fn shifted(end: TextEnd, shift: usize) -> TextEnd {
+    match end {
+        TextEnd::Entity(index) => TextEnd::Entity(index + shift),
+        other => other,
     }
 }
 

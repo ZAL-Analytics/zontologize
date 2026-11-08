@@ -11,7 +11,7 @@ use crate::hash::hex;
 use crate::ns::{OWL, QUDT, RDF, RDFS, SKOS, XSD};
 
 const ZONTOLOGIZE: &str = "urn:zontologize#";
-pub const STORE_FORMAT: u32 = 2;
+pub const STORE_FORMAT: u32 = 3;
 
 pub const TOLERANCE: &str = "urn:zontologize#similarityTolerance";
 const NUMBER_TYPES: [&str; 16] = [
@@ -72,6 +72,7 @@ pub struct Class {
     pub labels: LangMap<String>,
     pub alt_labels: LangMap<Vec<String>>,
     pub definition: LangMap<String>,
+    pub privacy_category: Option<String>,
     pub selected: bool,
     pub meta: bool,
 }
@@ -226,6 +227,7 @@ struct Node {
     quantity_kinds: Vec<String>,
     deprecated: bool,
     tolerance: Option<String>,
+    privacy_category: Option<String>,
 }
 
 #[derive(Default)]
@@ -539,8 +541,27 @@ fn add_triple(
         ((QUDT, "hasQuantityKind"), Some(iri), _) => node.quantity_kinds.push(iri),
         ((QUDT, "deprecated"), _, Some((_, value))) => node.deprecated = value == "true",
         ((ZONTOLOGIZE, "similarityTolerance"), _, Some((_, value))) => node.tolerance = Some(value),
+        ((ZONTOLOGIZE, "privacyCategory"), _, Some((_, value))) => {
+            node.privacy_category = Some(value)
+        }
         _ => {}
     }
+}
+
+fn privacy_category(
+    iri: &str,
+    value: Option<String>,
+    findings: &mut Vec<Finding>,
+) -> Option<String> {
+    let value = value?;
+    let valid = !value.is_empty() && value.chars().all(|c| c.is_ascii_uppercase() || c == '_');
+    if valid {
+        return Some(value);
+    }
+    findings.push(Finding::error(format!(
+        "class {iri}: privacyCategory {value:?} is not an upper-case name such as PERSON"
+    )));
+    None
 }
 
 fn build(ontology: &mut Ontology, nodes: HashMap<String, Node>, findings: &mut Vec<Finding>) {
@@ -594,6 +615,7 @@ fn build(ontology: &mut Ontology, nodes: HashMap<String, Node>, findings: &mut V
                 labels,
                 alt_labels: all_per_language(&node.alt_labels, &languages),
                 definition: first_per_language(definitions, &languages),
+                privacy_category: privacy_category(&iri, node.privacy_category, findings),
                 selected: false,
                 meta: false,
             };
@@ -1565,6 +1587,37 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("onto#built: range") && m.contains("not extracted")),
             "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn privacy_category_is_read_and_checked() {
+        let text = "@prefix z: <urn:zontologize#> .\n\
+            ex:Person a owl:Class ; z:privacyCategory \"PERSON\" .\n\
+            ex:Site a owl:Class ; z:privacyCategory \"a place\" .\n\
+            ex:Pump a owl:Class .\n";
+        let loaded = load_text(&[text], &config(&[], &[]));
+        let classes = &loaded.ontology.classes;
+        assert_eq!(
+            classes["http://example.org/onto#Person"]
+                .privacy_category
+                .as_deref(),
+            Some("PERSON")
+        );
+        assert_eq!(
+            classes["http://example.org/onto#Site"].privacy_category,
+            None
+        );
+        assert_eq!(
+            classes["http://example.org/onto#Pump"].privacy_category,
+            None
+        );
+        let errors = messages(&loaded, Severity::Error);
+        assert!(
+            errors
+                .iter()
+                .any(|m| m.contains("onto#Site: privacyCategory")),
+            "{errors:?}"
         );
     }
 

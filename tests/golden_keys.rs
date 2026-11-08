@@ -55,7 +55,7 @@ fn scan_stage_keys_are_unchanged() {
     );
     let ontology = acme_ontology(&config);
     let rules = rules::load(Some(&acme()), &ontology, &config.ontology.document_class).unwrap();
-    assert_eq!(rules.key, "rules-v3-be9ca4f98f6a298a");
+    assert_eq!(rules.key, "rules-v5-331c5cf4cd50fbed");
 }
 
 #[test]
@@ -63,7 +63,7 @@ fn ontology_version_is_unchanged() {
     let config = config();
     assert_eq!(
         acme_ontology(&config).version,
-        "a5478ba9de54f930d4e0794ad26357454e6d8bae7527f1d72564184f3b6fbcc2"
+        "594cffe2a9aa4f791a8a7152fb0642d19ff046b9aa2d32ede1b270f7faadf21f"
     );
 }
 

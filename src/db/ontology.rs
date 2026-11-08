@@ -58,6 +58,7 @@ pub async fn store(pool: &PgPool, ontology: &Ontology, run_id: i64) -> Result<(i
                 Some(&labels),
                 Some(&alt_labels),
                 Some(&definition),
+                class.privacy_category.as_deref(),
                 Some(if class.selected { "t" } else { "f" }),
             ],
         );
@@ -66,7 +67,7 @@ pub async fn store(pool: &PgPool, ontology: &Ontology, run_id: i64) -> Result<(i
         let mut copy = tx
             .copy_in_raw(
                 "copy classes (ontology_version_id, iri, parents, types, labels, alt_labels, \
-                 definition, selected) from stdin",
+                 definition, privacy_category, selected) from stdin",
             )
             .await?;
         copy.send(data.into_bytes()).await?;
@@ -160,6 +161,7 @@ struct ClassRow {
     labels: sqlx::types::Json<crate::ontology::LangMap<String>>,
     alt_labels: sqlx::types::Json<crate::ontology::LangMap<Vec<String>>>,
     definition: sqlx::types::Json<crate::ontology::LangMap<String>>,
+    privacy_category: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -201,7 +203,7 @@ pub async fn selected(pool: &PgPool, version_id: i64) -> Result<Stored> {
         .fetch_one(pool)
         .await?;
     let classes: Vec<ClassRow> = sqlx::query_as(
-        "select iri, parents, types, labels, alt_labels, definition from classes \
+        "select iri, parents, types, labels, alt_labels, definition, privacy_category from classes \
          where ontology_version_id = $1 and selected order by iri",
     )
     .bind(version_id)
@@ -224,6 +226,7 @@ pub async fn selected(pool: &PgPool, version_id: i64) -> Result<Stored> {
             labels: row.labels.0,
             alt_labels: row.alt_labels.0,
             definition: row.definition.0,
+            privacy_category: row.privacy_category,
             selected: true,
             meta: false,
         })

@@ -11,6 +11,7 @@ pub mod graph;
 pub mod llm;
 pub mod migrate;
 pub mod ontology;
+pub mod persons;
 pub mod pool;
 pub mod resolve;
 pub mod review;
@@ -24,7 +25,7 @@ use anyhow::{Context, Result};
 use sqlx::postgres::{PgConnectOptions, PgConnection};
 use sqlx::{ConnectOptions, Connection};
 
-pub const EXTENSIONS: [&str; 2] = ["vector", "age"];
+pub const EXTENSIONS: [&str; 3] = ["vector", "age", "pg_trgm"];
 
 pub const MODEL_METHODS: &str = "llm:%";
 pub const RESOLVE_METHODS: &str = "resolve:%";
@@ -34,9 +35,11 @@ pub const OCR_CONFIDENCE: &str = "(select min(p.ocr_confidence) from pages p \
     and p.page_no between coalesce(k.page_from, 0) and coalesce(k.page_to, 2147483647))";
 
 const VECTOR_PATH: &str = "select set_config('search_path', \
-    current_setting('search_path') || ', ' || quote_ident(n.nspname), false) \
+    current_setting('search_path') || ', ' || string_agg(distinct quote_ident(n.nspname), ', '), \
+    false) \
     from pg_extension e join pg_namespace n on n.oid = e.extnamespace \
-    where e.extname = 'vector' and n.nspname <> all(current_schemas(false))";
+    where e.extname in ('vector', 'pg_trgm') and n.nspname <> all(current_schemas(false)) \
+    having count(*) > 0";
 
 pub async fn connect(url: Option<&str>, schema: &str) -> Result<PgConnection> {
     let options = match url {

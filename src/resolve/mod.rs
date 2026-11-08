@@ -148,6 +148,7 @@ fn name_pairs(
             }
         }
     }
+    number_pairs(items, &by_key, &ids, rules, ontology, &mut pairs);
     exact_pairs(items, ontology, &mut pairs);
     for block in names::blocks(items, |e| &e.key, config.resolve.block_chars).values() {
         if block.len() > config.resolve.max_block {
@@ -175,6 +176,38 @@ fn name_pairs(
         }
     }
     pairs
+}
+
+fn number_pairs(
+    items: &[Eligible],
+    by_key: &HashMap<(&str, &str), i64>,
+    ids: &HashMap<i64, &Eligible>,
+    rules: &Rules,
+    ontology: &Ontology,
+    pairs: &mut BTreeMap<(i64, i64), Candidate>,
+) {
+    for item in items {
+        for rule in &rules.numbers {
+            if !ontology.is_a(&item.row.class_iri, &rule.class) {
+                continue;
+            }
+            let Some(key) = rule.key_of(&item.row.name) else {
+                continue;
+            };
+            let Some(&target) = by_key.get(&(rule.class.as_str(), key.as_str())) else {
+                continue;
+            };
+            if !ids.contains_key(&target) {
+                continue;
+            }
+            let candidate = Candidate {
+                rule: "number",
+                status: AUTO,
+                score: 1.0,
+            };
+            offer(pairs, item.row.id, target, candidate);
+        }
+    }
 }
 
 fn exact_pairs(

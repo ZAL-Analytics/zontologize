@@ -1,11 +1,11 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::Result;
 use sqlx::{FromRow, PgConnection, PgPool};
 
 use super::{MODEL_METHODS, RESOLVE_METHODS, copy_row};
 use crate::rules::pages::Segment;
-use crate::rules::{ClassHit, DocumentFacts, Endpoint, EntityHit, TextFacts};
+use crate::rules::{ClassHit, DocumentFacts, Endpoint, EntityHit, TextEnd, TextFacts};
 
 #[derive(Debug, Clone, FromRow)]
 pub struct DocumentWork {
@@ -84,7 +84,7 @@ pub struct ChunkOutput {
     pub facts: TextFacts,
 }
 
-pub(super) struct NewEntity {
+pub(crate) struct NewEntity {
     pub class: String,
     pub key: String,
     pub name: String,
@@ -92,6 +92,7 @@ pub(super) struct NewEntity {
     pub method: String,
     pub confidence: f64,
     pub document_id: Option<i64>,
+    pub props: BTreeMap<String, String>,
 }
 
 const DOCUMENTS_TO_RULE: &str = "from documents d join sources s on s.id = d.source_id \
@@ -208,6 +209,7 @@ fn best_entities(entities: Vec<NewEntity>) -> Vec<NewEntity> {
     for entity in entities {
         match index.get(&(entity.class.clone(), entity.key.clone())) {
             Some(&i) => {
+                best[i].props.extend(entity.props.clone());
                 if better_method(&entity, &best[i]) {
                     best[i].method = entity.method;
                     best[i].confidence = entity.confidence;
@@ -222,7 +224,7 @@ fn best_entities(entities: Vec<NewEntity>) -> Vec<NewEntity> {
     best
 }
 
-pub(super) async fn upsert_entities(
+pub(crate) async fn upsert_entities(
     conn: &mut PgConnection,
     entities: Vec<NewEntity>,
     version_id: i64,
@@ -234,7 +236,9 @@ pub(super) async fn upsert_entities(
     let mut methods = Vec::new();
     let mut confidences = Vec::new();
     let mut documents = Vec::new();
+    let mut props = Vec::new();
     for entity in best_entities(entities) {
+        props.push(sqlx::types::Json(entity.props));
         classes.push(entity.class);
         keys.push(entity.key);
         names.push(entity.name);
@@ -248,12 +252,13 @@ pub(super) async fn upsert_entities(
     }
     let rows: Vec<(i64, String, String)> = sqlx::query_as(
         "insert into entities (class_iri, key, name, dataset, method, confidence, document_id, \
-         ontology_version_id) \
-         select class_iri, key, name, dataset, method, confidence, document_id, $8 \
+         ontology_version_id, props) \
+         select class_iri, key, name, dataset, method, confidence, document_id, $8, props \
          from unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], \
-         $6::float8[], $7::bigint[]) \
-         as n(class_iri, key, name, dataset, method, confidence, document_id) \
+         $6::float8[], $7::bigint[], $10::jsonb[]) \
+         as n(class_iri, key, name, dataset, method, confidence, document_id, props) \
          on conflict (class_iri, key) do update set \
+         props = entities.props || excluded.props, \
          name = case when entities.name = entities.key then excluded.name else entities.name end, \
          method = case when (excluded.confidence, excluded.method not like $9) \
          > (entities.confidence, entities.method not like $9) \
@@ -271,6 +276,7 @@ pub(super) async fn upsert_entities(
     .bind(&documents)
     .bind(version_id)
     .bind(MODEL_METHODS)
+    .bind(&props)
     .fetch_all(&mut *conn)
     .await?;
     Ok(rows
@@ -288,15 +294,16 @@ fn new_entity(hit: &EntityHit, dataset: &str) -> NewEntity {
         method: hit.method.to_string(),
         confidence: hit.confidence,
         document_id: None,
+        props: hit.props.clone(),
     }
 }
 
-pub(super) enum Owner {
+pub(crate) enum Owner {
     Document(i64),
     Chunk(i64),
 }
 
-pub(super) fn mention_row(
+pub(crate) fn mention_row(
     data: &mut String,
     entity: i64,
     owner: &Owner,
@@ -349,7 +356,7 @@ fn class_row(data: &mut String, hit: &ClassHit, owner: &Owner) {
     );
 }
 
-pub(super) async fn copy(conn: &mut PgConnection, statement: &str, data: String) -> Result<()> {
+pub(crate) async fn copy(conn: &mut PgConnection, statement: &str, data: String) -> Result<()> {
     if data.is_empty() {
         return Ok(());
     }
@@ -400,6 +407,7 @@ pub async fn write_document_rules(
                     .unwrap_or_else(|| crate::rules::PATH_METHOD.to_string()),
                 confidence: output.type_confidence,
                 document_id: Some(output.id),
+                props: BTreeMap::new(),
             });
         }
         for hit in &facts.entities {
@@ -546,7 +554,7 @@ pub async fn write_text_rules(
         let sql = format!(
             "delete from {table} where chunk_id in \
              (select id from chunks where content_id = any($1)) \
-             and method not like $2 and method not like $3{}",
+             and method not like $2 and method not like $3 and method <> 'gliner'{}",
             open_only(table)
         );
         sqlx::query(sqlx::AssertSqlSafe(sql))
@@ -579,6 +587,7 @@ pub async fn write_text_rules(
                 method: entity.method.clone(),
                 confidence: entity.confidence,
                 document_id: None,
+                props: BTreeMap::new(),
             });
         }
     }
@@ -630,6 +639,7 @@ pub async fn write_text_rules(
     }
     copy(&mut tx, COPY_MENTIONS, mentions).await?;
     copy(&mut tx, COPY_CLASS_MENTIONS, class_mentions).await?;
+    write_text_relations(&mut tx, outputs, &map).await?;
     if let Some(property) = part_property
         && !sources.is_empty()
     {
@@ -660,6 +670,118 @@ pub async fn write_text_rules(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+const DOCUMENT_RELATIONS: &str = "insert into relations \
+    (src_id, property_iri, dst_id, method, confidence, chunk_id) \
+    select distinct on (e.id, u.property, u.dst) e.id, u.property, u.dst, u.method, \
+    u.confidence, u.chunk \
+    from unnest($1::bigint[], $2::text[], $3::bigint[], $4::text[], $5::float8[]) \
+    as u(chunk, property, dst, method, confidence) \
+    join chunks c on c.id = u.chunk \
+    join documents d on d.content_id = c.content_id and d.status = 'present' \
+    join entities e on e.document_id = d.id and e.key = d.id::text \
+    where not exists (select 1 from relations v where v.src_id = e.id \
+    and v.property_iri = u.property and v.dst_id = u.dst \
+    and (v.status in ('confirmed', 'rejected') or v.chunk_id = u.chunk))";
+
+const KNOWN_RELATIONS: &str = "insert into relations \
+    (src_id, property_iri, dst_id, method, confidence, chunk_id) \
+    select distinct on (u.src, u.property, e.id) u.src, u.property, e.id, u.method, \
+    u.confidence, u.chunk \
+    from unnest($1::bigint[], $2::text[], $3::text[], $4::text[], $5::text[], \
+    $6::float8[], $7::bigint[]) as u(src, property, class, key, method, confidence, chunk) \
+    join entities e on e.class_iri = u.class and e.key = u.key \
+    where not exists (select 1 from relations v where v.src_id = u.src \
+    and v.property_iri = u.property and v.dst_id = e.id)";
+
+#[derive(Default)]
+struct DocumentRows {
+    chunks: Vec<i64>,
+    properties: Vec<String>,
+    targets: Vec<i64>,
+    methods: Vec<String>,
+    confidences: Vec<f64>,
+}
+
+#[derive(Default)]
+struct KnownRows {
+    sources: Vec<i64>,
+    properties: Vec<String>,
+    classes: Vec<String>,
+    keys: Vec<String>,
+    methods: Vec<String>,
+    confidences: Vec<f64>,
+    chunks: Vec<i64>,
+}
+
+async fn write_text_relations(
+    conn: &mut PgConnection,
+    outputs: &[ChunkOutput],
+    map: &HashMap<(String, String), i64>,
+) -> Result<()> {
+    let mut documents = DocumentRows::default();
+    let mut known = KnownRows::default();
+    for output in outputs {
+        let entities = &output.facts.entities;
+        let id_of = |end: &TextEnd| match end {
+            TextEnd::Entity(index) => entities
+                .get(*index)
+                .and_then(|hit| map.get(&(hit.class.clone(), hit.key.clone())))
+                .map(|id| (*id, &entities[*index])),
+            _ => None,
+        };
+        for relation in &output.facts.relations {
+            match (&relation.from, &relation.to) {
+                (TextEnd::Document, to) => {
+                    let Some((target, hit)) = id_of(to) else {
+                        continue;
+                    };
+                    documents.chunks.push(output.id);
+                    documents.properties.push(relation.property.clone());
+                    documents.targets.push(target);
+                    documents.methods.push(hit.method.to_string());
+                    documents.confidences.push(hit.confidence);
+                }
+                (from, TextEnd::Known(class, key)) => {
+                    let Some((source, hit)) = id_of(from) else {
+                        continue;
+                    };
+                    known.sources.push(source);
+                    known.properties.push(relation.property.clone());
+                    known.classes.push(class.clone());
+                    known.keys.push(key.clone());
+                    known.methods.push(hit.method.to_string());
+                    known.confidences.push(hit.confidence);
+                    known.chunks.push(output.id);
+                }
+                _ => {}
+            }
+        }
+    }
+    if !documents.chunks.is_empty() {
+        sqlx::query(DOCUMENT_RELATIONS)
+            .bind(&documents.chunks)
+            .bind(&documents.properties)
+            .bind(&documents.targets)
+            .bind(&documents.methods)
+            .bind(&documents.confidences)
+            .execute(&mut *conn)
+            .await?;
+    }
+    if !known.sources.is_empty() {
+        sqlx::query(KNOWN_RELATIONS)
+            .bind(&known.sources)
+            .bind(&known.properties)
+            .bind(&known.classes)
+            .bind(&known.keys)
+            .bind(&known.methods)
+            .bind(&known.confidences)
+            .bind(&known.chunks)
+            .execute(&mut *conn)
+            .await?;
+    }
     Ok(())
 }
 
@@ -894,6 +1016,63 @@ fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+#[derive(Debug, Default, PartialEq)]
+pub struct Folded {
+    pub merged: u64,
+    pub moved: u64,
+}
+
+const FOLD_ALIASES: &str = "insert into aliases (entity_id, alias, lang, method) \
+    select o.id, a.alias, a.lang, a.method from entities c \
+    join entities o on o.class_iri = $2 and o.key = c.key \
+    join aliases a on a.entity_id = c.id where c.class_iri = $1 \
+    union all select o.id, c.name, '', 'fold' from entities c \
+    join entities o on o.class_iri = $2 and o.key = c.key \
+    where c.class_iri = $1 and c.name <> o.name \
+    on conflict do nothing";
+
+const FOLD_MENTIONS: &str = "update mentions m set entity_id = o.id from entities c \
+    join entities o on o.class_iri = $2 and o.key = c.key \
+    where c.class_iri = $1 and m.entity_id = c.id";
+
+const FOLD_SOURCES: &str = "update relations r set src_id = o.id from entities c \
+    join entities o on o.class_iri = $2 and o.key = c.key \
+    where c.class_iri = $1 and r.src_id = c.id";
+
+const FOLD_TARGETS: &str = "update relations r set dst_id = o.id from entities c \
+    join entities o on o.class_iri = $2 and o.key = c.key \
+    where c.class_iri = $1 and r.dst_id = c.id";
+
+const FOLD_DELETE: &str = "delete from entities c using entities o \
+    where c.class_iri = $1 and o.class_iri = $2 and o.key = c.key";
+
+pub async fn fold_class(conn: &mut PgConnection, from: &str, into: &str) -> Result<Folded> {
+    for statement in [FOLD_ALIASES, FOLD_MENTIONS, FOLD_SOURCES, FOLD_TARGETS] {
+        sqlx::query(statement)
+            .bind(from)
+            .bind(into)
+            .execute(&mut *conn)
+            .await?;
+    }
+    sqlx::query("delete from relations where src_id = dst_id")
+        .execute(&mut *conn)
+        .await?;
+    let merged = sqlx::query(FOLD_DELETE)
+        .bind(from)
+        .bind(into)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    let moved =
+        sqlx::query("update entities set class_iri = $2, canonical_id = null where class_iri = $1")
+            .bind(from)
+            .bind(into)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+    Ok(Folded { merged, moved })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,6 +1086,7 @@ mod tests {
             method: method.to_string(),
             confidence,
             document_id: None,
+            props: BTreeMap::new(),
         }
     }
 

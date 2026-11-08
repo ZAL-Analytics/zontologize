@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use anyhow::{Result, anyhow};
@@ -170,6 +170,7 @@ impl Lexicon {
                             end,
                             method: super::GAZETTEER_METHOD,
                             confidence: 1.0,
+                            props: BTreeMap::new(),
                         });
                     }
                     Target::Class(i) => classes.push(ClassHit {

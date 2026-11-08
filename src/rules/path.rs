@@ -32,6 +32,8 @@ struct EntitySpec {
     name: String,
     #[serde(default)]
     key_case: KeyCase,
+    #[serde(default)]
+    props: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +98,7 @@ struct EntityRule {
     key: Template,
     name: Template,
     key_case: KeyCase,
+    props: Vec<(String, Template)>,
 }
 
 #[derive(Debug)]
@@ -103,6 +106,16 @@ struct RelationRule {
     from: String,
     property: String,
     to: String,
+}
+
+fn entity_props(entity: &EntitySpec, regex: &Regex) -> Result<Vec<(String, Template)>, String> {
+    let mut props = Vec::new();
+    for (name, value) in &entity.props {
+        let template = Template::parse(value, regex)
+            .map_err(|e| format!("entities.{}.props.{name}: {e}", entity.id))?;
+        props.push((name.clone(), template));
+    }
+    Ok(props)
 }
 
 #[derive(Debug)]
@@ -157,6 +170,7 @@ impl PathRule {
                 name: Template::parse(name_text, &regex)
                     .map_err(|e| format!("entities.{}.name: {e}", entity.id))?,
                 key_case: entity.key_case,
+                props: entity_props(entity, &regex)?,
             });
         }
         let document_classes: Vec<String> = match (&doc_type, &spec.doc_type) {
@@ -248,6 +262,12 @@ impl PathRule {
             }
             let name = entity.name.fill(&captures).trim().to_string();
             local.push((&entity.id, facts.entities.len()));
+            let props = entity
+                .props
+                .iter()
+                .map(|(name, template)| (name.clone(), template.fill(&captures).trim().to_string()))
+                .filter(|(_, value)| !value.is_empty())
+                .collect();
             facts.entities.push(EntityHit {
                 class: entity.class.clone(),
                 name: if name.is_empty() { key.clone() } else { name },
@@ -256,6 +276,7 @@ impl PathRule {
                 end: whole.end,
                 method: super::PATH_METHOD,
                 confidence: 1.0,
+                props,
             });
         }
         let endpoint = |id: &str| -> Option<Endpoint> {
@@ -354,6 +375,20 @@ doc_type = "report"
                 },
             ]
         );
+    }
+
+    #[test]
+    fn entity_props_are_filled_and_empty_ones_dropped() {
+        let text = "[[path_rules]]\npattern = '^(?P<p>P-(?:(?P<y>20\\d\\d)\\d\\d|\\d{4}))/'\n\
+            [[path_rules.entities]]\nid = \"p\"\nclass = \"ex:Project\"\nkey = \"{p}\"\n\
+            props = { year = \"{y}\" }\n";
+        let rules = rules(text).unwrap();
+        let facts = rules.document_facts("P-200601/a.pdf");
+        let project = &facts.entities[0];
+        assert_eq!(project.key, "P-200601");
+        assert_eq!(project.props["year"], "2006");
+        let facts = rules.document_facts("P-4007/a.pdf");
+        assert!(facts.entities[0].props.is_empty());
     }
 
     #[test]
