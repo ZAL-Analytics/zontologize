@@ -1,5 +1,8 @@
 # zontologize
 
+[![Crates.io](https://img.shields.io/crates/v/zontologize.svg)](https://crates.io/crates/zontologize)
+[![Downloads](https://img.shields.io/crates/d/zontologize.svg)](https://crates.io/crates/zontologize)
+
 A Rust CLI that indexes folders into PostgreSQL, shaped by an OWL ontology (Turtle). It stores
 documents, pages, chunks, entities, relations and the provenance of every fact in its own schema.
 Runs are incremental: only changed files and stages are processed. CPU only.

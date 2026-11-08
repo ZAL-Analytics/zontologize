@@ -1,6 +1,6 @@
 [package]
 name = "zontologize"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 authors = ["Arsalan Anwari"]
 description = "A Rust CLI that indexes folders into PostgreSQL, shaped by an OWL ontology (Turtle)."
