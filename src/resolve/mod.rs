@@ -89,6 +89,7 @@ pub async fn run(config_dir: Option<&Path>, url: Option<&str>) -> Result<Stats> 
 struct Eligible<'a> {
     row: &'a EntityRow,
     key: String,
+    alias_keys: Vec<String>,
 }
 
 fn eligible<'a>(
@@ -108,11 +109,25 @@ fn eligible<'a>(
         .iter()
         .filter(|e| e.document_id.is_none() && !rules.is_document_class(ontology, &e.class_iri))
         .filter(|e| wanted.is_empty() || wanted.iter().any(|w| ontology.is_a(&e.class_iri, w)))
-        .map(|row| Eligible {
-            row,
-            key: normaliser.key(&row.name),
-        })
+        .map(|row| eligible_row(row, &normaliser))
         .collect()
+}
+
+fn eligible_row<'a>(row: &'a EntityRow, normaliser: &names::Normaliser) -> Eligible<'a> {
+    let key = normaliser.key(&row.name);
+    let mut alias_keys: Vec<String> = row
+        .aliases
+        .iter()
+        .map(|a| normaliser.key(a))
+        .filter(|k| !k.is_empty() && *k != key)
+        .collect();
+    alias_keys.sort();
+    alias_keys.dedup();
+    Eligible {
+        row,
+        key,
+        alias_keys,
+    }
 }
 
 fn name_pairs(
@@ -150,32 +165,67 @@ fn name_pairs(
     }
     number_pairs(items, &by_key, &ids, rules, ontology, &mut pairs);
     exact_pairs(items, ontology, &mut pairs);
-    for block in names::blocks(items, |e| &e.key, config.resolve.block_chars).values() {
+    let chars = config.resolve.block_chars;
+    let mut skipped = BTreeSet::new();
+    let mut compared = BTreeSet::new();
+    for (name, block) in names::blocks(items, |e| &e.key, chars) {
         if block.len() > config.resolve.max_block {
+            skipped.insert(name);
             continue;
         }
         for (n, &i) in block.iter().enumerate() {
             for &j in &block[n + 1..] {
-                let (a, b) = (&items[i], &items[j]);
-                if a.key == b.key
-                    || !names::compatible(ontology, &a.row.class_iri, &b.row.class_iri)
-                    || !names::digits_agree(&a.key, &b.key)
-                {
-                    continue;
-                }
-                let score = names::similarity(&a.key, &b.key);
-                if score >= config.resolve.fuzzy_score {
-                    let candidate = Candidate {
-                        rule: "fuzzy",
-                        status: PROPOSED,
-                        score,
-                    };
-                    offer(&mut pairs, a.row.id, b.row.id, candidate);
-                }
+                compared.insert((i, j));
             }
         }
     }
+    for (i, j) in compared {
+        let (a, b) = (&items[i], &items[j]);
+        if a.key == b.key
+            || !names::compatible(ontology, &a.row.class_iri, &b.row.class_iri)
+            || !names::digits_agree(&a.key, &b.key)
+        {
+            continue;
+        }
+        let score = names::similarity(&a.key, &b.key);
+        if score >= config.resolve.fuzzy_score {
+            let candidate = Candidate {
+                rule: "fuzzy",
+                status: PROPOSED,
+                score,
+            };
+            offer(&mut pairs, a.row.id, b.row.id, candidate);
+        }
+        if let Some(candidate) = partial(&a.key, &b.key, chars, &skipped) {
+            offer(&mut pairs, a.row.id, b.row.id, candidate);
+        }
+    }
     pairs
+}
+
+fn partial(a: &str, b: &str, chars: usize, skipped: &BTreeSet<String>) -> Option<Candidate> {
+    let (short, long) = if names::tokens(a).len() <= names::tokens(b).len() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let short_tokens = names::tokens(short);
+    let long_tokens = names::tokens(long);
+    if short_tokens.len() == 1 && names::acronym(long).as_deref() == Some(short) {
+        return Some(Candidate {
+            rule: "acronym",
+            status: PROPOSED,
+            score: 1.0,
+        });
+    }
+    let inside = short_tokens.iter().all(|t| long_tokens.contains(t));
+    let blocked =
+        names::blocking_tokens(short).any(|t| !skipped.contains(&names::block_of(t, chars)));
+    (inside && blocked).then(|| Candidate {
+        rule: "tokens",
+        status: PROPOSED,
+        score: short_tokens.len() as f64 / long_tokens.len() as f64,
+    })
 }
 
 fn number_pairs(
@@ -215,27 +265,49 @@ fn exact_pairs(
     ontology: &Ontology,
     pairs: &mut BTreeMap<(i64, i64), Candidate>,
 ) {
-    let mut groups: BTreeMap<&str, Vec<&Eligible>> = BTreeMap::new();
-    for item in items.iter().filter(|e| !e.key.is_empty()) {
-        groups.entry(&item.key).or_default().push(item);
+    let mut groups: BTreeMap<&str, Vec<(&Eligible, bool)>> = BTreeMap::new();
+    for item in items {
+        if !item.key.is_empty() {
+            groups.entry(&item.key).or_default().push((item, false));
+        }
+        for alias in &item.alias_keys {
+            groups.entry(alias).or_default().push((item, true));
+        }
     }
     for group in groups.values() {
-        let mut firsts: Vec<&Eligible> = Vec::new();
-        for item in group {
+        let mut firsts: Vec<(&Eligible, bool)> = Vec::new();
+        for &(item, by_alias) in group {
+            let class = &item.row.class_iri;
             let first = firsts
                 .iter()
-                .find(|e| names::compatible(ontology, &e.row.class_iri, &item.row.class_iri))
+                .find(|(e, _)| names::compatible(ontology, &e.row.class_iri, class))
                 .copied();
-            if !firsts.iter().any(|e| e.row.class_iri == item.row.class_iri) {
-                firsts.push(item);
+            let sibling = firsts
+                .iter()
+                .find(|(e, _)| names::siblings(ontology, &e.row.class_iri, class))
+                .copied();
+            if !firsts.iter().any(|(e, _)| &e.row.class_iri == class) {
+                firsts.push((item, by_alias));
             }
-            if let Some(first) = first {
+            if let Some((first, first_by_alias)) = first {
+                let rule = if by_alias || first_by_alias {
+                    "alias"
+                } else {
+                    "name"
+                };
                 let candidate = Candidate {
-                    rule: "name",
+                    rule,
                     status: AUTO,
                     score: 1.0,
                 };
                 offer(pairs, first.row.id, item.row.id, candidate);
+            } else if let Some((other, _)) = sibling {
+                let candidate = Candidate {
+                    rule: "class-conflict",
+                    status: PROPOSED,
+                    score: 1.0,
+                };
+                offer(pairs, other.row.id, item.row.id, candidate);
             }
         }
     }
@@ -631,6 +703,7 @@ mod tests {
             name: id.to_string(),
             document_id: None,
             canonical_id,
+            aliases: Vec::new(),
         };
         let entities = [
             row(1, Some(1)),
@@ -690,6 +763,7 @@ mod tests {
                 name: "same".to_string(),
                 document_id: None,
                 canonical_id: None,
+                aliases: Vec::new(),
             })
             .collect();
         let items: Vec<Eligible> = rows
@@ -697,11 +771,151 @@ mod tests {
             .map(|row| Eligible {
                 row,
                 key: "same".to_string(),
+                alias_keys: Vec::new(),
             })
             .collect();
         let mut pairs = BTreeMap::new();
         exact_pairs(&items, &ontology, &mut pairs);
         let found: Vec<(i64, i64)> = pairs.keys().copied().collect();
         assert_eq!(found, [(1, 5), (2, 3), (2, 4)]);
+    }
+
+    fn organisations() -> Ontology {
+        let ttl = "@prefix ex: <http://example.org/onto#> .\n\
+            @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+            @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+            ex:Organisation a owl:Class .\n\
+            ex:Customer a owl:Class ; rdfs:subClassOf ex:Organisation .\n\
+            ex:Supplier a owl:Class ; rdfs:subClassOf ex:Organisation .\n\
+            ex:Site a owl:Class .\n";
+        let config = crate::config::OntologyConfig {
+            files: Vec::new(),
+            languages: vec!["en".to_string()],
+            include: Vec::new(),
+            exclude: Vec::new(),
+            document_class: String::new(),
+        };
+        crate::ontology::load_sources(&[("o.ttl".to_string(), ttl.as_bytes().to_vec())], &config)
+            .ontology
+    }
+
+    fn entity(id: i64, class: &str, name: &str, aliases: &[&str]) -> EntityRow {
+        EntityRow {
+            id,
+            class_iri: format!("http://example.org/onto#{class}"),
+            key: format!("k{id}"),
+            name: name.to_string(),
+            document_id: None,
+            canonical_id: None,
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    fn exact(rows: &[EntityRow]) -> BTreeMap<(i64, i64), Candidate> {
+        let normaliser = names::Normaliser::new(&["B.V.".to_string()]);
+        let items: Vec<Eligible> = rows.iter().map(|r| eligible_row(r, &normaliser)).collect();
+        let mut pairs = BTreeMap::new();
+        exact_pairs(&items, &organisations(), &mut pairs);
+        pairs
+    }
+
+    #[test]
+    fn a_name_equal_to_an_alias_pairs_auto_by_alias() {
+        let rows = [
+            entity(
+                1,
+                "Customer",
+                "Northwind Pumps B.V.",
+                &["NW Pumps", "Northwind Pumps"],
+            ),
+            entity(2, "Customer", "NW Pumps", &[]),
+        ];
+        let pairs = exact(&rows);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(
+            (pairs[&(1, 2)].rule, pairs[&(1, 2)].status),
+            ("alias", AUTO)
+        );
+    }
+
+    #[test]
+    fn equal_names_in_sibling_classes_are_a_proposed_class_conflict() {
+        let rows = [
+            entity(1, "Customer", "Acme", &[]),
+            entity(2, "Supplier", "Acme B.V.", &[]),
+        ];
+        let pairs = exact(&rows);
+        assert_eq!(
+            (pairs[&(1, 2)].rule, pairs[&(1, 2)].status),
+            ("class-conflict", PROPOSED)
+        );
+    }
+
+    #[test]
+    fn equal_names_in_unrelated_classes_give_no_pair() {
+        let rows = [
+            entity(1, "Customer", "Eastport", &[]),
+            entity(2, "Site", "Eastport", &[]),
+        ];
+        assert!(exact(&rows).is_empty());
+    }
+
+    fn fuzzy_pairs(names: &[&str], max_block: usize) -> Vec<(i64, i64, &'static str)> {
+        let ontology = crate::rules::tests::ontology();
+        let rules = crate::rules::tests::rules("").unwrap();
+        let mut config = crate::config::load(None).unwrap();
+        config.resolve.max_block = max_block;
+        let rows: Vec<EntityRow> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| EntityRow {
+                id: i as i64 + 1,
+                class_iri: "http://example.org/onto#Customer".to_string(),
+                key: format!("k{i}"),
+                name: name.to_string(),
+                document_id: None,
+                canonical_id: None,
+                aliases: Vec::new(),
+            })
+            .collect();
+        let normaliser = names::Normaliser::new(&config.resolve.strip_words);
+        let items: Vec<Eligible> = rows.iter().map(|r| eligible_row(r, &normaliser)).collect();
+        name_pairs(&items, &rows, &config, &ontology, &rules)
+            .into_iter()
+            .map(|((a, b), c)| {
+                assert_eq!(c.status, PROPOSED);
+                (a, b, c.rule)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_name_inside_another_is_a_tokens_proposal() {
+        assert_eq!(
+            fuzzy_pairs(&["Fabrikam", "Northwind Fabrikam"], 1000),
+            [(1, 2, "tokens")]
+        );
+    }
+
+    #[test]
+    fn an_acronym_is_an_acronym_proposal() {
+        assert_eq!(
+            fuzzy_pairs(&["NHS", "Northwind Harbour Services"], 1000),
+            [(1, 2, "acronym")]
+        );
+    }
+
+    #[test]
+    fn different_numbers_give_no_pair() {
+        assert!(fuzzy_pairs(&["Pump P-101", "Pump P-102"], 1000).is_empty());
+    }
+
+    #[test]
+    fn a_common_token_block_gives_no_pairs() {
+        assert!(fuzzy_pairs(&["Alpha Pumps", "Bravo Pumps", "Pumps"], 2).is_empty());
+        assert_eq!(
+            fuzzy_pairs(&["Alpha Pumps", "Bravo Pumps", "Pumps"], 3).len(),
+            2
+        );
     }
 }

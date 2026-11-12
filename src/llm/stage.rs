@@ -12,7 +12,7 @@ use super::{ModelName, Request};
 use crate::config::Config;
 use crate::db;
 use crate::db::facts::Confidence;
-use crate::db::llm::JobParams;
+use crate::db::llm::{JobParams, Owner};
 use crate::facts::sample::{Candidate, Settings, first_folder, letter_share, select, text_hash};
 
 const KEY_BATCH: usize = 10_000;
@@ -86,6 +86,7 @@ pub(crate) trait Stage {
     type Checked;
     const SAMPLED: &'static str;
     const WRITES: &'static str;
+    const OWNER: Owner = Owner::Chunk;
 
     fn base(&self) -> &Base<'_>;
     fn keys(item: &Self::Item) -> Keys<'_>;
@@ -388,7 +389,7 @@ pub(crate) async fn run<S: Stage>(stage: &S, options: &Options) -> Result<Outcom
     let (queue, chunk_of) = if job_id > 0 {
         let ids: Vec<i64> = to_send.iter().map(|t| t.chunk_id).collect();
         let keys: Vec<String> = to_send.iter().map(|t| t.cache_key.clone()).collect();
-        let ords = db::llm::replace_items(pool, job_id, &ids, &keys).await?;
+        let ords = db::llm::replace_items(pool, job_id, S::OWNER, &ids, &keys).await?;
         let queue: VecDeque<Work> = ords
             .iter()
             .zip(&to_send)

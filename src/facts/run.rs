@@ -8,7 +8,7 @@ use globset::GlobSet;
 use rayon::ThreadPool;
 use sqlx::PgPool;
 
-use super::check::check;
+use super::check::{check, entity_key};
 use super::{Answer, Built, ChunkInput, Context, Known, TASK, USER_VARIABLES, build};
 use crate::config;
 use crate::db;
@@ -18,6 +18,7 @@ use crate::llm::prompt::{self, Prompt};
 use crate::llm::shortlist::counts_by_chunk;
 use crate::llm::stage::{self, Base, Chunk, Counts, Keys, Plan, Stage};
 use crate::ontology::{self, Ontology};
+use crate::resolve::names::Normaliser;
 
 pub use crate::llm::job::{Options, Outcome};
 
@@ -28,6 +29,7 @@ struct Setup<'a> {
     system: Arc<Prompt>,
     user: Arc<Prompt>,
     check_key: Arc<String>,
+    normaliser: Arc<Normaliser>,
     threads: Arc<ThreadPool>,
     out: PathBuf,
 }
@@ -101,7 +103,8 @@ pub async fn run(
             resend_share: extract.resend_share,
             confidence: extract.confidence,
         },
-        check_key: Arc::new(super::check_key(&ontology)),
+        check_key: Arc::new(super::check_key(&ontology, &config.resolve.strip_words)),
+        normaliser: Arc::new(Normaliser::new(&config.resolve.strip_words)),
         ontology: ontology.clone(),
         exclude: Arc::new(exclude),
         system: Arc::new(system),
@@ -109,17 +112,24 @@ pub async fn run(
         threads: Arc::new(crate::cpu::pool(extract.threads)?),
         out: PathBuf::from(&extract.out),
     };
+    if !options.dry_run {
+        rekey(&pool, &setup.normaliser).await?;
+    }
     let result = stage::run(&setup, options).await;
     pool.close().await;
     db::runs::release(lock).await;
     result
 }
 
-async fn inputs(pool: &PgPool, ids: &[i64]) -> Result<Vec<(ChunkInput, ChunkRow)>> {
+async fn inputs(
+    pool: &PgPool,
+    ids: &[i64],
+    max_known: usize,
+) -> Result<Vec<(ChunkInput, ChunkRow)>> {
     let rows = db::facts::chunks(pool, ids).await?;
     let mut counts = counts_by_chunk(db::fit::class_counts(pool, ids).await?);
     let mut known: HashMap<i64, Vec<Known>> = HashMap::new();
-    for row in db::facts::known(pool, ids).await? {
+    for row in db::facts::known(pool, ids, max_known).await? {
         known.entry(row.chunk_id).or_default().push(Known {
             entity_id: row.entity_id,
             class: row.class_iri,
@@ -145,7 +155,12 @@ async fn inputs(pool: &PgPool, ids: &[i64]) -> Result<Vec<(ChunkInput, ChunkRow)
 }
 
 async fn prepare(setup: &Setup<'_>, ids: &[i64]) -> Result<Vec<Prepared>> {
-    let pairs = inputs(setup.base.pool, ids).await?;
+    let pairs = inputs(
+        setup.base.pool,
+        ids,
+        setup.base.config.llm_extract.max_known,
+    )
+    .await?;
     let config = setup.base.config;
     let ontology = setup.ontology.clone();
     let system = setup.system.clone();
@@ -255,6 +270,7 @@ impl Stage for Setup<'_> {
             &item.chunk.text,
             &self.ontology,
             &self.base.config.ontology.languages,
+            &self.normaliser,
         );
         ChunkFacts {
             chunk_id: item.chunk.id,
@@ -302,5 +318,57 @@ impl Stage for Setup<'_> {
             job,
         )
         .await
+    }
+}
+async fn rekey(pool: &PgPool, normaliser: &Normaliser) -> Result<()> {
+    let rows = db::entities::model_keys(pool).await?;
+    let (ids, keys) = changed_keys(&rows, normaliser);
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let done = db::entities::rekey(pool, &ids, &keys).await?;
+    println!(
+        "extract: re-keyed {} entities, {} folded",
+        ids.len(),
+        done.merged
+    );
+    if done.kept_apart > 0 {
+        println!(
+            "extract: {} entities keep their key, a rejected same-as keeps them apart",
+            done.kept_apart
+        );
+    }
+    Ok(())
+}
+
+fn changed_keys(
+    rows: &[(i64, String, String)],
+    normaliser: &Normaliser,
+) -> (Vec<i64>, Vec<String>) {
+    rows.iter()
+        .filter_map(|(id, key, name)| {
+            let new = entity_key(normaliser, name);
+            (new != *key).then_some((*id, new))
+        })
+        .unzip()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_rows_whose_key_changes_are_re_keyed() {
+        let normaliser = Normaliser::new(&["B.V.".to_string(), "BV".to_string()]);
+        let row = |id: i64, key: &str, name: &str| (id, key.to_string(), name.to_string());
+        let rows = [
+            row(1, "acme b.v.", "Acme B.V."),
+            row(2, "acme", "Acme BV"),
+            row(3, "bv", "BV"),
+            row(4, "b.v", "B.V."),
+        ];
+        let (ids, keys) = changed_keys(&rows, &normaliser);
+        assert_eq!(ids, [1, 4]);
+        assert_eq!(keys, ["acme", "b.v."]);
     }
 }

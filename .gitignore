@@ -19,3 +19,6 @@ data/
 .serena/
 AGENTS.md
 GUIDELINES.md
+
+## Local environment
+.envrc

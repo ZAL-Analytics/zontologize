@@ -9,6 +9,7 @@ fn call<'a>(key: Option<&'a str>, chars: i64, usage: Usage, five_hour: f64) -> C
     Call {
         job_id: None,
         provider: "claude-code",
+        account: None,
         model: "haiku",
         task: "fit",
         cache_key: key,
@@ -25,6 +26,7 @@ fn call<'a>(key: Option<&'a str>, chars: i64, usage: Usage, five_hour: f64) -> C
         seconds: 2.0,
         status: "ok",
         error: None,
+        resume_at: None,
     }
 }
 
@@ -76,7 +78,7 @@ async fn cache_round_trip_and_calibration() {
     assert_eq!(calibration.output_tokens, 550.0);
     let per_usd = calibration.five_hour_per_usd.unwrap();
     assert!((per_usd - 1.0).abs() < 1e-6, "{per_usd}");
-    let windows = llm::last_windows(&env.pool).await.unwrap().unwrap();
+    let windows = llm::last_windows(&env.pool, None).await.unwrap().unwrap();
     assert_eq!(windows.five_hour.unwrap().used, 0.2);
     env.finish().await;
 }

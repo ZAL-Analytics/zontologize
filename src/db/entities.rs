@@ -554,7 +554,7 @@ pub async fn write_text_rules(
         let sql = format!(
             "delete from {table} where chunk_id in \
              (select id from chunks where content_id = any($1)) \
-             and method not like $2 and method not like $3 and method <> 'gliner'{}",
+             and method not like $2 and method not like $3{}",
             open_only(table)
         );
         sqlx::query(sqlx::AssertSqlSafe(sql))
@@ -861,6 +861,18 @@ pub async fn pages_of(pool: &PgPool, content_ids: &[i64]) -> Result<Vec<PageWork
     Ok(rows)
 }
 
+pub async fn with_clusters(pool: &PgPool) -> Result<Vec<(i64, i64, String, Vec<String>)>> {
+    let rows = sqlx::query_as(
+        "select e.id, coalesce(e.canonical_id, e.id), e.class_iri, \
+         array[e.name, e.key] || coalesce((select array_agg(a.alias) from aliases a \
+         where a.entity_id = e.id), array[]::text[]) \
+         from entities e order by e.id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 pub async fn known_keys(pool: &PgPool, method_to_skip: &str) -> Result<Vec<(String, String)>> {
     let rows = sqlx::query_as("select class_iri, key from entities where method <> $1")
         .bind(method_to_skip)
@@ -1045,6 +1057,113 @@ const FOLD_TARGETS: &str = "update relations r set dst_id = o.id from entities c
 
 const FOLD_DELETE: &str = "delete from entities c using entities o \
     where c.class_iri = $1 and o.class_iri = $2 and o.key = c.key";
+
+#[derive(Debug, Default, PartialEq)]
+pub struct Rekeyed {
+    pub merged: u64,
+    pub moved: u64,
+    pub kept_apart: u64,
+}
+
+pub async fn model_keys(pool: &PgPool) -> Result<Vec<(i64, String, String)>> {
+    let rows =
+        sqlx::query_as("select id, key, name from entities where method like $1 order by id")
+            .bind(MODEL_METHODS)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows)
+}
+
+const REKEY_TARGETS: &str = "create temporary table rekey_target on commit drop as \
+    select r.id, coalesce( \
+    (select o.id from entities o where o.class_iri = r.class_iri and o.key = r.new_key \
+    and o.method not like $1), \
+    least((select min(x.id) from rekey x where x.class_iri = r.class_iri \
+    and x.new_key = r.new_key), \
+    (select o.id from entities o where o.class_iri = r.class_iri and o.key = r.new_key))) \
+    as target, r.class_iri, r.new_key from rekey r";
+
+const REKEY_HOLDERS: &str = "insert into rekey (id, class_iri, new_key) \
+    select distinct o.id, o.class_iri, o.key from rekey r \
+    join entities o on o.class_iri = r.class_iri and o.key = r.new_key \
+    where o.method like $1 and not exists (select 1 from rekey x where x.id = o.id)";
+
+const REKEY_TAKEN: &str = "delete from rekey_target t where t.id = t.target and exists \
+    (select 1 from entities o where o.class_iri = t.class_iri and o.key = t.new_key \
+    and o.id <> t.id and not exists (select 1 from rekey_target f \
+    where f.id = o.id and f.id <> f.target))";
+
+const REKEY_APART: &str = "delete from rekey_target t where t.id <> t.target and exists \
+    (select 1 from relations s where s.property_iri = $1 and s.status = 'rejected' \
+    and ((s.src_id = t.id and s.dst_id = t.target) or (s.src_id = t.target and s.dst_id = t.id)))";
+
+const REKEY_MOVES: [&str; 6] = [
+    "insert into aliases (entity_id, alias, lang, method) \
+     select t.target, a.alias, a.lang, a.method from rekey_target t \
+     join aliases a on a.entity_id = t.id where t.id <> t.target \
+     union all select t.target, e.name, '', 'fold' from rekey_target t \
+     join entities e on e.id = t.id join entities o on o.id = t.target \
+     where t.id <> t.target and e.name <> o.name \
+     on conflict do nothing",
+    "update mentions m set entity_id = t.target from rekey_target t \
+     where m.entity_id = t.id and t.id <> t.target",
+    "update relations r set src_id = t.target from rekey_target t \
+     where r.src_id = t.id and t.id <> t.target",
+    "update relations r set dst_id = t.target from rekey_target t \
+     where r.dst_id = t.id and t.id <> t.target",
+    "update attributes a set entity_id = t.target from rekey_target t \
+     where a.entity_id = t.id and t.id <> t.target",
+    "delete from relations r where r.src_id = r.dst_id \
+     and r.status not in ('confirmed', 'rejected') \
+     and r.src_id in (select target from rekey_target)",
+];
+
+pub async fn rekey(pool: &PgPool, ids: &[i64], keys: &[String]) -> Result<Rekeyed> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "create temporary table rekey on commit drop as \
+         select e.id, e.class_iri, u.key as new_key \
+         from unnest($1::bigint[], $2::text[]) as u(id, key) join entities e on e.id = u.id",
+    )
+    .bind(ids)
+    .bind(keys)
+    .execute(&mut *tx)
+    .await?;
+    for statement in [REKEY_HOLDERS, REKEY_TARGETS] {
+        sqlx::query(statement)
+            .bind(MODEL_METHODS)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let kept_apart = sqlx::query(REKEY_APART)
+        .bind(crate::db::resolve::SAME_AS)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    sqlx::query(REKEY_TAKEN).execute(&mut *tx).await?;
+    for statement in REKEY_MOVES {
+        sqlx::query(statement).execute(&mut *tx).await?;
+    }
+    let merged = sqlx::query(
+        "delete from entities e using rekey_target t where e.id = t.id and t.id <> t.target",
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let moved = sqlx::query(
+        "update entities e set key = t.new_key from rekey_target t \
+         where e.id = t.id and t.id = t.target and e.key <> t.new_key",
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(Rekeyed {
+        merged,
+        moved,
+        kept_apart,
+    })
+}
 
 pub async fn fold_class(conn: &mut PgConnection, from: &str, into: &str) -> Result<Folded> {
     for statement in [FOLD_ALIASES, FOLD_MENTIONS, FOLD_SOURCES, FOLD_TARGETS] {

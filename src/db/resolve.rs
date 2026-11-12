@@ -16,6 +16,7 @@ pub struct EntityRow {
     pub name: String,
     pub document_id: Option<i64>,
     pub canonical_id: Option<i64>,
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, FromRow, PartialEq)]
@@ -48,8 +49,12 @@ pub struct NewLink {
 
 pub async fn entities<'e>(db: impl PgExecutor<'e>) -> Result<Vec<EntityRow>> {
     let rows = sqlx::query_as(
-        "select id, class_iri, key, name, document_id, canonical_id from entities order by id",
+        "select e.id, e.class_iri, e.key, e.name, e.document_id, e.canonical_id, \
+         array(select a.alias from aliases a where a.entity_id = e.id and a.method <> $1 \
+         order by a.alias) as aliases \
+         from entities e order by e.id",
     )
+    .bind(crate::resolve::METHOD)
     .fetch_all(db)
     .await?;
     Ok(rows)

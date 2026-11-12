@@ -179,3 +179,35 @@ pub async fn set_merge_status(pool: &PgPool, id: i64, status: &str) -> Result<()
         .await?;
     Ok(())
 }
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ClassChange {
+    pub entity_id: i64,
+    pub name: String,
+    pub class_iri: String,
+    pub proposed_class: Option<String>,
+    pub proposed_name: Option<String>,
+    pub method: String,
+    pub confidence: f64,
+}
+
+pub async fn proposed_classes(
+    pool: &PgPool,
+    class_iri: &str,
+    seed: &str,
+    n: i64,
+) -> Result<Vec<ClassChange>> {
+    let rows = sqlx::query_as(
+        "select e.id as entity_id, e.name, e.class_iri, c.class_iri as proposed_class, \
+         c.name as proposed_name, c.method, c.confidence \
+         from entity_classes c join entities e on e.id = c.entity_id \
+         where c.status = 'proposed' and ($1 = '' or e.class_iri = $1 or c.class_iri = $1) \
+         order by md5($2 || e.id::text), e.id limit $3",
+    )
+    .bind(class_iri)
+    .bind(seed)
+    .bind(n)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}

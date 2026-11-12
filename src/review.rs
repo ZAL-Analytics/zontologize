@@ -26,20 +26,16 @@ pub struct Tally {
     pub skipped: usize,
 }
 
-pub fn context(text: &str, start: Option<i32>, end: Option<i32>) -> String {
+pub fn context(text: &str, start: Option<i32>, end: Option<i32>, around: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     let (Some(start), Some(end)) = (start, end) else {
-        return chars.iter().take(2 * CONTEXT_CHARS).collect::<String>();
+        return chars.iter().take(2 * around).collect::<String>();
     };
     let start = (start.max(0) as usize).min(chars.len());
     let end = (end.max(0) as usize).clamp(start, chars.len());
-    let before: String = chars[start.saturating_sub(CONTEXT_CHARS)..start]
-        .iter()
-        .collect();
+    let before: String = chars[start.saturating_sub(around)..start].iter().collect();
     let found: String = chars[start..end].iter().collect();
-    let after: String = chars[end..(end + CONTEXT_CHARS).min(chars.len())]
-        .iter()
-        .collect();
+    let after: String = chars[end..(end + around).min(chars.len())].iter().collect();
     let flat = |s: String| crate::text::squash(&s);
     format!("{} «{}» {}", flat(before), flat(found), flat(after))
         .trim()
@@ -73,7 +69,7 @@ fn describe(fact: &Fact) -> String {
         fact.method,
         fact.confidence,
         fact.path,
-        context(&fact.text, fact.span_start, fact.span_end)
+        context(&fact.text, fact.span_start, fact.span_end, CONTEXT_CHARS)
     )
 }
 
@@ -204,7 +200,8 @@ async fn card(pool: &sqlx::PgPool, id: i64, name: &str, class: &str) -> Result<S
             context(
                 &example.text,
                 Some(example.span_start),
-                Some(example.span_end)
+                Some(example.span_end),
+                CONTEXT_CHARS
             )
         ));
     }
@@ -296,9 +293,160 @@ pub async fn merges<R: AsyncBufRead + Unpin>(
     result
 }
 
+pub struct ClassOptions {
+    pub n: Option<usize>,
+    pub class: String,
+    pub seed: String,
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct ClassTally {
+    pub confirmed: usize,
+    pub rejected: usize,
+    pub skipped: usize,
+}
+
+fn class_change(change: &db::review::ClassChange) -> String {
+    let to = change
+        .proposed_class
+        .as_deref()
+        .map_or("not an entity".to_string(), |c| local_name(c).to_string());
+    let name = match &change.proposed_name {
+        Some(name) if *name != change.name => format!(", name {name}"),
+        _ => String::new(),
+    };
+    format!(
+        "{} ({}) -> {to}{name}",
+        change.name,
+        local_name(&change.class_iri)
+    )
+}
+
+async fn ask_classes<R: AsyncBufRead + Unpin>(
+    pool: &sqlx::PgPool,
+    changes: &[db::review::ClassChange],
+    input: &mut R,
+) -> Result<ClassTally> {
+    let mut tally = ClassTally::default();
+    let mut lines = input.lines();
+    for (i, change) in changes.iter().enumerate() {
+        println!(
+            "[{}/{}] {}: {}, confidence {:.2}",
+            i + 1,
+            changes.len(),
+            printable(&class_change(change)),
+            change.method,
+            change.confidence
+        );
+        let entity = card(pool, change.entity_id, &change.name, &change.class_iri).await?;
+        println!("{}", printable(&entity));
+        println!("right? y = yes, n = no, s = skip, q = quit");
+        let Some(line) = lines.next_line().await? else {
+            break;
+        };
+        let status = match line.trim().to_lowercase().as_str() {
+            "y" | "yes" => "confirmed",
+            "n" | "no" => "rejected",
+            "q" | "quit" => break,
+            _ => {
+                tally.skipped += 1;
+                continue;
+            }
+        };
+        let mut conn = pool.acquire().await?;
+        db::entity_classes::set_status(&mut conn, change.entity_id, status).await?;
+        if status == "confirmed" {
+            tally.confirmed += 1;
+        } else {
+            tally.rejected += 1;
+        }
+    }
+    Ok(tally)
+}
+
+pub async fn classes<R: AsyncBufRead + Unpin>(
+    config_dir: Option<&Path>,
+    url: Option<&str>,
+    options: &ClassOptions,
+    input: &mut R,
+) -> Result<ClassTally> {
+    let config = config::load(config_dir)?;
+    let iri = if options.class.is_empty() {
+        String::new()
+    } else {
+        let loaded = crate::ontology::load(config_dir, &config.ontology)?;
+        loaded
+            .ontology
+            .resolve(&options.class)
+            .map_err(|e| anyhow::anyhow!("--class: {e}"))?
+    };
+    let lock = db::runs::lock(url, &config.database.schema).await?;
+    let pool = db::pool::connect(
+        url,
+        &config.database.schema,
+        config.database.max_connections,
+    )
+    .await?;
+    let n = options.n.unwrap_or(config.review.sample);
+    let result = async {
+        let changes = db::review::proposed_classes(&pool, &iri, &options.seed, n as i64).await?;
+        if changes.is_empty() {
+            println!("review classes: no proposed class changes left for this filter");
+            return Ok(ClassTally::default());
+        }
+        let tally = ask_classes(&pool, &changes, input).await?;
+        println!(
+            "review classes: {} confirmed, {} rejected, {} skipped",
+            tally.confirmed, tally.rejected, tally.skipped
+        );
+        Ok(tally)
+    }
+    .await;
+    pool.close().await;
+    lock.release().await;
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn change(
+        proposed_class: Option<&str>,
+        proposed_name: Option<&str>,
+    ) -> db::review::ClassChange {
+        db::review::ClassChange {
+            entity_id: 7,
+            name: "Delta".to_string(),
+            class_iri: "https://example.org/acme#Pump".to_string(),
+            proposed_class: proposed_class.map(str::to_string),
+            proposed_name: proposed_name.map(str::to_string),
+            method: "curate:llm:claude-code:haiku".to_string(),
+            confidence: 0.6,
+        }
+    }
+
+    #[test]
+    fn class_card_shows_the_proposed_class() {
+        let card = class_change(&change(
+            Some("https://example.org/acme#Site"),
+            Some("Delta"),
+        ));
+        assert_eq!(card, "Delta (Pump) -> Site");
+        let renamed = class_change(&change(
+            Some("https://example.org/acme#Site"),
+            Some("Delta Site"),
+        ));
+        assert_eq!(renamed, "Delta (Pump) -> Site, name Delta Site");
+    }
+
+    #[test]
+    fn class_card_shows_not_an_entity() {
+        assert_eq!(
+            class_change(&change(None, None)),
+            "Delta (Pump) -> not an entity"
+        );
+    }
 
     #[test]
     fn printable_drops_control_characters() {
@@ -308,11 +456,15 @@ mod tests {
     #[test]
     fn context_marks_the_span_and_cuts_around_it() {
         let text = format!("{}The booster pump\nruns.", "x".repeat(150));
-        let found = context(&text, Some(154), Some(166));
+        let found = context(&text, Some(154), Some(166), CONTEXT_CHARS);
         assert!(found.ends_with("«booster pump» runs."), "{found}");
         assert_eq!(found.chars().filter(|c| *c == 'x').count(), 96);
-        assert_eq!(context("a  b", None, None), "a  b");
-        assert_eq!(context("short", Some(2), Some(99)), "sh «ort»");
+        assert_eq!(context("a  b", None, None, CONTEXT_CHARS), "a  b");
+        assert_eq!(
+            context("short", Some(2), Some(99), CONTEXT_CHARS),
+            "sh «ort»"
+        );
+        assert_eq!(context("abcdef", Some(3), Some(4), 2), "bc «d» ef");
     }
 
     #[test]

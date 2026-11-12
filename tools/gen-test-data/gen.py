@@ -153,7 +153,11 @@ class World:
                 name = f"{word(rng, rng.randint(2, 3))} {rng.choice(COMPANY_FORMS[lang])}"
                 self.clients.append((lang, name))
         self.sites = [word(rng, 3) for _ in range(30)]
-        self.people = [f"{rng.choice(FIRST_NAMES)} {word(rng, 2)}" for _ in range(60)]
+        self.people = []
+        while len(self.people) < 60:
+            person = f"{rng.choice(FIRST_NAMES)} {word(rng, 2)}"
+            if person not in self.people:
+                self.people.append(person)
         self.projects = []
         for i in range(60):
             lang, client = rng.choice(self.clients)
@@ -163,6 +167,54 @@ class World:
                 "lang": lang, "client": client, "year": year, "code": code,
                 "site": rng.choice(self.sites), "index": i,
             })
+        spell = random.Random(f"variants-{rng.random()}")
+        self.classes = {}
+        candidates = {}
+        for lang, client in self.clients:
+            base, form = client.split(" ", 1)
+            names = [client, client.upper(), typo(spell, client), base]
+            if form.endswith("BV"):
+                names.append(f"{base} {form[:-2]}B.V.")
+            candidates[client] = names
+            self.classes[client] = "acme:Customer"
+        for site in self.sites:
+            candidates[site] = [site, site.upper(), typo(spell, site)]
+            self.classes[site] = "acme:Site"
+        for person in self.people:
+            first, last = person.split(" ", 1)
+            candidates[person] = [person, person.upper(), typo(spell, person),
+                                  f"{first[0]}. {last}"]
+            self.classes[person] = "acme:Person"
+        owners = {}
+        for name, names in candidates.items():
+            for variant in names:
+                owners.setdefault(variant.lower(), set()).add(name)
+        self.variants = {
+            name: list(dict.fromkeys(v for v in names
+                                     if v == name or len(owners[v.lower()]) == 1))
+            for name, names in candidates.items()
+        }
+
+    def spell(self, rng, name):
+        return rng.choice(self.variants[name]) if rng.random() < 1 / 3 else name
+
+    def rows(self):
+        rows = [(name, variant, self.classes[name])
+                for name, variants in self.variants.items() for variant in variants]
+        rows += [(p["code"], p["code"], "acme:Project") for p in self.projects]
+        rows = list(dict.fromkeys(rows))
+        owner = {}
+        for name, variant, _ in rows:
+            assert owner.setdefault(variant.lower(), name) == name, variant
+        return rows
+
+
+def typo(rng, name):
+    letters = [i for i, c in enumerate(name[:-1]) if c.isalpha() and name[i + 1].isalpha()]
+    i = rng.choice(letters)
+    if rng.random() < 0.5:
+        return name[:i] + name[i + 1:]
+    return name[:i] + name[i + 1] + name[i] + name[i + 2:]
 
 
 def fill(rng, world, project, template):
@@ -170,10 +222,10 @@ def fill(rng, world, project, template):
     return template.format(
         date=date.strftime("%d-%m-%Y"),
         item=rng.choice(ITEMS[project["lang"]]),
-        site=project["site"],
-        person=rng.choice(world.people),
+        site=world.spell(rng, project["site"]),
+        person=world.spell(rng, rng.choice(world.people)),
         project=project["code"],
-        client=project["client"],
+        client=world.spell(rng, project["client"]),
         order=f"PO-{rng.randint(10000, 99999)}",
         drawing=f"DWG-{rng.randint(100, 999)}-{rng.choice('ABCD')}{rng.randint(1, 9)}",
         value=f"{rng.uniform(1, 40):.1f}".replace(".", "," if project["lang"] == "nl" else "."),
@@ -360,6 +412,7 @@ def main():
         KINDS[kind] = max(1, round(KINDS[kind] * args.scale))
     rng = random.Random(args.seed)
     world = World(rng)
+    world_rows = world.rows()
     plans = plan(rng, world)
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
@@ -441,6 +494,10 @@ def main():
                                                "truth_file"])
         writer.writeheader()
         writer.writerows(manifest)
+    with open(out / "world.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["name", "variant", "class"])
+        writer.writerows(world_rows)
     print(f"wrote {len(manifest)} files to {out}")
 
 

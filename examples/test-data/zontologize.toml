@@ -1,0 +1,54 @@
+[database]
+schema = "zontologize_test"
+graph = "zontologize_test_graph"
+api_schema = "zontologize_test_api"
+
+[ontology]
+files = ["../acme/ontology/acme.ttl", "../acme/ontology/units.ttl", "ontology/people.ttl"]
+include = ["acme:Organisation", "acme:Site", "acme:Project", "acme:Procedure", "acme:Equipment", "acme:Document", "acme:Person"]
+document_class = "acme:Document"
+
+[eval]
+world = "../../data/tests/world.csv"
+
+[[sources]]
+name = "tests"
+kind = "folder"
+root = "../../data/tests"
+dataset = "current"
+
+[scan.kinds.pdf]
+extensions = ["pdf"]
+max_mb = 200
+
+[scan.kinds.word]
+extensions = ["doc", "docx", "rtf"]
+max_mb = 50
+
+[scan.kinds.sheet]
+extensions = ["xls", "xlsx", "csv"]
+max_mb = 50
+
+[scan.kinds.slides]
+extensions = ["ppt", "pptx", "odp"]
+max_mb = 50
+
+[scan.kinds.mail]
+extensions = ["eml", "msg"]
+max_mb = 25
+
+[scan.kinds.text]
+extensions = ["txt", "html", "htm"]
+max_mb = 10
+
+[scan.kinds.image]
+extensions = ["png", "jpg", "jpeg", "tif", "tiff"]
+max_mb = 50
+
+[models]
+fit = "claude-code:sonnet"
+extract = "claude-code:sonnet"
+classify = "claude-code:haiku"
+attributes = "claude-code:sonnet"
+embed = "local:multilingual-e5-small"
+chars_per_token = 2.0

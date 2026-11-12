@@ -219,13 +219,13 @@ async fn print_status(
             total - errors.len() as i64
         );
     }
-    print_models(pool).await?;
+    print_models(pool, config).await?;
     print_model_facts(pool, config).await?;
     print_embeddings(pool).await?;
     print_graph(pool, &config.database.api_schema).await
 }
 
-async fn print_models(pool: &PgPool) -> Result<()> {
+async fn print_models(pool: &PgPool, config: &Config) -> Result<()> {
     let usage = db::llm::usage(pool).await?;
     if !usage.is_empty() {
         println!("models:");
@@ -271,7 +271,37 @@ async fn print_models(pool: &PgPool) -> Result<()> {
         }
         println!("{line}");
     }
+    let dirs = &config.providers.claude_code.config_dirs;
+    if !dirs.is_empty() {
+        println!("claude-code accounts:");
+    }
+    for account in db::llm::accounts(pool, dirs).await? {
+        let mut line = format!(
+            "  {}: last used {}",
+            account.account,
+            account.last_used.map_or("never".to_string(), utc)
+        );
+        if let Some(windows) = db::llm::last_windows(pool, Some(&account.account)).await? {
+            for (label, window) in [("5-hour", windows.five_hour), ("7-day", windows.seven_day)] {
+                if let Some(window) = window {
+                    line.push_str(&format!(
+                        "; {label} {:.0}% used, resets {}",
+                        window.used * 100.0,
+                        utc(window.resets_at)
+                    ));
+                }
+            }
+        }
+        if let Some(at) = account.paused_until {
+            line.push_str(&format!("; paused until {}", utc(at)));
+        }
+        println!("{line}");
+    }
     Ok(())
+}
+
+fn utc(time: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>) -> String {
+    time.format("%Y-%m-%d %H:%M UTC").to_string()
 }
 
 async fn print_graph(pool: &PgPool, api_schema: &str) -> Result<()> {

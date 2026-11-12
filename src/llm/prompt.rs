@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-const BUILT_IN: [(&str, &str); 8] = [
+const BUILT_IN: [(&str, &str); 10] = [
     ("fit-system", include_str!("../../prompts/fit-system.md")),
     ("fit-user", include_str!("../../prompts/fit-user.md")),
     (
@@ -29,6 +29,11 @@ const BUILT_IN: [(&str, &str); 8] = [
         "attributes-user",
         include_str!("../../prompts/attributes-user.md"),
     ),
+    (
+        "curate-system",
+        include_str!("../../prompts/curate-system.md"),
+    ),
+    ("curate-user", include_str!("../../prompts/curate-user.md")),
 ];
 
 pub struct Prompt {

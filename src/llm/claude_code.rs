@@ -13,6 +13,7 @@ use super::{CallError, Reply, Request, Resume, Usage, Window, Windows};
 
 pub const BIN_VARIABLE: &str = "CLAUDE_CODE_BIN";
 pub const DEFAULT_BIN: &str = "claude";
+const CONFIG_DIR_VARIABLE: &str = "CLAUDE_CONFIG_DIR";
 const SUBSCRIPTION_KEY_SOURCE: &str = "none";
 const ALLOWED: [&str; 2] = ["allowed", "allowed_warning"];
 const STDERR_TAIL: usize = 500;
@@ -55,16 +56,23 @@ pub struct ClaudeCode {
     args: Option<Vec<String>>,
     model: String,
     timeout: Duration,
+    config_dir: Option<PathBuf>,
 }
 
 impl ClaudeCode {
-    pub fn new(program: PathBuf, model: &str, timeout: Duration) -> ClaudeCode {
+    pub fn new(
+        program: PathBuf,
+        model: &str,
+        timeout: Duration,
+        config_dir: Option<PathBuf>,
+    ) -> ClaudeCode {
         ClaudeCode {
             program,
             #[cfg(test)]
             args: None,
             model: model.to_string(),
             timeout,
+            config_dir,
         }
     }
 
@@ -75,6 +83,7 @@ impl ClaudeCode {
             args: Some(args),
             model: String::new(),
             timeout,
+            config_dir: None,
         }
     }
 
@@ -127,10 +136,15 @@ impl ClaudeCode {
         std::fs::write(&system_file, &request.system).map_err(|error| {
             CallError::Fatal(format!("cannot write {}: {error}", system_file.display()))
         })?;
-        let mut child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(self.args(request, &system_file))
             .env_clear()
-            .envs(allowed_env(std::env::vars_os()))
+            .envs(allowed_env(std::env::vars_os()));
+        if let Some(config_dir) = &self.config_dir {
+            command.env(CONFIG_DIR_VARIABLE, config_dir);
+        }
+        let mut child = command
             .current_dir(&dir.path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -178,6 +192,16 @@ async fn read_all<R: AsyncReadExt + Unpin>(reader: Option<R>) -> String {
         let _ = reader.read_to_string(&mut text).await;
     }
     text
+}
+
+pub fn expand_home(dir: &str, home: Option<OsString>) -> Result<PathBuf, String> {
+    let Some(rest) = dir.strip_prefix("~/") else {
+        return Ok(PathBuf::from(dir));
+    };
+    match home {
+        Some(home) if !home.is_empty() => Ok(PathBuf::from(home).join(rest)),
+        _ => Err(format!("HOME is not set, so {dir} cannot be expanded")),
+    }
 }
 
 fn allowed_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
@@ -531,7 +555,12 @@ mod tests {
 
     #[test]
     fn isolation_flags_are_passed() {
-        let provider = ClaudeCode::new(PathBuf::from("claude"), "haiku", Duration::from_secs(1));
+        let provider = ClaudeCode::new(
+            PathBuf::from("claude"),
+            "haiku",
+            Duration::from_secs(1),
+            None,
+        );
         let request = Request {
             task: "fit".to_string(),
             system: "sys".to_string(),
@@ -633,6 +662,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_config_dir_reaches_the_child() {
+        let body = "cat >/dev/null; printf '{\"type\":\"result\",\"is_error\":false,\
+                    \"structured_output\":{\"dir\":\"%s\"}}\\n' \"$CLAUDE_CONFIG_DIR\"";
+        let mut fake = script(body.to_string());
+        fake.config_dir = Some(PathBuf::from("/home/acme/.claude-a"));
+        let reply = fake.send(&request()).await.unwrap();
+        assert_eq!(reply.response, "{\"dir\":\"/home/acme/.claude-a\"}");
+        let inherited = std::env::var("CLAUDE_CONFIG_DIR").unwrap_or_default();
+        let reply = script(body.to_string()).send(&request()).await.unwrap();
+        assert_eq!(reply.response, format!("{{\"dir\":\"{inherited}\"}}"));
+    }
+
+    #[test]
+    fn a_leading_tilde_is_home() {
+        let home = Some(OsString::from("/home/acme"));
+        assert_eq!(
+            expand_home("~/.claude-a", home.clone()).unwrap(),
+            PathBuf::from("/home/acme/.claude-a")
+        );
+        assert_eq!(
+            expand_home("/srv/claude", home).unwrap(),
+            PathBuf::from("/srv/claude")
+        );
+        assert!(expand_home("~/.claude-a", None).is_err());
+    }
+
+    #[tokio::test]
     async fn large_stderr_does_not_block() {
         let fake = script(format!(
             "cat >/dev/null; head -c 300000 /dev/zero | tr '\\0' x >&2; cat '{}'",
@@ -670,7 +726,12 @@ mod tests {
 
     #[tokio::test]
     async fn the_system_prompt_goes_in_a_private_file_and_big_schemas_stop() {
-        let provider = ClaudeCode::new(PathBuf::from("claude"), "haiku", Duration::from_secs(1));
+        let provider = ClaudeCode::new(
+            PathBuf::from("claude"),
+            "haiku",
+            Duration::from_secs(1),
+            None,
+        );
         let mut big = request();
         big.schema = serde_json::json!({ "description": "x".repeat(MAX_ARG_BYTES) });
         let error = provider.send(&big).await.unwrap_err();
@@ -718,6 +779,7 @@ mod tests {
             PathBuf::from("/nonexistent/claude"),
             "haiku",
             Duration::from_secs(1),
+            None,
         );
         let error = missing.send(&request).await.unwrap_err();
         assert!(

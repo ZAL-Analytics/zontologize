@@ -88,7 +88,7 @@ pub fn prepare(config_dir: Option<&Path>, only: &[String]) -> Result<Prepared> {
             ..source
         });
     }
-    let extract = ExtractSettings::new(&config.extract, &config.ocr);
+    let extract = ExtractSettings::new(&config.extract, &config.ocr, config.gpu)?;
     let chunk = ChunkSettings::new(&config.chunk, config.extract.format);
     let hash_pool = Arc::new(cpu::pool(config.scan.hash_threads)?);
     let chunk_pool = cpu::pool(config.chunk.threads)?;
@@ -671,6 +671,7 @@ pub fn setup_line(config: &Config, workers: usize) -> Result<String> {
     let setup = worker::Setup {
         extract,
         ocr: config.ocr.clone(),
+        gpu: config.gpu,
     };
     Ok(serde_json::to_string(&setup)?)
 }
@@ -837,12 +838,12 @@ async fn chunk_stage(
         .await?;
         for (content_id, result) in results {
             stats.items += 1;
-            let chunks = match result {
-                Ok(chunks) => chunks,
+            let (chunks, page_starts) = match result {
+                Ok(chunked) => chunked,
                 Err(error) => {
                     stats.errors += 1;
                     eprintln!("error: content {content_id}: {error:#}");
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 }
             };
             chunks_written += chunks.len();
@@ -852,6 +853,7 @@ async fn chunk_stage(
                 &key,
                 &prepared.config.chunk.text_search,
                 &chunks,
+                &page_starts,
             )
             .await?;
         }

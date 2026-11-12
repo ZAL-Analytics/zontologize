@@ -47,15 +47,15 @@ fn scan_stage_keys_are_unchanged() {
     let config = config();
     assert_eq!(
         extract_key(&config.extract, &config.ocr),
-        "extract-v1 xberg-1.3.10 paddleocr small nl+en markdown embedded-0-10mb-ocr-false"
+        "extract-v2 xberg-1.3.10 paddleocr small nl+en markdown embedded-0-10mb-ocr-false visual-plain-words"
     );
     assert_eq!(
         ChunkSettings::new(&config.chunk, config.extract.format).key,
-        "chunk-v1 2000 200 markdown simple"
+        "chunk-v2 2000 200 markdown simple"
     );
     let ontology = acme_ontology(&config);
     let rules = rules::load(Some(&acme()), &ontology, &config.ontology.document_class).unwrap();
-    assert_eq!(rules.key, "rules-v5-331c5cf4cd50fbed");
+    assert_eq!(rules.key, "rules-v5-091696416c030a1a");
 }
 
 #[test]
@@ -63,7 +63,7 @@ fn ontology_version_is_unchanged() {
     let config = config();
     assert_eq!(
         acme_ontology(&config).version,
-        "594cffe2a9aa4f791a8a7152fb0642d19ff046b9aa2d32ede1b270f7faadf21f"
+        "66188ea54f4dc65094b739db0e95b7fb338381029485bb1400f9325bbb28ec88"
     );
 }
 
@@ -143,7 +143,7 @@ fn facts_cache_key_is_unchanged() {
     );
     assert_eq!(
         built.cache_key,
-        "c8862cc9aa49078f9f048511553f013e2c59810a2e30f93679dcd5128108840a"
+        "6e5cc2187b0a27434eebf8058756c91bb50fa45426d6f7cfe0999c54ceefbe99"
     );
 }
 

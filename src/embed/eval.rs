@@ -531,7 +531,8 @@ pub async fn run(
             let files =
                 tokio::task::spawn_blocking(move || super::local::fetch(&fetched, &cache_dir))
                     .await??;
-            let local = super::local::Local::new(model.clone(), files, config.embed.threads);
+            let local =
+                super::local::Local::new(model.clone(), files, config.embed.threads, config.gpu);
             reports.push(evaluate(&pool, &config, model, Box::new(local), &sample).await?);
         }
         write_report(&config, &sample, &seed, &reports)

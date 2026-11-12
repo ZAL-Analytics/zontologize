@@ -1,0 +1,19 @@
+@prefix acme: <https://example.org/acme#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix zontologize: <urn:zontologize#> .
+
+acme:Person a owl:Class ; skos:prefLabel "person"@en, "persoon"@nl ;
+    skos:definition "A named person: someone at Acme, a customer or a supplier."@en ;
+    zontologize:privacyCategory "PERSON" .
+
+acme:worksFor a owl:ObjectProperty ; rdfs:domain acme:Person ; rdfs:range acme:Organisation ;
+    skos:prefLabel "works for"@en, "werkt bij"@nl ;
+    skos:definition "The organisation a person works for."@en .
+acme:sentBy a owl:ObjectProperty ; rdfs:domain acme:Document ; rdfs:range acme:Person ;
+    skos:prefLabel "sent by"@en, "verzonden door"@nl ;
+    skos:definition "The person who sent a mail."@en .
+acme:sentTo a owl:ObjectProperty ; rdfs:domain acme:Document ; rdfs:range acme:Person ;
+    skos:prefLabel "sent to"@en, "verzonden aan"@nl ;
+    skos:definition "A person a mail was sent to, also in copy."@en .

@@ -107,18 +107,18 @@ async fn the_graph_mirrors_entities_and_relations() {
         .await
         .unwrap();
     let stats = sync(&env).await;
-    let entities = env.count("select count(*) from entities").await;
-    let relations = env
-        .count("select count(*) from relations where status <> 'rejected'")
-        .await;
+    let api = format!("\"{}_api\"", env.schema);
+    let canonical = |view: &str| format!("select count(*) from {api}.{view}");
+    let entities = env.count(&canonical("canonical_entities")).await;
+    let relations = env.count(&canonical("canonical_relations")).await;
     assert_eq!(stats.vertices as i64, entities);
     assert_eq!(stats.edges as i64, relations);
     assert!(relations > 0);
     let described = env
-        .count(
-            "select count(*) from relations r join entities p on p.id = r.dst_id \
-             where r.property_iri like '%#describes' and p.class_iri like '%#Project'",
-        )
+        .count(&format!(
+            "select count(*) from {api}.canonical_relations r join entities p on p.id = r.dst_id \
+                 where r.property_iri like '%#describes' and p.class_iri like '%#Project'"
+        ))
         .await;
     assert!(described > 0);
     let found = cypher(&env, "match (d)-[:describes]->(p:Project) return p.name").await;
@@ -144,7 +144,9 @@ async fn the_graph_mirrors_entities_and_relations() {
     assert_eq!(unchanged.vertices, stats.vertices);
     assert!(!stats.unchanged);
     let with_chunk = env
-        .count("select count(*) from relations where status <> 'rejected' and chunk_id is not null")
+        .count(&format!(
+            "select count(*) from {api}.canonical_relations where chunk_id is not null"
+        ))
         .await;
     assert!(with_chunk > 0);
     let traced = cypher(
@@ -153,14 +155,16 @@ async fn the_graph_mirrors_entities_and_relations() {
     )
     .await;
     let spanned = env
-        .count(
-            "select count(*) from relations where status <> 'rejected' \
-             and chunk_id is not null and span_start is not null",
-        )
+        .count(&format!(
+            "select count(*) from {api}.canonical_relations \
+                 where chunk_id is not null and span_start is not null"
+        ))
         .await;
     assert_eq!(traced, spanned);
     let documents = env
-        .count("select count(*) from entities where document_id is not null")
+        .count(&format!(
+            "select count(*) from {api}.canonical_entities where document_id is not null"
+        ))
         .await;
     assert!(documents > 0);
     let found = cypher(&env, "match (v) where v.document_id is not null return v").await;
@@ -190,7 +194,11 @@ async fn the_graph_mirrors_entities_and_relations() {
     .await
     .unwrap();
     let again = sync(&env).await;
-    assert_eq!(again.edges as i64, relations - 1);
+    assert_eq!(
+        again.edges as i64,
+        env.count(&canonical("canonical_relations")).await
+    );
+    assert!((again.edges as i64) < relations);
     let during: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(edge_count))
         .fetch_one(&mut reader)
         .await
@@ -207,6 +215,164 @@ async fn the_graph_mirrors_entities_and_relations() {
     let rebuilt = sync(&env).await;
     assert_eq!(rebuilt.vertices as i64, entities);
     assert_eq!(vertex_ids(&env).await, ids);
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn merged_entities_are_one_vertex_with_remapped_edges() {
+    let env = acme("canonical").await;
+    sqlx::raw_sql(
+        "insert into entities (class_iri, key, name, method, confidence, ontology_version_id)
+             select 'https://example.org/acme#Site', k, n, 'rules', 1, (select max(id) from ontology_versions)
+             from (values ('gt-east', 'Eastport Terminal'), ('gt-east-bv', 'Eastport Terminal BV'),
+                          ('gt-west', 'Westhaven')) v(k, n);
+         update entities set canonical_id = (select id from entities where key = 'gt-east')
+             where key in ('gt-east', 'gt-east-bv');
+         insert into relations (src_id, property_iri, dst_id, method, status, confidence, document_id)
+             select (select id from entities where key = s), p, (select id from entities where key = d),
+                 'rules', st, c, (select min(id) from documents)
+             from (values ('gt-east-bv', 'https://example.org/acme#locatedNear', 'gt-west', 'auto', 0.6),
+                          ('gt-east', 'https://example.org/acme#locatedNear', 'gt-west', 'auto', 0.9),
+                          ('gt-east', 'http://www.w3.org/2002/07/owl#sameAs', 'gt-east-bv', 'auto', 1.0),
+                          ('gt-west', 'https://example.org/acme#locatedNear', 'gt-east-bv', 'auto', 0.5))
+                 v(s, p, d, st, c);",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    sync(&env).await;
+    let root = "match (v) where v.name = 'Eastport Terminal' and v.members = 2 \
+                and 'Eastport Terminal BV' in v.aliases return v";
+    assert_eq!(cypher(&env, root).await, 1);
+    let member = "match (v) where v.name = 'Eastport Terminal BV' return v";
+    assert_eq!(cypher(&env, member).await, 0);
+    let merged = "match (a)-[r]->(b) where a.name = 'Eastport Terminal' and b.name = 'Westhaven' \
+                  return r";
+    assert_eq!(cypher(&env, merged).await, 1);
+    let best = "match (a)-[r]->(b) where a.name = 'Eastport Terminal' and b.name = 'Westhaven' \
+                and r.support = 2 and r.confidence = 0.9 return r";
+    assert_eq!(cypher(&env, best).await, 1);
+    let remapped = "match (a)-[r]->(b) where a.name = 'Westhaven' and b.name = 'Eastport Terminal' \
+                    return r";
+    assert_eq!(cypher(&env, remapped).await, 1);
+    assert_eq!(cypher(&env, "match (a)-[r]->(a) return r").await, 0);
+
+    sqlx::query(
+        "insert into aliases (entity_id, alias, method) \
+         select id, 'West Haven', 'rules' from entities where key = 'gt-west'",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    let again = sync(&env).await;
+    assert!(!again.unchanged, "{again:?}");
+    let alias = "match (v) where v.name = 'Westhaven' and 'West Haven' in v.aliases return v";
+    assert_eq!(cypher(&env, alias).await, 1);
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn the_class_overlay_moves_renames_and_drops_clusters() {
+    let env = acme("overlay").await;
+    sqlx::raw_sql(
+        "insert into entities (class_iri, key, name, method, confidence, ontology_version_id)
+             select 'https://example.org/acme#Site', k, n, 'rules', 1, (select max(id) from ontology_versions)
+             from (values ('ov-east', 'Eastport Terminal'), ('ov-east-bv', 'Eastport Terminal BV'),
+                          ('ov-west', 'Westhaven')) v(k, n);
+         update entities set canonical_id = (select id from entities where key = 'ov-east')
+             where key in ('ov-east', 'ov-east-bv');
+         insert into relations (src_id, property_iri, dst_id, method, status, confidence, document_id)
+             select (select id from entities where key = 'ov-west'), 'https://example.org/acme#partOf',
+                 (select id from entities where key = 'ov-east-bv'), 'rules', 'auto', 0.8,
+                 (select min(id) from documents);",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    let api = format!("\"{}_api\"", env.schema);
+    let set = |status: &str, class: Option<&str>, name: Option<&str>| {
+        let class = class.map_or("null".to_string(), |c| {
+            format!("'https://example.org/acme#{c}'")
+        });
+        let name = name.map_or("null".to_string(), |n| format!("'{n}'"));
+        format!(
+            "insert into entity_classes (entity_id, class_iri, name, method, status, confidence, \
+             ontology_version_id) select id, {class}, {name}, 'curate:test', '{status}', 0.9, \
+             ontology_version_id from entities where key = 'ov-east' \
+             on conflict (entity_id) do update set class_iri = excluded.class_iri, \
+             name = excluded.name, status = excluded.status"
+        )
+    };
+    let root_class = format!(
+        "select count(*) from {api}.canonical_entities where key = 'ov-east' \
+         and class_iri = 'https://example.org/acme#Project'"
+    );
+    sync(&env).await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(set("proposed", Some("Project"), None)))
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let proposed = sync(&env).await;
+    assert!(!proposed.unchanged);
+    assert_eq!(env.count(&root_class).await, 0);
+    sqlx::raw_sql(sqlx::AssertSqlSafe(set(
+        "auto",
+        Some("Project"),
+        Some("Eastport"),
+    )))
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    let moved = sync(&env).await;
+    assert!(!moved.unchanged, "{moved:?}");
+    assert_eq!(env.count(&root_class).await, 1);
+    assert_eq!(
+        cypher(
+            &env,
+            "match (v:Project) where v.name = 'Eastport' and v.members = 2 return v"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        cypher(&env, "match (v:Site) where v.key = 'ov-east' return v").await,
+        0
+    );
+    assert_eq!(
+        cypher(
+            &env,
+            "match (a)-[r]->(b:Project) where a.name = 'Westhaven' return r"
+        )
+        .await,
+        1
+    );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(set("auto", None, None)))
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let dropped = sync(&env).await;
+    assert!(!dropped.unchanged);
+    assert_eq!(
+        env.count(&format!(
+            "select count(*) from {api}.canonical_entities where key = 'ov-east'"
+        ))
+        .await,
+        0
+    );
+    assert_eq!(
+        cypher(&env, "match (v) where v.key = 'ov-east' return v").await,
+        0
+    );
+    assert_eq!(
+        cypher(
+            &env,
+            "match (a)-[r]->(b) where a.name = 'Westhaven' return r"
+        )
+        .await,
+        0
+    );
     env.finish().await;
 }
 
@@ -253,7 +419,7 @@ async fn the_views_keep_their_contract() {
     let version = env
         .count(&format!("select {api}.contract_version()::bigint"))
         .await;
-    assert_eq!(version, 3);
+    assert_eq!(version, 6);
 
     let documents = env
         .count(&format!("select count(*) from {api}.documents"))
@@ -363,5 +529,43 @@ async fn a_label_no_longer_used_is_emptied() {
     )
     .await;
     assert_eq!(left, 0);
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn mentions_map_to_their_page() {
+    let env = Env::new("mention_pages").await;
+    env.copy_acme_rules();
+    env.write_config(&folder_source("docs", &env.data(), "current"));
+    std::fs::create_dir_all(env.data().join("a")).unwrap();
+    std::fs::copy(
+        repo("tests/fixtures/extract/two-pages.pdf"),
+        env.data().join("a/two-pages.pdf"),
+    )
+    .unwrap();
+    env.scan().await;
+    let api = format!("\"{}_api\"", env.schema);
+    let rows: Vec<(i32, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "select mp.page_no, substr(p.text, mp.span_start + 1, mp.span_end - mp.span_start), e.name \
+         from {api}.mention_pages mp \
+         join {api}.pages p on p.content_id = mp.content_id and p.page_no = mp.page_no \
+         join {api}.entities e on e.id = mp.entity_id"
+    )))
+    .fetch_all(&env.pool)
+    .await
+    .unwrap();
+    let order = rows
+        .iter()
+        .find(|row| row.2 == "P-2021-0042")
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!(order.0, 2);
+    assert_eq!(order.1, "P-2021-0042");
+    for (_, slice, name) in &rows {
+        assert!(
+            slice.eq_ignore_ascii_case(name) || !slice.is_empty(),
+            "{rows:?}"
+        );
+    }
     env.finish().await;
 }

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use ort::session::builder::GraphOptimizationLevel;
+use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ort::session::{Session, SessionInputValue};
 use ort::value::Tensor;
 use sha2::{Digest, Sha256};
@@ -9,7 +9,7 @@ use tokenizers::{Tokenizer, TruncationParams};
 
 use super::model::Model;
 use super::{Embed, Embedded};
-use crate::config::Pooling;
+use crate::config::{GpuConfig, Pooling};
 use crate::hash::hex;
 
 const INPUT_IDS: &str = "input_ids";
@@ -131,16 +131,18 @@ pub struct Local {
     model: Model,
     files: Files,
     threads: usize,
+    gpu: GpuConfig,
     loaded: Option<Loaded>,
     dimensions: Option<usize>,
 }
 
 impl Local {
-    pub fn new(model: Model, files: Files, threads: usize) -> Local {
+    pub fn new(model: Model, files: Files, threads: usize, gpu: GpuConfig) -> Local {
         Local {
             model,
             files,
             threads,
+            gpu,
             loaded: None,
             dimensions: None,
         }
@@ -148,7 +150,7 @@ impl Local {
 
     fn load(&mut self) -> Result<&mut Loaded> {
         if self.loaded.is_none() {
-            self.loaded = Some(load(&self.model, &self.files, self.threads)?);
+            self.loaded = Some(load(&self.model, &self.files, self.threads, self.gpu)?);
         }
         self.loaded
             .as_mut()
@@ -156,15 +158,59 @@ impl Local {
     }
 }
 
-fn load(model: &Model, files: &Files, threads: usize) -> Result<Loaded> {
+#[cfg(feature = "gpu")]
+fn cuda(device: u32) -> ort::ep::ExecutionProviderDispatch {
+    ort::ep::CUDA::default()
+        .with_device_id(device as i32)
+        .build()
+        .error_on_failure()
+}
+
+#[cfg(feature = "gpu")]
+pub fn cuda_available(device: u32) -> Result<()> {
+    Session::builder()
+        .map_err(|e| anyhow!("{e}"))?
+        .with_execution_providers([cuda(device)])
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(())
+}
+
+#[cfg(feature = "gpu")]
+fn with_provider(builder: SessionBuilder, gpu: GpuConfig) -> Result<SessionBuilder> {
+    if gpu.provider == crate::config::GpuProvider::Cpu {
+        println!("embed: execution provider cpu");
+        return Ok(builder);
+    }
+    if let Err(error) = cuda_available(gpu.device) {
+        println!(
+            "embed: execution provider cpu, cuda device {} not available: {error:#}",
+            gpu.device
+        );
+        return Ok(builder);
+    }
+    println!("embed: execution provider cuda, device {}", gpu.device);
+    builder
+        .with_execution_providers([cuda(gpu.device)])
+        .map_err(|e| anyhow!("cuda execution provider: {e}"))
+}
+
+#[cfg(not(feature = "gpu"))]
+fn with_provider(builder: SessionBuilder, gpu: GpuConfig) -> Result<SessionBuilder> {
+    gpu.usable()?;
+    println!("embed: execution provider cpu");
+    Ok(builder)
+}
+
+fn load(model: &Model, files: &Files, threads: usize, gpu: GpuConfig) -> Result<Loaded> {
     let settings = &model.settings;
     let path = files.model.display().to_string();
-    let session = Session::builder()
+    let builder = Session::builder()
         .map_err(|e| anyhow!("{path}: {e}"))?
         .with_optimization_level(GraphOptimizationLevel::All)
         .map_err(|e| anyhow!("{path}: {e}"))?
         .with_intra_threads(threads)
-        .map_err(|e| anyhow!("{path}: {e}"))?
+        .map_err(|e| anyhow!("{path}: {e}"))?;
+    let session = with_provider(builder, gpu)?
         .commit_from_file(&files.model)
         .map_err(|e| anyhow!("cannot load {path}: {e}"))?;
     let mut inputs = Vec::new();

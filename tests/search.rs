@@ -45,5 +45,5 @@ async fn stemmed_text_and_trigram_names_are_searchable() {
         .fetch_one(&env.pool)
         .await
         .unwrap();
-    assert_eq!(contract, 3);
+    assert_eq!(contract, 6);
 }

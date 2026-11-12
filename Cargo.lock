@@ -7109,6 +7109,7 @@ dependencies = [
  "unicode-normalization",
  "walkdir",
  "xberg",
+ "xberg-native-pdf",
 ]
 
 [[package]]

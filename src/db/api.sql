@@ -1,5 +1,5 @@
 create or replace function {api}.contract_version() returns integer
-    language sql immutable as 'select 3';
+    language sql immutable as 'select 6';
 
 create or replace view {api}.sources as
 select id, name, kind, root, dataset
@@ -14,7 +14,7 @@ join {schema}.sources s on s.id = d.source_id
 where d.status <> 'deleted';
 
 create or replace view {api}.pages as
-select p.content_id, p.page_no, p.method, p.ocr_confidence, p.text
+select p.content_id, p.page_no, p.method, p.ocr_confidence, p.text, p.width, p.height, p.words
 from {schema}.pages p
 where exists (select 1 from {schema}.documents d
     where d.content_id = p.content_id and d.status = 'present');
@@ -30,6 +30,59 @@ select id, class_iri, key, name, props, dataset, method, confidence, document_id
     canonical_id
 from {schema}.entities;
 
+create or replace view {api}.entity_classes as
+select entity_id, class_iri, name, method, status, confidence, ontology_version_id, created_at
+from {schema}.entity_classes;
+
+create or replace view {api}.canonical_entities as
+select r.id, coalesce(o.class_iri, r.class_iri) as class_iri, r.key,
+    coalesce(o.name, r.name) as name, r.props, r.dataset, r.document_id,
+    (select count(*) from {schema}.entities m
+        where (m.id = r.id or m.canonical_id = r.id) and not exists (
+            select 1 from {schema}.entity_classes x where x.entity_id = m.id
+            and x.status in ('auto', 'confirmed') and x.class_iri is null))
+        as members,
+    coalesce((select array_agg(distinct n.name order by n.name) from (
+        select r.name
+        union all
+        select m.name from {schema}.entities m where m.canonical_id = r.id
+        and not exists (select 1 from {schema}.entity_classes x where x.entity_id = m.id
+            and x.status in ('auto', 'confirmed') and x.class_iri is null)
+        union all
+        select a.alias from {schema}.aliases a
+        join {schema}.entities m on m.id = a.entity_id
+        where (m.id = r.id or m.canonical_id = r.id)
+        and not exists (select 1 from {schema}.entity_classes x where x.entity_id = m.id
+            and x.status in ('auto', 'confirmed') and x.class_iri is null)
+    ) n where n.name <> coalesce(o.name, r.name)), array[]::text[]) as aliases
+from {schema}.entities r
+left join {schema}.entity_classes o on o.entity_id = r.id and o.status in ('auto', 'confirmed')
+where (r.canonical_id is null or r.canonical_id = r.id)
+    and not (o.entity_id is not null and o.class_iri is null);
+
+create or replace view {api}.canonical_relations as
+select id, src_id, property_iri, dst_id, props, method, status, confidence, document_id,
+    chunk_id, span_start, span_end, support
+from (
+    select r.id, coalesce(a.canonical_id, a.id) as src_id, r.property_iri,
+        coalesce(b.canonical_id, b.id) as dst_id, r.props, r.method, r.status, r.confidence,
+        r.document_id, r.chunk_id, r.span_start, r.span_end,
+        count(*) over w as support,
+        row_number() over (w order by r.status = 'confirmed' desc, r.confidence desc, r.id)
+            as rank
+    from {schema}.relations r
+    join {schema}.entities a on a.id = r.src_id
+    join {schema}.entities b on b.id = r.dst_id
+    where r.status <> 'rejected' and coalesce(a.canonical_id, a.id) <> coalesce(b.canonical_id, b.id)
+        and not exists (select 1 from {schema}.entity_classes x
+            where x.entity_id in (a.id, b.id, coalesce(a.canonical_id, a.id),
+                coalesce(b.canonical_id, b.id))
+            and x.status in ('auto', 'confirmed') and x.class_iri is null)
+    window w as (partition by coalesce(a.canonical_id, a.id), r.property_iri,
+        coalesce(b.canonical_id, b.id))
+) g
+where rank = 1;
+
 create or replace view {api}.aliases as
 select entity_id, alias, lang, method
 from {schema}.aliases;
@@ -37,6 +90,19 @@ from {schema}.aliases;
 create or replace view {api}.mentions as
 select id, entity_id, document_id, chunk_id, span_start, span_end, method, confidence
 from {schema}.mentions;
+
+create or replace view {api}.mention_pages as
+select m.id as mention_id, m.entity_id, c.content_id, p.page_no,
+    c.text_start + m.span_start - p.text_start as span_start,
+    least(c.text_start + m.span_end - p.text_start, char_length(p.text)) as span_end
+from {schema}.mentions m
+join {schema}.chunks c on c.id = m.chunk_id
+join {schema}.pages p on p.content_id = c.content_id
+    and c.text_start + m.span_start >= p.text_start
+    and c.text_start + m.span_start < p.text_start + char_length(p.text)
+where m.span_start is not null and m.span_end is not null
+    and exists (select 1 from {schema}.documents d
+        where d.content_id = c.content_id and d.status = 'present');
 
 create or replace view {api}.class_mentions as
 select id, class_iri, document_id, chunk_id, span_start, span_end, method, confidence

@@ -6,7 +6,7 @@ use zontologize::db;
 
 const TEST_URL: &str = "ZONTOLOGIZE_TEST_DATABASE_URL";
 const SCHEMA_PREFIX: &str = "zontologize_test_";
-const TABLES: [&str; 29] = [
+const TABLES: [&str; 30] = [
     "_sqlx_migrations",
     "aliases",
     "attributes",
@@ -19,6 +19,7 @@ const TABLES: [&str; 29] = [
     "embedding_models",
     "embeddings",
     "entities",
+    "entity_classes",
     "fact_reviews",
     "graph_labels",
     "llm_cache",
@@ -262,4 +263,56 @@ async fn a_released_lock_is_free_before_its_connection_closes() {
         let lock = db::runs::lock(Some(&url), "lock_c").await.unwrap();
         lock.release().await;
     }
+}
+
+#[tokio::test]
+#[ignore]
+async fn drop_persons_keeps_rule_mentions_of_gliner_entities() {
+    let guard = Schema::new("drop_persons").await;
+    let schema = guard.0.clone();
+    migrate(&schema).await.unwrap();
+    let mut conn = db::connect(Some(&test_url()), &schema).await.unwrap();
+    sqlx::raw_sql(
+        "alter table contents add column persons_key text;
+         insert into runs (started_at, config_hash) values (now(), 'x');
+         insert into sources (name, kind, root) values ('s', 'folder', '/');
+         insert into documents (source_id, path, size, mtime, status, first_run_id, last_seen_run_id)
+             values (1, 'a.pdf', 1, now(), 'present', 1, 1);
+         insert into ontology_versions (sha256, files) values ('x', '[]');
+         insert into entities (class_iri, key, name, method, confidence, ontology_version_id)
+             values ('urn:p', 'only', 'Only Gliner', 'gliner', 0.9, 1),
+                    ('urn:p', 'both', 'Both Ways', 'gliner', 0.9, 1);
+         insert into mentions (entity_id, document_id, span_start, span_end, method, confidence)
+             values (1, 1, 0, 4, 'gliner', 0.9),
+                    (2, 1, 0, 4, 'gliner', 0.9),
+                    (2, 1, 5, 9, 'rules:mail', 0.8);",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0030_drop_persons.sql"))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let entities: Vec<(String, String)> =
+        sqlx::query_as("select key, method from entities order by id")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(entities, [("both".to_string(), "rules:mail".to_string())]);
+    let mentions: Vec<String> = sqlx::query_scalar("select method from mentions")
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(mentions, ["rules:mail"]);
+    let columns: i64 = sqlx::query_scalar(
+        "select count(*) from information_schema.columns \
+         where table_schema = $1 and table_name = 'contents' and column_name = 'persons_key'",
+    )
+    .bind(&schema)
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(columns, 0);
+    db::close(conn).await;
 }

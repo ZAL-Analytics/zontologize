@@ -227,6 +227,7 @@ pub async fn selected(pool: &PgPool, version_id: i64) -> Result<Stored> {
             alt_labels: row.alt_labels.0,
             definition: row.definition.0,
             privacy_category: row.privacy_category,
+            disjoint: Vec::new(),
             selected: true,
             meta: false,
         })

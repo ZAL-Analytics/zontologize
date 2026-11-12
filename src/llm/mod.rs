@@ -90,6 +90,14 @@ impl ProviderKind {
         self == ProviderKind::ClaudeCode
     }
 
+    pub fn accounts(self, providers: &ProvidersConfig) -> Vec<Option<&str>> {
+        let dirs = &providers.claude_code.config_dirs;
+        if self != ProviderKind::ClaudeCode || dirs.is_empty() {
+            return vec![None];
+        }
+        dirs.iter().map(|dir| Some(dir.as_str())).collect()
+    }
+
     fn key_parts(self, providers: &ProvidersConfig) -> Vec<String> {
         match self {
             ProviderKind::ClaudeCode => Vec::new(),
@@ -274,13 +282,22 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub fn new(name: &ModelName, config: &Config, claude_program: PathBuf) -> Result<Provider> {
+    pub fn new(
+        name: &ModelName,
+        config: &Config,
+        claude_program: PathBuf,
+        account: Option<&str>,
+    ) -> Result<Provider> {
         let providers = &config.providers;
         Ok(match name.provider {
             ProviderKind::ClaudeCode => Provider::ClaudeCode(claude_code::ClaudeCode::new(
                 claude_program,
                 &name.model,
                 Duration::from_secs(providers.claude_code.timeout_secs),
+                account
+                    .map(|dir| claude_code::expand_home(dir, std::env::var_os("HOME")))
+                    .transpose()
+                    .map_err(anyhow::Error::msg)?,
             )),
             ProviderKind::OpenRouter => {
                 let Ok(key) = std::env::var(openrouter::KEY_VARIABLE) else {

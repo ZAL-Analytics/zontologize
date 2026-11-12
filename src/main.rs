@@ -59,21 +59,10 @@ enum Command {
         about = "Link entities that are the same thing and documents that name or replace each other"
     )]
     Resolve,
-    #[command(about = "Find people in the chunks with the local GLiNER model")]
-    Persons {
-        #[arg(
-            long,
-            value_name = "MINUTES",
-            help = "Stop after this many minutes; the next run goes on"
-        )]
-        minutes: Option<u64>,
-        #[arg(
-            long = "path",
-            value_name = "PREFIX",
-            help = "Only read documents whose path starts with this prefix; repeat for more"
-        )]
-        paths: Vec<String>,
-    },
+    #[command(
+        about = "Send clusters of proposed same-as links to the curate model and write its merges, classes and names"
+    )]
+    Curate(JobArgs),
     #[command(subcommand, about = "Evaluation commands")]
     Eval(EvalCommand),
     #[command(subcommand, about = "Fact review commands")]
@@ -243,6 +232,8 @@ struct EmbedArgs {
 
 #[derive(Debug, Subcommand)]
 enum EvalCommand {
+    #[command(about = "Compare found entities and clusters with the world list in [eval] world")]
+    Entities,
     #[command(about = "Compare embedding models on a sample of the own data")]
     Embed {
         #[arg(
@@ -311,6 +302,28 @@ enum ReviewCommand {
             value_name = "NAME",
             default_value = "",
             help = "Only links of this class (prefixed name or IRI)"
+        )]
+        class: String,
+        #[arg(
+            long,
+            value_name = "SEED",
+            help = "Seed of the draw (default: the current time)"
+        )]
+        seed: Option<String>,
+    },
+    #[command(about = "Show proposed class changes of entities and confirm or reject each")]
+    Classes {
+        #[arg(
+            long,
+            value_name = "N",
+            help = "Class changes to show (default [review] sample)"
+        )]
+        n: Option<usize>,
+        #[arg(
+            long,
+            value_name = "NAME",
+            default_value = "",
+            help = "Only changes from or to this class (prefixed name or IRI)"
         )]
         class: String,
         #[arg(
@@ -442,10 +455,8 @@ fn main() -> ExitCode {
                 zontologize::embed(config, &options).await
             }
             Command::Resolve => zontologize::resolve(config).await,
-            Command::Persons { minutes, paths } => {
-                let options = zontologize::persons::run::Options { minutes, paths };
-                zontologize::persons(config, &options).await
-            }
+            Command::Curate(args) => zontologize::curate(config, &args.options()).await,
+            Command::Eval(EvalCommand::Entities) => zontologize::eval_entities(config).await,
             Command::Eval(EvalCommand::Embed {
                 models,
                 sample,
@@ -479,6 +490,14 @@ fn main() -> ExitCode {
                     seed: seed.unwrap_or_else(now_seed),
                 };
                 zontologize::review_merges(config, &options).await
+            }
+            Command::Review(ReviewCommand::Classes { n, class, seed }) => {
+                let options = zontologize::review::ClassOptions {
+                    n,
+                    class,
+                    seed: seed.unwrap_or_else(now_seed),
+                };
+                zontologize::review_classes(config, &options).await
             }
             Command::Status { errors } => zontologize::status(config, errors).await,
             Command::ExtractWorker => zontologize::extract_worker().await,

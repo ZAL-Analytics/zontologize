@@ -18,7 +18,7 @@ fn real_model_gives_stable_normalised_vectors() {
         let model = embed::model::parse(name.trim(), &config.embed.models).unwrap();
         let files = embed::local::cached(&model, &cache)
             .unwrap_or_else(|e| panic!("{name} is not in {cache}: {e}"));
-        let mut local = embed::local::Local::new(model.clone(), files, 4);
+        let mut local = embed::local::Local::new(model.clone(), files, 4, config.gpu);
         let texts = vec![
             embed::passage(&model, "The pump P-101 was serviced in March."),
             embed::passage(&model, "De klant vroeg om een nieuwe offerte."),

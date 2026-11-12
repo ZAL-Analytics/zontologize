@@ -6,7 +6,7 @@ between versions; `select zontologize_api.contract_version()` says which contrac
 A run after new files arrive, from cron or by hand:
 
 ```sh
-zontologize scan && zontologize persons && zontologize extract && zontologize attributes \
+zontologize scan && zontologize extract && zontologize attributes \
   && zontologize embed \
   && zontologize resolve && zontologize graph sync
 ```
@@ -22,10 +22,14 @@ shows `running`, `running_since`, `last_scan_finished_at`, `ontology_version` an
 |---|---|
 | `sources` | Configured sources |
 | `documents` | Files that are not deleted; `status` is `present`, `skipped` (not read) or `error` |
-| `pages`, `chunks` | Text per content (`content_id`); `chunks.tsv` for full-text search without stemming (IDs), `chunks.tsv_stem` with Dutch and English stemming (since contract 3) |
+| `pages`, `chunks` | Text per content (`content_id`); `chunks.tsv` for full-text search without stemming (IDs), `chunks.tsv_stem` with Dutch and English stemming (since contract 3). For PDF and image pages, `pages.width` and `pages.height` give the page size (PDF points after `/Rotate`, image pixels) and `pages.words` the words as `[[start, end, x0, y0, x1, y1], ...]`: char offsets into `pages.text` and a 0-1 box with a top-left origin; all three are null for other pages (since contract 6) |
 | `entities` | Things found; `canonical_id` groups duplicates |
 | `aliases` | Other names of an entity |
+| `canonical_entities` | One row per cluster of merged entities (since contract 4): the root's `id`, `class_iri`, `key`, `name`, `props`, `dataset`, `document_id`, `members` (rows in the cluster) and `aliases` (names of the other members and all their aliases). `class_iri` and `name` come from the root's `entity_classes` row when it takes effect; a cluster whose root is not an entity is left out, and so are members that are not an entity |
+| `entity_classes` | Corrections per entity (since contract 5): `class_iri` (null: not an entity), `name` (display name of the cluster, null: keep), `method`, `status`, `confidence`. `status` is `auto`, `proposed` (waits for `review classes`), `confirmed` or `rejected` (by a person); only `auto` and `confirmed` rows take effect |
+| `canonical_relations` | `relations` with both ends mapped to their cluster root (since contract 4); self-loops and relations of entities or clusters that are not an entity dropped, one row per `src_id`, `property_iri`, `dst_id` (the confirmed one first, then the highest confidence), `support` counts the relations behind it |
 | `mentions`, `class_mentions` | Where an entity or class is named: chunk or document, span, method, confidence |
+| `mention_pages` | Chunk mentions on their page: `mention_id`, `entity_id`, `content_id`, `page_no`, and `span_start`/`span_end` as char offsets into that page's `pages.text`, end clipped to the page (since contract 6) |
 | `relations` | Facts between entities, without rejected ones; `status` is `auto`, `proposed` or `confirmed` |
 | `attributes` | Values of entities: `value_text` as found, `unit_text`, `unit_iri`, `low`/`high` as written and `si_low`/`si_high` in SI units, chunk, span, method, confidence; `superseded` when a newer revision replaces the document |
 | `units` | Units of the ontology: symbols, labels, `dimension`, `conversion_multiplier`, `conversion_offset` |
@@ -46,8 +50,10 @@ grant select on all tables in schema zontologize, zontologize_api to reader;
 ## Graph
 
 `graph sync` rebuilds the AGE graph `zontologize_graph` (`[database] graph`): one vertex per
-entity with `id`, `class`, `key`, `name`, `canonical_id` and `dataset`, one edge per relation that
-is not rejected with `id`, `iri`, `status`, `confidence` and `method`. Labels are the class and
+cluster of merged entities (`canonical_entities`) with `id`, `class`, `key`, `name`, `dataset`,
+`members` and `aliases`, and one edge per row of `canonical_relations` between cluster roots with
+`id`, `iri`, `status`, `confidence`, `method` and `support`. Same-as links inside a cluster are
+not edges. A vertex takes its label from the cluster's effective class (`entity_classes`). Labels are the class and
 property labels in camel case (`Project`, `describes`); `graph_labels` maps them to IRIs.
 
 Each connection that runs Cypher needs:

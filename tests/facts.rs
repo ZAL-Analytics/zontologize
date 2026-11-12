@@ -130,6 +130,7 @@ async fn setup_extract(name: &str) -> Env {
     env.write_config(&format!(
         "[models]\nextract = \"claude-code:haiku\"\n\
          [providers.claude-code]\nconcurrency = 1\n\
+         [resolve]\nstrip_words = [\"B.V.\", \"BV\"]\n\
          [llm_extract]\nmin_chars = 50\nmin_evidence = 1\nout = \"{}\"\n{}",
         out.display(),
         folder_source("docs", &env.data(), "current")
@@ -291,6 +292,250 @@ async fn a_check_change_replays_the_cache_without_yes() {
         env.count("select count(*) from chunks where llm_key = 'older check'")
             .await,
         0
+    );
+    env.finish().await;
+}
+
+async fn known_setup(name: &str) -> (Env, i64) {
+    let env = Env::new(name).await;
+    env.file(
+        "Projects/2021/P-2021-0042 Brixwell Pumps - Kelmar/04 Reports/visit.txt",
+        "Visit report. The pressure was checked on the return line and the readings were \
+         written down for the next visit. Nothing else needs attention this time.",
+    );
+    env.copy_acme_rules();
+    env.write_config(&folder_source("docs", &env.data(), "current"));
+    env.scan().await;
+    let chunk = env.count("select min(id) from chunks").await;
+    (env, chunk)
+}
+
+async fn known_names(env: &Env, chunk: i64) -> Vec<String> {
+    zontologize::db::facts::known(&env.pool, &[chunk], 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|k| k.name)
+        .collect()
+}
+
+#[tokio::test]
+#[ignore]
+async fn known_offers_the_document_project_customer_and_site() {
+    let (env, chunk) = known_setup("facts_known").await;
+    let mut names = known_names(&env, chunk).await;
+    names.sort();
+    assert_eq!(
+        names,
+        ["Brixwell Pumps", "Kelmar", "P-2021-0042 Brixwell Pumps"]
+    );
+    sqlx::raw_sql(
+        "insert into entities (class_iri, key, name, method, confidence, ontology_version_id)
+         select class_iri, 'brixwell root', 'Brixwell Root', 'gazetteer', 1, ontology_version_id
+         from entities where key = 'brixwell pumps';
+         update entities set canonical_id = (select id from entities where key = 'brixwell root')
+         where key in ('brixwell pumps', 'brixwell root');",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    let mut names = known_names(&env, chunk).await;
+    names.sort();
+    assert_eq!(
+        names,
+        ["Brixwell Root", "Kelmar", "P-2021-0042 Brixwell Pumps"]
+    );
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn known_leaves_out_model_mentions() {
+    let (env, chunk) = known_setup("facts_known_model").await;
+    sqlx::raw_sql(
+        "insert into entities (class_iri, key, name, method, confidence, ontology_version_id)
+         select class_iri, 'model made', 'Model Made', 'llm:x', 0.8, ontology_version_id
+         from entities where key = 'kelmar';
+         insert into mentions (entity_id, document_id, span_start, span_end, method, confidence)
+         select (select id from entities where key = 'model made'), min(id), 0, 4, 'llm:x', 0.8
+         from documents;",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    assert!(
+        !known_names(&env, chunk)
+            .await
+            .contains(&"Model Made".to_string())
+    );
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_class_override_survives_an_extract_replay() {
+    let env = setup_extract("facts_overlay").await;
+    assert_eq!(extract(&env, &options()).await.unwrap(), Outcome::Finished);
+    let pump = "select id from entities where method like 'llm:%' \
+                and class_iri = 'https://example.org/acme#Pump'";
+    let id = env.count(pump).await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "insert into entity_classes (entity_id, class_iri, method, status, confidence, \
+         ontology_version_id) select id, 'https://example.org/acme#Equipment', 'curate:test', \
+         'auto', 0.9, ontology_version_id from entities where id = {id}"
+    )))
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    sqlx::query("update chunks set llm_key = null")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    assert_eq!(extract(&env, &options()).await.unwrap(), Outcome::Finished);
+    assert_eq!(env.count("select count(*) from llm_calls").await, 2);
+    assert_eq!(env.count(pump).await, id);
+    assert_eq!(
+        env.count(&format!(
+            "select count(*) from entity_classes where entity_id = {id} and status = 'auto'"
+        ))
+        .await,
+        1
+    );
+    assert_eq!(
+        env.count(&format!(
+            "select count(*) from \"{}_api\".canonical_entities where id = {id} \
+             and class_iri = 'https://example.org/acme#Equipment'",
+            env.schema
+        ))
+        .await,
+        1
+    );
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_replay_gives_extracted_entities_normalised_keys() {
+    let env = setup_extract("facts_keys").await;
+    assert_eq!(extract(&env, &options()).await.unwrap(), Outcome::Finished);
+    sqlx::raw_sql(
+        "update entities set key = key || ' b.v.' where method like 'llm:%';
+         update chunks set llm_key = 'older check' where llm_key is not null;",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(extract(&env, &options()).await.unwrap(), Outcome::Finished);
+    assert_eq!(env.count("select count(*) from llm_calls").await, 2);
+    assert_eq!(
+        env.count("select count(*) from entities where method like 'llm:%' and key like '% b.v.'")
+            .await,
+        0
+    );
+    assert!(
+        env.count("select count(*) from entities where method like 'llm:%' and key = 'north site'")
+            .await
+            > 0
+    );
+    assert_eq!(
+        env.count(
+            "select count(*) from entities e where e.method like 'llm:%' \
+             and not exists (select 1 from mentions m where m.entity_id = e.id)"
+        )
+        .await,
+        0
+    );
+    env.finish().await;
+}
+
+const ACME_ROWS: &str = "
+    insert into entities (class_iri, key, name, method, confidence, ontology_version_id)
+    select 'https://example.org/acme#Organisation', k, n, 'llm:test', 0.8, max(ontology_version_id)
+    from entities, (values (1, 'acme b.v.', 'Acme B.V.'), (2, 'acme bv', 'Acme BV'),
+                           (3, 'zeta works', 'Zeta Works')) v(o, k, n)
+    group by o, k, n order by o;
+    insert into mentions (entity_id, document_id, span_start, span_end, method, confidence)
+    select e.id, (select min(id) from documents), 0, 4, 'llm:test', 0.8
+    from entities e where e.key in ('acme b.v.', 'acme bv');
+    insert into attributes (entity_id, property_iri, value_text, chunk_id, span_start, span_end,
+        method, confidence)
+    select e.id, 'https://example.org/acme#ratedPower', e.name, (select min(id) from chunks), 0, 4,
+        'llm:test', 0.8
+    from entities e where e.key in ('acme b.v.', 'acme bv');
+    insert into aliases (entity_id, alias, method)
+    select e.id, 'Alias of ' || e.name, 'gazetteer' from entities e
+    where e.key in ('acme b.v.', 'acme bv');
+    insert into relations (src_id, property_iri, dst_id, method, status, confidence, document_id)
+    select e.id, 'https://example.org/acme#partOf', z.id, 'llm:test', 'confirmed', 0.9,
+        (select min(id) from documents)
+    from entities e, entities z where e.key in ('acme b.v.', 'acme bv') and z.key = 'zeta works';
+";
+
+async fn acme_ids(env: &Env) -> Vec<(i64, String)> {
+    sqlx::query_as("select id, key from entities where name like 'Acme%' order by id")
+        .fetch_all(&env.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore]
+async fn stored_model_entities_are_re_keyed_and_folded() {
+    let env = setup_extract("facts_rekey").await;
+    assert_eq!(extract(&env, &options()).await.unwrap(), Outcome::Finished);
+    sqlx::raw_sql(ACME_ROWS).execute(&env.pool).await.unwrap();
+    let before = acme_ids(&env).await;
+    assert_eq!(extract(&env, &options()).await.unwrap(), Outcome::Finished);
+    assert_eq!(env.count("select count(*) from llm_calls").await, 2);
+    let kept = before[0].0;
+    assert_eq!(acme_ids(&env).await, [(kept, "acme".to_string())]);
+    let on_kept = |table: &str| format!("select count(*) from {table} where entity_id = {kept}");
+    assert_eq!(env.count(&on_kept("mentions")).await, 2);
+    assert_eq!(env.count(&on_kept("attributes")).await, 2);
+    assert_eq!(
+        env.count(&format!(
+            "select count(*) from aliases where entity_id = {kept} and \
+             (alias like 'Alias of Acme%' or (alias = 'Acme BV' and method = 'fold'))"
+        ))
+        .await,
+        3
+    );
+    assert_eq!(
+        env.count(&format!(
+            "select count(*) from relations where src_id = {kept} and status = 'confirmed'"
+        ))
+        .await,
+        2
+    );
+    assert_eq!(extract(&env, &options()).await.unwrap(), Outcome::Finished);
+    assert_eq!(acme_ids(&env).await, [(kept, "acme".to_string())]);
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_rejected_same_as_keeps_rows_apart() {
+    let env = setup_extract("facts_rekey_apart").await;
+    assert_eq!(extract(&env, &options()).await.unwrap(), Outcome::Finished);
+    sqlx::raw_sql(ACME_ROWS).execute(&env.pool).await.unwrap();
+    let before = acme_ids(&env).await;
+    sqlx::query(
+        "insert into relations (src_id, property_iri, dst_id, method, status, confidence, document_id) \
+         values ($1, 'http://www.w3.org/2002/07/owl#sameAs', $2, 'resolve:fuzzy', 'rejected', 0.9, \
+         (select min(id) from documents))",
+    )
+    .bind(before[0].0)
+    .bind(before[1].0)
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(extract(&env, &options()).await.unwrap(), Outcome::Finished);
+    assert_eq!(
+        acme_ids(&env).await,
+        [
+            (before[0].0, "acme".to_string()),
+            (before[1].0, "acme bv".to_string())
+        ]
     );
     env.finish().await;
 }

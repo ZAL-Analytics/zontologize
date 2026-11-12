@@ -5,7 +5,8 @@
 
 A Rust CLI that indexes folders into PostgreSQL, shaped by an OWL ontology (Turtle). It stores
 documents, pages, chunks, entities, relations and the provenance of every fact in its own schema.
-Runs are incremental: only changed files and stages are processed. CPU only.
+Runs are incremental: only changed files and stages are processed. Runs on the CPU by default;
+a build with `--features gpu` runs OCR and embeddings on an NVIDIA GPU.
 
 Status: early development.
 
@@ -39,7 +40,9 @@ zontologize --config my-config db check
 
 A config directory (`--config DIR` or `ZONTOLOGIZE_CONFIG`) holds everything specific to your
 data. All files are optional; see `examples/acme/` for a complete example and
-[docs/configuration.md](docs/configuration.md) for the settings.
+[docs/configuration.md](docs/configuration.md) for the settings. `examples/test-data/` runs the
+whole pipeline on the generated `data/tests` in its own schema; `data/tests/world.csv` lists every
+spelling of every entity in that data (`name,variant,class`).
 
 ```
 my-config/
@@ -62,9 +65,12 @@ zontologize --config my-config extract          # LLM extraction
 zontologize --config my-config attributes       # values with units
 zontologize --config my-config embed            # local embeddings, see docs/embeddings.md
 zontologize --config my-config eval embed       # compare embedding models
+zontologize --config my-config eval entities    # compare found entities with a world list
 zontologize --config my-config resolve          # merge duplicates, link documents
+zontologize --config my-config curate           # LLM decides proposed merges, classes and names
 zontologize --config my-config review sample    # mark sampled facts right or wrong
 zontologize --config my-config review merges    # confirm or reject proposed links
+zontologize --config my-config review classes   # confirm or reject proposed class changes
 zontologize --config my-config graph sync       # rebuild the AGE graph
 zontologize --config my-config ontology export  # write the selected ontology as Turtle
 zontologize --config my-config status

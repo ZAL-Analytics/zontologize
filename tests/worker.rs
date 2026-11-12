@@ -17,6 +17,7 @@ fn worker_process_extracts_and_exits_when_stdin_closes() {
     let setup = Setup {
         extract: config.extract,
         ocr: config.ocr,
+        gpu: config.gpu,
     };
     let mut child = Command::new(env!("CARGO_BIN_EXE_zontologize"))
         .arg(SUBCOMMAND)

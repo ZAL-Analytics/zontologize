@@ -74,6 +74,7 @@ fit = "claude-code:sonnet"
 extract = "claude-code:sonnet"
 classify = "claude-code:haiku"
 attributes = "claude-code:sonnet"
+curate = "claude-code:sonnet"
 embed = "local:multilingual-e5-small"
 # fit = "claude-code:haiku"
 # fit = "openrouter:anthropic/claude-haiku-5.5"
@@ -84,6 +85,8 @@ chars_per_token = 2.0
 concurrency = 2
 timeout_secs = 300
 max_window_use = 0.8
+config_dirs = []
+# config_dirs = ["~/.claude-a", "~/.claude-b"]
 
 [providers.openrouter]
 base_url = "https://openrouter.ai/api/v1"
@@ -163,9 +166,27 @@ confidence = 0.7
 read_batch = 500
 definition_chars = 200
 
+[curate]
+confidence = 0.9
+max_members = 8
+context_chars = 100
+max_shortlist = 30
+definition_chars = 200
+out = "curate"
+
+[curate.not_in_class]
+"acme:Site" = ["(?i)\\b(b\\.?v\\.?|n\\.?v\\.?)$"]
+
+[gpu]
+provider = "cpu"
+device = 0
+
 [review]
 sample = 50
 min_verdicts = 30
+
+[eval]
+world = ""
 
 [embed]
 threads = 0

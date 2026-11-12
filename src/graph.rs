@@ -180,7 +180,14 @@ async fn run_with(
         });
     }
     let mut conn = db::connect(url, &config.database.schema).await?;
-    let result = db::graph::rebuild(&mut conn, &config.database.schema, graph, &labels).await;
+    let result = db::graph::rebuild(
+        &mut conn,
+        &config.database.schema,
+        &config.database.api_schema,
+        graph,
+        &labels,
+    )
+    .await;
     db::close(conn).await;
     let (vertices, edges) = result?;
     Ok(Stats {

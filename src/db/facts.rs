@@ -137,17 +137,42 @@ pub async fn chunks(pool: &PgPool, ids: &[i64]) -> Result<Vec<ChunkRow>> {
     Ok(rows)
 }
 
-pub async fn known(pool: &PgPool, ids: &[i64]) -> Result<Vec<KnownRow>> {
-    let rows = sqlx::query_as(
-        "select distinct m.chunk_id, e.id as entity_id, e.class_iri, e.name from mentions m \
-         join entities e on e.id = m.entity_id where m.chunk_id = any($1) \
-         and m.method not like $2 and m.method <> $3 order by m.chunk_id, e.id",
-    )
-    .bind(ids)
-    .bind(MODEL_METHODS)
-    .bind(SEGMENT_METHOD)
-    .fetch_all(pool)
-    .await?;
+const KNOWN: &str = "with chunk as (select k.id as chunk_id, k.content_id, d.id as document_id \
+    from chunks k join lateral (select d.id from documents d where d.content_id = k.content_id \
+    and d.status = 'present' order by d.id limit 1) d on true where k.id = any($1)), \
+    rule_mentions as (select * from mentions m where m.method not like $2 \
+    and m.method not like $3 and m.method <> $4), \
+    in_document as (select c.chunk_id, m.entity_id from chunk c \
+    join rule_mentions m on m.document_id = c.document_id), \
+    found as (select c.chunk_id, 1 as rank, m.entity_id from chunk c \
+    join rule_mentions m on m.chunk_id = c.chunk_id \
+    union all select chunk_id, 2, entity_id from in_document \
+    union all select f.chunk_id, 3, \
+    case when r.src_id = f.entity_id then r.dst_id else r.src_id end from in_document f \
+    join relations r on r.src_id = f.entity_id or r.dst_id = f.entity_id \
+    where r.status <> 'rejected' and r.property_iri <> $5 \
+    and r.method not like $2 and r.method not like $3 \
+    union all select c.chunk_id, 4, m.entity_id from chunk c \
+    join chunks o on o.content_id = c.content_id and o.id <> c.chunk_id \
+    join rule_mentions m on m.chunk_id = o.id), \
+    best as (select f.chunk_id, coalesce(e.canonical_id, e.id) as root, min(f.rank) as rank \
+    from found f join entities e on e.id = f.entity_id \
+    where e.document_id is null or e.key <> e.document_id::text group by 1, 2), \
+    numbered as (select chunk_id, root, \
+    row_number() over (partition by chunk_id order by rank, root) as n from best) \
+    select n.chunk_id, e.id as entity_id, e.class_iri, e.name from numbered n \
+    join entities e on e.id = n.root where n.n <= $6 order by n.chunk_id, n.n";
+
+pub async fn known(pool: &PgPool, ids: &[i64], max_known: usize) -> Result<Vec<KnownRow>> {
+    let rows = sqlx::query_as(KNOWN)
+        .bind(ids)
+        .bind(MODEL_METHODS)
+        .bind(super::RESOLVE_METHODS)
+        .bind(SEGMENT_METHOD)
+        .bind(super::resolve::SAME_AS)
+        .bind(max_known as i64)
+        .fetch_all(pool)
+        .await?;
     Ok(rows)
 }
 

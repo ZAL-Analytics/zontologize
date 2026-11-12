@@ -480,3 +480,47 @@ async fn deleted_owners_take_their_vectors_and_job_items_along() {
     assert!(orphan.is_err());
     env.finish().await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn a_name_equal_to_a_gazetteer_alias_is_merged_by_alias() {
+    let env = setup("resolve_alias").await;
+    sqlx::raw_sql(
+        "insert into entities (class_iri, key, name, method, confidence, ontology_version_id)
+         select 'https://example.org/acme#Customer', 'test nw pumps', 'NW Pumps', 'llm:test', 0.8,
+             ontology_version_id from entities where name = 'Northwind Pumps';
+         insert into entities (class_iri, key, name, method, confidence, ontology_version_id)
+         select 'https://example.org/acme#Customer', 'test only resolve', 'Only Resolve Alias',
+             'llm:test', 0.8, ontology_version_id from entities where name = 'Northwind Pumps';
+         insert into aliases (entity_id, alias, method)
+         select id, 'Only Resolve Alias Twin', 'resolve' from entities where name = 'Northwind Pumps';
+         insert into entities (class_iri, key, name, method, confidence, ontology_version_id)
+         select 'https://example.org/acme#Customer', 'test twin', 'Only Resolve Alias Twin',
+             'llm:test', 0.8, ontology_version_id from entities where name = 'Northwind Pumps';",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    let stats = resolve(&env).await;
+    assert!(stats.added.contains_key("resolve:alias"), "{stats:?}");
+    let by_alias = env
+        .count(
+            "select count(*) from relations r join entities a on a.id = r.src_id \
+             join entities b on b.id = r.dst_id where r.method = 'resolve:alias' \
+             and r.status = 'auto' and 'NW Pumps' in (a.name, b.name) \
+             and 'Northwind Pumps' in (a.name, b.name)",
+        )
+        .await;
+    assert_eq!(by_alias, 1);
+    assert_eq!(
+        canonical(&env, "NW Pumps").await,
+        canonical(&env, "Northwind Pumps").await
+    );
+    assert_ne!(
+        canonical(&env, "Only Resolve Alias Twin").await,
+        canonical(&env, "Northwind Pumps").await
+    );
+    let again = resolve(&env).await;
+    assert_eq!(again.written(), 0, "{again:?}");
+    env.finish().await;
+}
