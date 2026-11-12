@@ -3,6 +3,43 @@
 Apps read the views in `zontologize_api` (`[database] api_schema`). The views only gain columns
 between versions; `select zontologize_api.contract_version()` says which contract you have.
 
+## Quick start
+
+Find text, with the file and page it is on:
+
+```sql
+select d.path, c.page_from, left(c.text, 200) as snippet
+from zontologize_api.chunks c
+join zontologize_api.documents d on d.content_id = c.content_id,
+     websearch_to_tsquery('english', 'seal leak') q
+where c.tsv_stem @@ q
+order by ts_rank(c.tsv_stem, q) desc
+limit 10;
+```
+
+Find an entity, typos allowed, and every page that names it:
+
+```sql
+select e.name, e.class_iri, d.path, p.page_no
+from zontologize_api.canonical_entities e
+join zontologize_api.entities x on e.id in (x.id, x.canonical_id)
+join zontologize_api.mention_pages p on p.entity_id = x.id
+join zontologize_api.documents d on d.content_id = p.content_id
+where similarity(lower(e.name), lower('Nortside Pumping Station')) > 0.5;
+```
+
+Follow the graph: everything directly linked to one project.
+
+```sql
+load 'age';
+set search_path = ag_catalog, "$user", public;
+select * from cypher('zontologize_graph', $$
+  match (p:Project {key: 'P-2021-0042'})-[r]-(n) return type(r), n.name
+$$) as (relation agtype, name agtype);
+```
+
+## Running
+
 A run after new files arrive, from cron or by hand:
 
 ```sh
