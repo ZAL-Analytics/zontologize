@@ -15,7 +15,7 @@ use crate::ontology::{Ontology, PropertyKind};
 
 pub const TASK: &str = "extract";
 pub const CACHE_VERSION: u32 = 1;
-pub const CHECK_VERSION: u32 = 2;
+pub const CHECK_VERSION: u32 = 4;
 pub const DOC: &str = "doc";
 pub const USER_VARIABLES: [&str; 7] = [
     "path",
@@ -246,10 +246,14 @@ pub fn schema(
     })
 }
 
-pub fn check_key(ontology: &Ontology) -> String {
+pub fn check_key(ontology: &Ontology, strip_words: &[String]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(CHECK_VERSION.to_le_bytes());
     hasher.update(ontology.version.as_bytes());
+    for word in strip_words {
+        hasher.update(word.as_bytes());
+        hasher.update([0]);
+    }
     hex(&hasher.finalize())
 }
 
@@ -347,7 +351,7 @@ pub mod tests {
         format!("{EX}{name}")
     }
 
-    fn ontology_from(ttl: &str) -> Ontology {
+    pub fn ontology_from(ttl: &str) -> Ontology {
         let config = OntologyConfig {
             files: vec!["a.ttl".to_string()],
             languages: vec!["en".to_string()],
@@ -411,6 +415,52 @@ pub mod tests {
             model: &model,
         };
         build(&context, input)
+    }
+
+    #[test]
+    fn known_things_keep_their_order_and_are_cut_at_max_known() {
+        let onto = ontology();
+        let mut chunk = input(&[("Pump", 1)]);
+        chunk.known = [
+            (9, "Site", "Zeta"),
+            (3, "Pump", "Alpha"),
+            (5, "Site", "Mid"),
+        ]
+        .iter()
+        .map(|(id, class, name)| Known {
+            entity_id: *id,
+            class: iri(class),
+            name: name.to_string(),
+        })
+        .collect();
+        let system = prompt("system");
+        let user = prompt("{known}\n{chunk}");
+        let model = ModelName::parse("claude-code:haiku").unwrap();
+        let languages = languages();
+        let context = Context {
+            ontology: &onto,
+            languages: &languages,
+            max_shortlist: 10,
+            max_known: 2,
+            definition_chars: 200,
+            exclude: &[],
+            check_key: "check",
+            system: &system,
+            user: &user,
+            model: &model,
+        };
+        let built = build(&context, &chunk);
+        let ids: Vec<i64> = built.known.iter().map(|k| k.entity_id).collect();
+        assert_eq!(ids, [9, 3]);
+        let lines = known_lines(&built.known, None);
+        assert_eq!(
+            lines,
+            format!(
+                "- r1 | {} | Zeta\n- r2 | {} | Alpha\n",
+                iri("Site"),
+                iri("Pump")
+            )
+        );
     }
 
     #[test]
@@ -510,12 +560,13 @@ pub mod tests {
             r#"ex:Site a owl:Class ; skos:prefLabel "Site"@en ."#,
             r#"ex:Site a owl:Class ; skos:prefLabel "Site"@en ; skos:altLabel "Plant"@en ."#,
         ));
-        assert_ne!(check_key(&onto), check_key(&alias));
+        assert_ne!(check_key(&onto, &[]), check_key(&alias, &[]));
         let request = built(&onto, &input(&[("Pump", 1)]));
-        let same = state_key(&request.cache_key, &check_key(&onto));
-        let other = state_key(&request.cache_key, &check_key(&alias));
+        let same = state_key(&request.cache_key, &check_key(&onto, &[]));
+        let other = state_key(&request.cache_key, &check_key(&alias, &[]));
         assert_ne!(same, other);
         assert_eq!(request.key, state_key(&request.cache_key, "check"));
+        assert_ne!(check_key(&onto, &[]), check_key(&onto, &["BV".to_string()]));
     }
 
     pub fn recorded<T: serde::de::DeserializeOwned>(name: &str) -> T {

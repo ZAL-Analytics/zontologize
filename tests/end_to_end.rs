@@ -248,7 +248,11 @@ async fn graph_export_and_views(env: &Env, url: &str) {
         .unwrap();
     assert_eq!(
         graph.vertices as i64,
-        env.count("select count(*) from entities").await
+        env.count(&format!(
+            "select count(*) from \"{}_api\".canonical_entities",
+            env.schema
+        ))
+        .await
     );
     let text = zontologize::export::run(config.as_deref(), Some(url))
         .await

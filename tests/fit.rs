@@ -18,6 +18,10 @@ fn options(script: &str) -> Options {
 }
 
 async fn setup(name: &str) -> Env {
+    setup_with(name, "").await
+}
+
+async fn setup_with(name: &str, claude_code: &str) -> Env {
     let env = Env::new(name).await;
     for n in 1..=3 {
         env.file(
@@ -29,7 +33,7 @@ async fn setup(name: &str) -> Env {
     let out = env.dir.join("fit");
     env.write_config(&format!(
         "[models]\nfit = \"claude-code:haiku\"\n\
-         [providers.claude-code]\nconcurrency = 1\n\
+         [providers.claude-code]\nconcurrency = 1\n{claude_code}\n\
          [fit]\nsample = 10\nmin_chars = 50\nmin_evidence = 2\nout = \"{}\"\n\
          proposal_namespace = \"urn:acme:proposal#\"\n{}",
         out.display(),
@@ -258,5 +262,81 @@ async fn max_usd_stops_a_billed_job_but_not_a_subscription() {
     subscription.max_usd = Some(0.002);
     assert_eq!(fit(&env, &subscription).await.unwrap(), Outcome::Finished);
     assert_eq!(env.count("select count(*) from llm_calls").await, 4);
+    env.finish().await;
+}
+
+async fn two_accounts(name: &str) -> Env {
+    setup_with(
+        name,
+        "config_dirs = [\"/nonexistent/acct-a\", \"/nonexistent/acct-b\"]",
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_limited_account_is_paused_and_the_job_goes_on_with_the_other() {
+    let env = two_accounts("fit_accounts").await;
+    assert_eq!(
+        fit(&env, &options("fake-claude-accounts.sh"))
+            .await
+            .unwrap(),
+        Outcome::Finished
+    );
+    assert_eq!(
+        env.count(
+            "select count(*) from llm_calls where status = 'pause' and account like '%acct-a' \
+             and resume_at = to_timestamp(1893456000)"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        env.count("select count(*) from llm_calls where status = 'ok' and account like '%acct-b'")
+            .await,
+        4
+    );
+    assert_eq!(
+        env.count(
+            "select count(*) from llm_calls where status = 'ok' and account not like '%acct-b'"
+        )
+        .await,
+        0
+    );
+    let accounts = zontologize::db::llm::accounts(
+        &env.pool,
+        &[
+            "/nonexistent/acct-a".to_string(),
+            "/nonexistent/acct-b".to_string(),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(accounts[0].paused_until.is_some(), "{accounts:?}");
+    assert!(accounts[1].paused_until.is_none(), "{accounts:?}");
+    assert!(accounts[1].last_used.is_some(), "{accounts:?}");
+    env.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn the_job_pauses_when_every_account_is_limited() {
+    let env = two_accounts("fit_accounts_limited").await;
+    assert_eq!(
+        fit(&env, &options("fake-claude-rejected.sh"))
+            .await
+            .unwrap(),
+        Outcome::Paused
+    );
+    assert_eq!(
+        env.count("select count(distinct account) from llm_calls where status = 'pause'")
+            .await,
+        2
+    );
+    assert_eq!(
+        env.count("select count(*) from llm_jobs where status = 'paused'")
+            .await,
+        1
+    );
     env.finish().await;
 }

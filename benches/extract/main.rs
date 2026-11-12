@@ -78,17 +78,23 @@ async fn main() -> Result<()> {
         files.truncate(limit);
     }
     println!(
-        "folder {}: {} files, backend {}, tier {}, languages {}, threads {}, timeout {}s",
+        "folder {}: {} files, backend {}, provider {:?} device {}, tier {}, languages {}, threads {}, timeout {}s",
         args.folder.display(),
         files.len(),
         extract::OCR_BACKEND,
+        config.gpu.provider,
+        config.gpu.device,
         extract::tier_name(config.ocr.model_tier),
         config.ocr.languages.join("+"),
         config.extract.threads,
         config.extract.timeout_secs,
     );
 
-    let settings = Arc::new(ExtractSettings::new(&config.extract, &config.ocr));
+    let settings = Arc::new(ExtractSettings::new(
+        &config.extract,
+        &config.ocr,
+        config.gpu,
+    )?);
     let timeout = Duration::from_secs(config.extract.timeout_secs);
     let semaphore = Arc::new(Semaphore::new(config.extract.threads));
     let cpu_before = cpu_seconds();

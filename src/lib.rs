@@ -2,8 +2,10 @@ pub mod attributes;
 pub mod classify;
 pub mod config;
 pub mod cpu;
+pub mod curate;
 pub mod db;
 pub mod embed;
+pub mod eval;
 pub mod export;
 pub mod facts;
 pub mod fit;
@@ -12,7 +14,6 @@ pub mod hash;
 pub mod llm;
 pub mod ns;
 pub mod ontology;
-pub mod persons;
 pub mod resolve;
 pub mod review;
 pub mod rules;
@@ -302,6 +303,11 @@ pub async fn attributes(
     Ok(exit_code(outcome))
 }
 
+pub async fn curate(config_dir: Option<&Path>, options: &llm::job::Options) -> Result<ExitCode> {
+    let outcome = curate::run::run(config_dir, database_url().as_deref(), options).await?;
+    Ok(exit_code(outcome))
+}
+
 pub async fn classify(config_dir: Option<&Path>, options: &llm::job::Options) -> Result<ExitCode> {
     let outcome = classify::run(config_dir, database_url().as_deref(), options).await?;
     Ok(exit_code(outcome))
@@ -357,30 +363,18 @@ pub async fn embed(config_dir: Option<&Path>, options: &embed::run::Options) -> 
     Ok(ExitCode::SUCCESS)
 }
 
+pub async fn eval_entities(config_dir: Option<&Path>) -> Result<ExitCode> {
+    let scores = eval::run(config_dir, database_url().as_deref()).await?;
+    print!("{}", eval::table(&scores));
+    Ok(ExitCode::SUCCESS)
+}
+
 pub async fn eval_embed(
     config_dir: Option<&Path>,
     options: &embed::eval::Options,
 ) -> Result<ExitCode> {
     let path = embed::eval::run(config_dir, database_url().as_deref(), options).await?;
     println!("eval embed: report in {}", path.display());
-    Ok(ExitCode::SUCCESS)
-}
-
-pub async fn persons(
-    config_dir: Option<&Path>,
-    options: &persons::run::Options,
-) -> Result<ExitCode> {
-    let stats = persons::run::run(config_dir, database_url().as_deref(), options).await?;
-    println!(
-        "persons: {} contents, {} chunks ({} unreadable), {} windows, {} names, {} contents left, {:.0} s",
-        stats.contents,
-        stats.chunks,
-        stats.skipped,
-        stats.windows,
-        stats.people,
-        stats.left,
-        stats.seconds
-    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -419,11 +413,33 @@ pub async fn review_merges(
     Ok(ExitCode::SUCCESS)
 }
 
+pub async fn review_classes(
+    config_dir: Option<&Path>,
+    options: &review::ClassOptions,
+) -> Result<ExitCode> {
+    let mut input = tokio::io::BufReader::new(tokio::io::stdin());
+    review::classes(config_dir, database_url().as_deref(), options, &mut input).await?;
+    Ok(ExitCode::SUCCESS)
+}
+
 fn exit_code(outcome: llm::job::Outcome) -> ExitCode {
     match outcome {
         llm::job::Outcome::Paused => ExitCode::from(PAUSED_EXIT_CODE),
         _ => ExitCode::SUCCESS,
     }
+}
+
+fn execution_provider(gpu: config::GpuConfig) -> Result<String> {
+    gpu.usable()?;
+    if gpu.provider == config::GpuProvider::Cpu {
+        return Ok("cpu".to_string());
+    }
+    #[cfg(feature = "gpu")]
+    return embed::local::cuda_available(gpu.device)
+        .map(|()| format!("cuda device {} available", gpu.device))
+        .map_err(|e| anyhow::anyhow!("cuda device {} not available: {e:#}", gpu.device));
+    #[cfg(not(feature = "gpu"))]
+    anyhow::bail!("cuda device {} not available", gpu.device)
 }
 
 pub async fn models_check(
@@ -435,6 +451,13 @@ pub async fn models_check(
         .await
         .ok();
     let mut failed = false;
+    match execution_provider(config.gpu) {
+        Ok(line) => println!("execution provider: {line}"),
+        Err(error) => {
+            failed = true;
+            println!("execution provider: failed, {error:#}");
+        }
+    }
     let mut checked: Vec<(&str, &str)> = Vec::new();
     for (task, model) in config.models.llm_tasks() {
         if model.is_empty() {
@@ -474,65 +497,90 @@ const CHECK_SYSTEM: &str = include_str!("../prompts/check-system.md");
 const CHECK_USER: &str = include_str!("../prompts/check-user.md");
 const CHECK_SCHEMA: &str = include_str!("../prompts/check-schema.json");
 
+async fn check_claude(
+    provider: &llm::Provider,
+    name: &llm::ModelName,
+    account: Option<&str>,
+    pool: Option<&sqlx::PgPool>,
+) -> Result<Vec<String>> {
+    let request = llm::Request {
+        task: "check".to_string(),
+        system: CHECK_SYSTEM.trim_end().to_string(),
+        user: CHECK_USER.trim_end().to_string(),
+        schema: serde_json::from_str(CHECK_SCHEMA)
+            .context("built-in prompts/check-schema.json is not valid JSON")?,
+    };
+    let started = std::time::Instant::now();
+    let reply = provider
+        .send(&request)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if let Some(pool) = pool {
+        let call = db::llm::Call {
+            job_id: None,
+            provider: name.provider.as_str(),
+            account,
+            model: &name.model,
+            task: "check",
+            cache_key: None,
+            input_chars: request.chars() as i64,
+            usage: reply.usage,
+            subscription: reply.subscription,
+            windows: reply.windows,
+            seconds: started.elapsed().as_secs_f64(),
+            status: "ok",
+            error: None,
+            resume_at: None,
+        };
+        if let Err(error) = db::llm::record(pool, &call, None, None).await {
+            eprintln!("models check: the call was not recorded: {error:#}");
+        }
+    }
+    let billing = if reply.subscription {
+        "subscription"
+    } else {
+        "API key, USD caps apply"
+    };
+    let mut lines = vec![format!(
+        "reachable ({billing}), {} input tokens per request at the least",
+        reply.usage.input_tokens
+    )];
+    for (label, window) in [
+        ("5-hour", reply.windows.five_hour),
+        ("7-day", reply.windows.seven_day),
+    ] {
+        if let Some(window) = window {
+            lines.push(format!(
+                "{label} window {:.0}% used, resets {}",
+                window.used * 100.0,
+                window.resets_at.format("%Y-%m-%d %H:%M UTC")
+            ));
+        }
+    }
+    Ok(lines)
+}
+
 async fn check_model(
     config: &config::Config,
     name: &llm::ModelName,
     claude_program: std::path::PathBuf,
     pool: Option<&sqlx::PgPool>,
 ) -> Result<Vec<String>> {
-    let provider = llm::Provider::new(name, config, claude_program)?;
+    let provider = llm::Provider::new(name, config, claude_program.clone(), None)?;
     match &provider {
         llm::Provider::ClaudeCode(_) => {
-            let request = llm::Request {
-                task: "check".to_string(),
-                system: CHECK_SYSTEM.trim_end().to_string(),
-                user: CHECK_USER.trim_end().to_string(),
-                schema: serde_json::from_str(CHECK_SCHEMA)
-                    .context("built-in prompts/check-schema.json is not valid JSON")?,
-            };
-            let started = std::time::Instant::now();
-            let reply = provider
-                .send(&request)
-                .await
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
-            if let Some(pool) = pool {
-                let call = db::llm::Call {
-                    job_id: None,
-                    provider: name.provider.as_str(),
-                    model: &name.model,
-                    task: "check",
-                    cache_key: None,
-                    input_chars: request.chars() as i64,
-                    usage: reply.usage,
-                    subscription: reply.subscription,
-                    windows: reply.windows,
-                    seconds: started.elapsed().as_secs_f64(),
-                    status: "ok",
-                    error: None,
-                };
-                if let Err(error) = db::llm::record(pool, &call, None, None).await {
-                    eprintln!("models check: the call was not recorded: {error:#}");
-                }
-            }
-            let billing = if reply.subscription {
-                "subscription"
-            } else {
-                "API key, USD caps apply"
-            };
-            let mut lines = vec![format!(
-                "reachable ({billing}), {} input tokens per request at the least",
-                reply.usage.input_tokens
-            )];
-            for (label, window) in [
-                ("5-hour", reply.windows.five_hour),
-                ("7-day", reply.windows.seven_day),
-            ] {
-                if let Some(window) = window {
-                    lines.push(format!(
-                        "{label} window {:.0}% used, resets {}",
-                        window.used * 100.0,
-                        window.resets_at.format("%Y-%m-%d %H:%M UTC")
-                    ));
+            let mut lines = Vec::new();
+            for account in name.provider.accounts(&config.providers) {
+                let provider = llm::Provider::new(name, config, claude_program.clone(), account)?;
+                let checked = check_claude(&provider, name, account, pool).await;
+                match account {
+                    Some(dir) => lines.extend(
+                        checked
+                            .with_context(|| dir.to_string())?
+                            .into_iter()
+                            .map(|line| format!("{dir}: {line}")),
+                    ),
+                    None => lines.extend(checked?),
                 }
             }
             Ok(lines)

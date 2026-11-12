@@ -459,10 +459,6 @@ fn turn_around(name: &str) -> String {
     }
 }
 
-pub fn is_particle(word: &str) -> bool {
-    PARTICLES.contains(&word.to_lowercase().as_str())
-}
-
 pub fn person_name(text: &str) -> Option<String> {
     let text = text.trim();
     if text.is_empty() || text.chars().count() > MAX_NAME_CHARS {

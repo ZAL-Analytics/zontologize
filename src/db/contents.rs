@@ -107,6 +107,12 @@ pub async fn write_pages(
         }
         let page_no = page.page_no.to_string();
         let confidence = page.ocr_confidence.map(|c| c.to_string());
+        let width = page.width.map(|w| w.to_string());
+        let height = page.height.map(|h| h.to_string());
+        let words = match page.words.is_empty() {
+            true => None,
+            false => Some(serde_json::to_string(&page.words)?),
+        };
         copy_row(
             &mut data,
             &[
@@ -115,13 +121,17 @@ pub async fn write_pages(
                 Some(page.method.as_str()),
                 confidence.as_deref(),
                 Some(&page.text),
+                width.as_deref(),
+                height.as_deref(),
+                words.as_deref(),
             ],
         );
     }
     if !data.is_empty() {
         let mut copy = tx
             .copy_in_raw(
-                "copy pages (content_id, page_no, method, ocr_confidence, text) from stdin",
+                "copy pages (content_id, page_no, method, ocr_confidence, text, width, height, words) \
+                 from stdin",
             )
             .await?;
         copy.send(data.into_bytes()).await?;
@@ -230,6 +240,7 @@ pub async fn write_chunks(
     key: &str,
     ts_config: &str,
     chunks: &[Chunk],
+    page_starts: &[(i32, i32)],
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
     let old: Vec<(i64, i32, String)> =
@@ -281,6 +292,34 @@ pub async fn write_chunks(
     update_chunks(&mut tx, &kept, ts_config, false).await?;
     update_chunks(&mut tx, &changed, ts_config, true).await?;
     insert_chunks(&mut tx, content_id, ts_config, &fresh).await?;
+    let ords: Vec<i32> = chunks.iter().map(|c| c.ord).collect();
+    let starts: Vec<Option<i32>> = chunks.iter().map(|c| c.text_start).collect();
+    sqlx::query(
+        "update chunks k set text_start = u.text_start \
+         from unnest($2::int[], $3::int[]) as u(ord, text_start) \
+         where k.content_id = $1 and k.ord = u.ord \
+         and k.text_start is distinct from u.text_start",
+    )
+    .bind(content_id)
+    .bind(&ords)
+    .bind(&starts)
+    .execute(&mut *tx)
+    .await?;
+    let page_nos: Vec<i32> = page_starts.iter().map(|(page_no, _)| *page_no).collect();
+    let page_offsets: Vec<i32> = page_starts.iter().map(|(_, start)| *start).collect();
+    sqlx::query(
+        "update pages p set text_start = u.text_start \
+         from (select q.page_no, s.text_start from pages q \
+         left join unnest($2::int[], $3::int[]) as s(page_no, text_start) using (page_no) \
+         where q.content_id = $1) as u \
+         where p.content_id = $1 and p.page_no = u.page_no \
+         and p.text_start is distinct from u.text_start",
+    )
+    .bind(content_id)
+    .bind(&page_nos)
+    .bind(&page_offsets)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("update contents set chunk_key = $2, rules_key = null where id = $1")
         .bind(content_id)
         .bind(key)

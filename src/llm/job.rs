@@ -63,6 +63,7 @@ pub struct Work {
 }
 
 struct Sent {
+    account: usize,
     ord: i32,
     key: String,
     chars: usize,
@@ -94,11 +95,77 @@ struct Caps {
 }
 
 struct Sender {
-    provider: Arc<Provider>,
     concurrency: usize,
     caps: Caps,
     backoff: Duration,
     next_cost: f64,
+}
+
+struct Paused {
+    since: DateTime<Utc>,
+    resume: Resume,
+    reason: String,
+}
+
+struct Account {
+    dir: Option<String>,
+    provider: Arc<Provider>,
+    in_flight: usize,
+    paused: Option<Paused>,
+}
+
+fn pick(accounts: &[Account], concurrency: usize) -> Option<usize> {
+    accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.paused.is_none() && a.in_flight < concurrency)
+        .min_by_key(|(n, a)| (a.in_flight, *n))
+        .map(|(n, _)| n)
+}
+
+fn earliest(accounts: &[Account]) -> Option<(Resume, String)> {
+    let paused: Vec<&Paused> = accounts
+        .iter()
+        .map(|a| a.paused.as_ref())
+        .collect::<Option<_>>()?;
+    let at = paused
+        .iter()
+        .filter_map(|p| match p.resume {
+            Resume::At(at) => Some((at, p)),
+            Resume::Funded => None,
+        })
+        .min_by_key(|(at, _)| *at);
+    match at {
+        Some((at, p)) => Some((Resume::At(at), p.reason.clone())),
+        None => paused.first().map(|p| (Resume::Funded, p.reason.clone())),
+    }
+}
+
+fn lift_reset(accounts: &mut [Account], now: DateTime<Utc>, margin: Duration) {
+    for account in accounts {
+        if let Some(Paused {
+            since,
+            resume: Resume::At(at),
+            ..
+        }) = account.paused
+            && since < at
+            && at + margin <= now
+        {
+            account.paused = None;
+        }
+    }
+}
+
+fn lift_waited(accounts: &mut [Account], now: DateTime<Utc>) {
+    for account in accounts {
+        if account
+            .paused
+            .as_ref()
+            .is_some_and(|p| !matches!(p.resume, Resume::At(at) if at > now))
+        {
+            account.paused = None;
+        }
+    }
 }
 
 enum Stop {
@@ -173,7 +240,17 @@ pub(crate) async fn run<H: Handler>(
     let pool = runner.pool;
     let config = runner.config;
     let name = runner.name;
-    let provider = Provider::new(name, config, limits.claude_program.clone())?;
+    let mut accounts = Vec::new();
+    for dir in name.provider.accounts(&config.providers) {
+        let provider = Provider::new(name, config, limits.claude_program.clone(), dir)?;
+        accounts.push(Account {
+            dir: dir.map(str::to_string),
+            provider: Arc::new(provider),
+            in_flight: 0,
+            paused: None,
+        });
+    }
+    let provider = accounts[0].provider.clone();
     let concurrency = name.provider.concurrency(&config.providers);
     let prices = provider.prices().await?;
     let min_calls = budget::MIN_CALLS.min(config.budget.calibration_calls);
@@ -196,14 +273,14 @@ pub(crate) async fn run<H: Handler>(
             output_tokens: config.budget.default_output_tokens as f64,
             min_calls,
         },
-        concurrency,
+        concurrency * accounts.len(),
     );
     let (spent, sent) = db::llm::spend(pool, runner.job_id).await?;
     let caps = Caps {
         max_usd: limits.max_usd.unwrap_or(config.budget.max_usd),
         max_requests: limits.max_requests.unwrap_or(config.budget.max_requests),
     };
-    print_estimate(runner, &provider, &estimate, (spent, sent), caps, min_calls).await?;
+    print_estimate(runner, &accounts, &estimate, (spent, sent), caps, min_calls).await?;
     if limits.dry_run {
         return Ok(Outcome::DryRun);
     }
@@ -213,7 +290,6 @@ pub(crate) async fn run<H: Handler>(
         .usd
         .map_or(0.0, |usd| usd / estimate.requests.max(1) as f64);
     let sender = Sender {
-        provider: Arc::new(provider),
         concurrency,
         caps,
         backoff: limits
@@ -226,18 +302,30 @@ pub(crate) async fn run<H: Handler>(
     let mut first = Some(runner.resume_after);
     loop {
         if let Some(resume_after) = first.take() {
+            let now = Utc::now();
+            if name.provider.has_windows() {
+                for account in &mut accounts {
+                    if let Some(windows) =
+                        db::llm::last_windows(pool, account.dir.as_deref()).await?
+                        && let Some(at) = budget::window_full(
+                            &windows,
+                            config.providers.claude_code.max_window_use,
+                            now,
+                        )
+                    {
+                        account.paused = Some(Paused {
+                            since: now,
+                            resume: Resume::At(at),
+                            reason: "waiting for the usage window".to_string(),
+                        });
+                    }
+                }
+            }
             let mut waits = Vec::new();
-            if let Some(at) = resume_after.filter(|at| *at > Utc::now()) {
+            if let Some(at) = resume_after.filter(|at| *at > now) {
                 waits.push(at);
             }
-            if name.provider.has_windows()
-                && let Some(windows) = db::llm::last_windows(pool).await?
-                && let Some(at) = budget::window_full(
-                    &windows,
-                    config.providers.claude_code.max_window_use,
-                    Utc::now(),
-                )
-            {
+            if let Some((Resume::At(at), _)) = earliest(&accounts) {
                 waits.push(at);
             }
             if let Some(at) = waits.into_iter().max() {
@@ -247,14 +335,17 @@ pub(crate) async fn run<H: Handler>(
                     handler,
                     stop,
                     limits,
-                    &sender.provider,
+                    &provider,
                     next_cost,
                     &mut stop_rx,
                 )
                 .await?
                 {
                     Some(outcome) => return Ok(outcome),
-                    None => continue,
+                    None => {
+                        lift_waited(&mut accounts, Utc::now());
+                        continue;
+                    }
                 }
             }
         }
@@ -263,6 +354,7 @@ pub(crate) async fn run<H: Handler>(
             runner,
             handler,
             &sender,
+            &mut accounts,
             &mut queue,
             &mut pauses,
             &mut stop_rx,
@@ -291,7 +383,7 @@ pub(crate) async fn run<H: Handler>(
             handler,
             stop,
             limits,
-            &sender.provider,
+            &provider,
             next_cost,
             &mut stop_rx,
         )
@@ -299,12 +391,13 @@ pub(crate) async fn run<H: Handler>(
         {
             return Ok(outcome);
         }
+        lift_waited(&mut accounts, Utc::now());
     }
 }
 
 async fn print_estimate(
     runner: &Runner<'_>,
-    provider: &Provider,
+    accounts: &[Account],
     estimate: &Estimate,
     (spent, sent): (f64, i64),
     caps: Caps,
@@ -352,14 +445,19 @@ async fn print_estimate(
     );
     if name.provider.has_windows() {
         let max_use = runner.config.providers.claude_code.max_window_use;
-        match db::llm::last_windows(runner.pool).await? {
-            Some(windows) => print_windows(&windows, estimate, max_use),
-            None => println!(
-                "windows: no reading yet; run zontologize models check to see the usage windows"
-            ),
+        for account in accounts {
+            let dir = account.dir.as_deref();
+            let prefix = dir.map_or(String::new(), |dir| format!("{dir} "));
+            match db::llm::last_windows(runner.pool, dir).await? {
+                Some(windows) => print_windows(&prefix, &windows, estimate, max_use),
+                None => println!(
+                    "windows: {prefix}no reading yet; run zontologize models check to see the \
+                     usage windows"
+                ),
+            }
         }
     }
-    if let Some(credit) = provider.credit().await? {
+    if let Some(credit) = accounts[0].provider.credit().await? {
         match credit.remaining_usd {
             Some(remaining) => println!(
                 "openrouter: ${remaining:.4} left on the key{}",
@@ -374,7 +472,7 @@ async fn print_estimate(
     Ok(())
 }
 
-fn print_windows(windows: &Windows, estimate: &Estimate, max_use: f64) {
+fn print_windows(prefix: &str, windows: &Windows, estimate: &Estimate, max_use: f64) {
     let rows = [
         ("5-hour", windows.five_hour, estimate.five_hour),
         ("7-day", windows.seven_day, estimate.seven_day),
@@ -389,7 +487,7 @@ fn print_windows(windows: &Windows, estimate: &Estimate, max_use: f64) {
             0.0
         };
         let mut line = format!(
-            "windows: {label} at {} (resets {}), stop at {}",
+            "windows: {prefix}{label} at {} (resets {}), stop at {}",
             percent(used),
             utc(window.resets_at),
             percent(max_use)
@@ -410,6 +508,7 @@ async fn send_all<H: Handler>(
     runner: &Runner<'_>,
     handler: &H,
     sender: &Sender,
+    accounts: &mut [Account],
     queue: &mut VecDeque<Work>,
     pauses: &mut HashMap<i32, u32>,
     stop_rx: &mut watch::Receiver<bool>,
@@ -425,8 +524,14 @@ async fn send_all<H: Handler>(
     let (mut ok, mut invalid, mut failed) = (0usize, 0usize, 0usize);
     let max_use = runner.config.providers.claude_code.max_window_use;
     let mut subscription = runner.name.provider.has_windows();
+    let margin = Duration::from_secs(runner.config.llm.wait_margin_secs);
+    let label = handler.label();
     loop {
-        while stop.is_none() && set.len() < sender.concurrency && !queue.is_empty() {
+        lift_reset(accounts, Utc::now(), margin);
+        while stop.is_none() && !queue.is_empty() {
+            let Some(account) = pick(accounts, sender.concurrency) else {
+                break;
+            };
             let in_flight = if subscription {
                 0.0
             } else {
@@ -446,12 +551,14 @@ async fn send_all<H: Handler>(
                 continue;
             };
             sent += 1;
-            let provider = sender.provider.clone();
+            accounts[account].in_flight += 1;
+            let provider = accounts[account].provider.clone();
             let backoff = sender.backoff;
             set.spawn(async move {
                 let started = Instant::now();
                 let (result, _) = super::send_with_retries(&provider, &request, backoff).await;
                 Sent {
+                    account,
                     ord: work.ord,
                     key,
                     chars: request.chars(),
@@ -461,7 +568,13 @@ async fn send_all<H: Handler>(
             });
         }
         if set.is_empty() {
-            return Ok(stop.unwrap_or(Stop::Done));
+            if let Some(stop) = stop {
+                return Ok(stop);
+            }
+            if let Some((resume, reason)) = earliest(accounts).filter(|_| !queue.is_empty()) {
+                return Ok(Stop::Pause(resume, reason));
+            }
+            return Ok(Stop::Done);
         }
         let joined = tokio::select! {
             joined = set.join_next() => joined,
@@ -475,15 +588,19 @@ async fn send_all<H: Handler>(
             continue;
         };
         let Sent {
+            account,
             ord,
             key,
             chars,
             result,
             seconds,
         } = joined.context("a model call panicked")?;
+        accounts[account].in_flight -= 1;
+        let dir = accounts[account].dir.clone();
         let mut call = Call {
             job_id: Some(job),
             provider: runner.name.provider.as_str(),
+            account: dir.as_deref(),
             model: &runner.name.model,
             task: handler.task(),
             cache_key: Some(&key),
@@ -494,7 +611,9 @@ async fn send_all<H: Handler>(
             seconds,
             status: "ok",
             error: None,
+            resume_at: None,
         };
+        let mut paused = None;
         match result {
             Ok(reply) => {
                 call.usage = reply.usage;
@@ -520,10 +639,9 @@ async fn send_all<H: Handler>(
                     }
                 }
                 if reply.subscription
-                    && stop.is_none()
                     && let Some(at) = budget::window_full(&reply.windows, max_use, Utc::now())
                 {
-                    stop = Some(Stop::Pause(
+                    paused = Some((
                         Resume::At(at),
                         format!("a Claude Code usage window reached {}", percent(max_use)),
                     ));
@@ -532,6 +650,9 @@ async fn send_all<H: Handler>(
             Err(CallError::Pause { resume, reason }) => {
                 call.status = "pause";
                 call.error = Some(&reason);
+                if let Resume::At(at) = resume {
+                    call.resume_at = Some(at);
+                }
                 let count = pauses.entry(ord).or_insert(0);
                 *count += 1;
                 if *count > MAX_PAUSES_PER_ITEM {
@@ -545,9 +666,7 @@ async fn send_all<H: Handler>(
                 }
                 db::llm::record(pool, &call, None, None).await?;
                 queue.push_front(Work { ord, chars });
-                if stop.is_none() {
-                    stop = Some(Stop::Pause(resume, reason.clone()));
-                }
+                paused = Some((resume, reason.clone()));
             }
             Err(CallError::Invalid { message, usage }) => {
                 invalid += 1;
@@ -573,6 +692,22 @@ async fn send_all<H: Handler>(
                 while set.join_next().await.is_some() {}
                 return Ok(Stop::Fatal(message));
             }
+        }
+        if let Some((resume, reason)) = paused
+            && accounts[account].paused.is_none()
+        {
+            if let Some(dir) = &dir {
+                let until = match resume {
+                    Resume::At(at) => utc(at),
+                    Resume::Funded => "the limit lifts".to_string(),
+                };
+                println!("{label}: account {dir} paused until {until}");
+            }
+            accounts[account].paused = Some(Paused {
+                since: Utc::now(),
+                resume,
+                reason,
+            });
         }
         if last_progress.elapsed() >= Duration::from_secs(runner.config.llm.progress_secs) {
             last_progress = Instant::now();
@@ -702,6 +837,73 @@ async fn wait_for_funds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn account(in_flight: usize, paused: Option<i64>) -> Account {
+        let provider = Provider::ClaudeCode(super::super::claude_code::ClaudeCode::new(
+            PathBuf::from("claude"),
+            "haiku",
+            Duration::from_secs(1),
+            None,
+        ));
+        Account {
+            dir: None,
+            provider: Arc::new(provider),
+            in_flight,
+            paused: paused.map(|at| Paused {
+                since: DateTime::from_timestamp(1_000, 0).unwrap(),
+                resume: Resume::At(DateTime::from_timestamp(at, 0).unwrap()),
+                reason: format!("limit {at}"),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_paused_account_is_skipped_and_concurrency_is_per_account() {
+        let accounts = [account(0, Some(5_000)), account(1, None), account(0, None)];
+        assert_eq!(pick(&accounts, 2), Some(2));
+        let accounts = [account(1, None), account(1, None)];
+        assert_eq!(pick(&accounts, 2), Some(0));
+        let accounts = [account(2, None), account(1, None)];
+        assert_eq!(pick(&accounts, 2), Some(1));
+        let accounts = [account(2, None), account(0, Some(5_000))];
+        assert_eq!(pick(&accounts, 2), None);
+        assert!(earliest(&accounts).is_none());
+    }
+
+    #[test]
+    fn the_earliest_reset_wins_when_all_are_paused() {
+        let mut accounts = [account(0, Some(9_000)), account(0, Some(5_000))];
+        let (resume, reason) = earliest(&accounts).unwrap();
+        assert_eq!(
+            resume,
+            Resume::At(DateTime::from_timestamp(5_000, 0).unwrap())
+        );
+        assert_eq!(reason, "limit 5000");
+        let margin = Duration::from_secs(60);
+        lift_reset(
+            &mut accounts,
+            DateTime::from_timestamp(5_030, 0).unwrap(),
+            margin,
+        );
+        assert!(accounts[1].paused.is_some());
+        lift_reset(
+            &mut accounts,
+            DateTime::from_timestamp(5_060, 0).unwrap(),
+            margin,
+        );
+        assert!(accounts[1].paused.is_none());
+        assert!(accounts[0].paused.is_some());
+        let mut past = [account(0, Some(500)), account(0, Some(9_000))];
+        lift_reset(
+            &mut past,
+            DateTime::from_timestamp(6_000, 0).unwrap(),
+            margin,
+        );
+        assert!(past[0].paused.is_some());
+        lift_waited(&mut past, DateTime::from_timestamp(6_000, 0).unwrap());
+        assert!(past[0].paused.is_none());
+        assert!(past[1].paused.is_some());
+    }
 
     #[tokio::test]
     async fn a_failed_signal_listener_does_not_stop_the_run() {

@@ -83,6 +83,7 @@ fit = "claude-code:sonnet"
 extract = "claude-code:sonnet"
 classify = "claude-code:haiku"
 attributes = "claude-code:sonnet"
+curate = "claude-code:sonnet"
 embed = "local:arctic-embed-m-v2.0"
 chars_per_token = 2.0
 
@@ -90,6 +91,7 @@ chars_per_token = 2.0
 concurrency = 2
 timeout_secs = 300
 max_window_use = 0.8
+config_dirs = []
 
 [providers.openrouter]
 base_url = "https://openrouter.ai/api/v1"
@@ -168,9 +170,26 @@ confidence = 0.7
 read_batch = 500
 definition_chars = 200
 
+[curate]
+confidence = 0.9
+max_members = 8
+context_chars = 100
+max_shortlist = 30
+definition_chars = 200
+out = "curate"
+
+[curate.not_in_class]
+
+[gpu]
+provider = "cpu"
+device = 0
+
 [review]
 sample = 50
 min_verdicts = 30
+
+[eval]
+world = ""
 
 [embed]
 threads = 0
@@ -251,21 +270,6 @@ normalize = true
 passage_prefix = ""
 query_prefix = "Instruct: Given a question, retrieve passages that answer it\nQuery:"
 max_tokens = 512
-
-[persons]
-repo = "onnx-community/gliner_multi_pii-v1"
-revision = ""
-file = "onnx/model.onnx"
-tokenizer = "tokenizer.json"
-labels = ["person"]
-threshold = 0.5
-max_width = 12
-max_words = 384
-context_words = 20
-threads = 0
-workers = 4
-batch_size = 8
-read_batch = 200
 
 [resolve]
 strip_words = []

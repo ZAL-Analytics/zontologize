@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{Answer, Built, DOC};
 use crate::ontology::Ontology;
+use crate::resolve::names::Normaliser;
 use crate::text::{fold, squash};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +17,7 @@ pub enum Reason {
     EmptyLabel,
     ClassName,
     RefTaken,
+    DisjointClass,
 }
 
 impl Reason {
@@ -31,6 +33,7 @@ impl Reason {
             Reason::EmptyLabel => "empty label",
             Reason::ClassName => "named after its class",
             Reason::RefTaken => "ref already used for a known thing",
+            Reason::DisjointClass => "class disjoint with a known thing of the same name",
         }
     }
 }
@@ -157,12 +160,20 @@ fn language<'a>(allowed: &'a [String], value: &str) -> Option<&'a String> {
         .find(|a| a.eq_ignore_ascii_case(value.trim()))
 }
 
+pub fn entity_key(normaliser: &Normaliser, name: &str) -> String {
+    match normaliser.key(name) {
+        key if key.is_empty() => fold(name),
+        key => key,
+    }
+}
+
 pub fn check(
     answer: Answer,
     built: &Built,
     text: &str,
     ontology: &Ontology,
     languages: &[String],
+    normaliser: &Normaliser,
 ) -> Checked {
     let haystack = Haystack::new(text);
     let mut checked = Checked::default();
@@ -190,6 +201,15 @@ pub fn check(
             checked.drop(Reason::ClassName, class);
             continue;
         }
+        let name = fold(&entity.name);
+        if built
+            .known
+            .iter()
+            .any(|k| fold(&k.name) == name && ontology.disjoint(class, &k.class))
+        {
+            checked.drop(Reason::DisjointClass, class);
+            continue;
+        }
         if haystack.find(&entity.name).is_none() {
             checked.drop(Reason::NameNotFound, class);
             continue;
@@ -198,7 +218,7 @@ pub fn check(
             checked.drop(Reason::QuoteNotFound, class);
             continue;
         };
-        let key = fold(&entity.name);
+        let key = entity_key(normaliser, &entity.name);
         let index = *by_key
             .entry((class.clone(), key.clone()))
             .or_insert_with(|| {
@@ -290,7 +310,7 @@ pub fn check(
 #[cfg(test)]
 mod tests {
     use super::super::Known;
-    use super::super::tests::{built, input, iri, languages, ontology};
+    use super::super::tests::{TTL, built, input, iri, languages, ontology, ontology_from};
     use super::*;
 
     #[test]
@@ -306,6 +326,7 @@ mod tests {
             Reason::EmptyLabel,
             Reason::ClassName,
             Reason::RefTaken,
+            Reason::DisjointClass,
         ]
         .iter()
         .map(|r| r.as_str())
@@ -322,7 +343,8 @@ mod tests {
                 "language not configured",
                 "empty label",
                 "named after its class",
-                "ref already used for a known thing"
+                "ref already used for a known thing",
+                "class disjoint with a known thing of the same name"
             ]
         );
         let mut checked = Checked::default();
@@ -339,6 +361,10 @@ mod tests {
             key,
             &format!("{}|{}", Reason::UnknownRef, "x".repeat(MAX_DROP_TEXT))
         );
+    }
+
+    fn normaliser() -> Normaliser {
+        Normaliser::new(&["B.V.".to_string(), "BV".to_string()])
     }
 
     fn answer(json: serde_json::Value) -> Answer {
@@ -384,6 +410,7 @@ mod tests {
             text,
             &onto,
             &languages(),
+            &normaliser(),
         );
         assert_eq!(checked.entities.len(), 1);
         let entity = &checked.entities[0];
@@ -451,6 +478,7 @@ mod tests {
             text,
             &onto,
             &languages(),
+            &normaliser(),
         );
         assert_eq!(
             checked.relations,
@@ -528,6 +556,7 @@ mod tests {
             text,
             &onto,
             &languages(),
+            &normaliser(),
         );
         assert_eq!(checked.entities.len(), 1);
         assert!(checked.relations.is_empty(), "{:?}", checked.relations);
@@ -545,7 +574,71 @@ mod tests {
             "text",
             &onto,
             &languages(),
+            &normaliser(),
         );
         assert!(checked.entities.is_empty() && checked.drops.is_empty());
+    }
+
+    #[test]
+    fn legal_form_variants_land_on_one_normalised_key() {
+        let onto = ontology();
+        let built = built(&onto, &input(&[("Site", 1)]));
+        let text = "Northwind Pumps B.V. and Northwind Pumps BV, also B.V. alone.";
+        let checked = check(
+            answer(serde_json::json!({
+                "entities": [
+                    {"ref": "e1", "class": iri("Site"), "name": "Northwind Pumps B.V.", "evidence": "Northwind Pumps B.V."},
+                    {"ref": "e2", "class": iri("Site"), "name": "Northwind Pumps BV", "evidence": "Northwind Pumps BV"},
+                    {"ref": "e3", "class": iri("Site"), "name": "B.V.", "evidence": "B.V. alone"}
+                ],
+                "other_relations": []
+            })),
+            &built,
+            text,
+            &onto,
+            &languages(),
+            &normaliser(),
+        );
+        let keys: Vec<&str> = checked.entities.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, ["northwind pumps", "b.v."]);
+    }
+
+    #[test]
+    fn known_name_in_disjoint_class_is_dropped() {
+        let onto = ontology_from(&format!("{TTL} ex:Company owl:disjointWith ex:Site ."));
+        let mut chunk = input(&[("Company", 1), ("Asset", 1), ("Pump", 1)]);
+        chunk.known = vec![
+            Known {
+                entity_id: 5,
+                class: iri("Site"),
+                name: "North Site".to_string(),
+            },
+            Known {
+                entity_id: 6,
+                class: iri("Pump"),
+                name: "booster pump".to_string(),
+            },
+        ];
+        let built = built(&onto, &chunk);
+        let checked = check(
+            answer(serde_json::json!({
+                "entities": [
+                    {"ref": "e1", "class": iri("Company"), "name": "north site", "evidence": "north site"},
+                    {"ref": "e2", "class": iri("Asset"), "name": "Booster Pump", "evidence": "booster pump"}
+                ],
+                "other_relations": []
+            })),
+            &built,
+            &chunk.text,
+            &onto,
+            &languages(),
+            &normaliser(),
+        );
+        let names: Vec<&str> = checked.entities.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Booster Pump"]);
+        assert_eq!(
+            checked.drops[&format!("{}|{}", Reason::DisjointClass, iri("Company"))],
+            1
+        );
     }
 }

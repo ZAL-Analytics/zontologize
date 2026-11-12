@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ontology::Ontology;
 use crate::rules::ids::{IdPatterns, On};
@@ -70,8 +70,25 @@ pub fn digits_agree(a: &str, b: &str) -> bool {
     digit_tokens(a) == digit_tokens(b)
 }
 
-fn first_token(key: &str) -> &str {
-    key.split(' ').next().unwrap_or("")
+const MIN_TOKEN_CHARS: usize = 3;
+
+pub fn tokens(key: &str) -> Vec<&str> {
+    key.split(' ').filter(|t| !t.is_empty()).collect()
+}
+
+pub fn acronym(key: &str) -> Option<String> {
+    let tokens = tokens(key);
+    (tokens.len() >= 2).then(|| tokens.iter().filter_map(|t| t.chars().next()).collect())
+}
+
+pub fn block_of(token: &str, chars: usize) -> String {
+    token.chars().take(chars.max(1)).collect()
+}
+
+pub fn blocking_tokens(key: &str) -> impl Iterator<Item = &str> {
+    tokens(key)
+        .into_iter()
+        .filter(|t| t.chars().count() >= MIN_TOKEN_CHARS)
 }
 
 pub fn similarity(a: &str, b: &str) -> f64 {
@@ -80,6 +97,19 @@ pub fn similarity(a: &str, b: &str) -> f64 {
 
 pub fn compatible(ontology: &Ontology, a: &str, b: &str) -> bool {
     a == b || ontology.is_a(a, b) || ontology.is_a(b, a)
+}
+
+pub fn siblings(ontology: &Ontology, a: &str, b: &str) -> bool {
+    if compatible(ontology, a, b) {
+        return false;
+    }
+    let parents = |iri: &str| {
+        ontology
+            .classes
+            .get(iri)
+            .map_or(&[][..], |c| c.parents.as_slice())
+    };
+    parents(a).iter().any(|p| parents(b).contains(p))
 }
 
 pub fn id_keys(ids: &IdPatterns, name: &str) -> Vec<(String, String)> {
@@ -100,10 +130,13 @@ pub fn blocks<T>(
 ) -> BTreeMap<String, Vec<usize>> {
     let mut out: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, item) in items.iter().enumerate() {
-        let first = first_token(key(item));
-        if !first.is_empty() {
-            let prefix: String = first.chars().take(chars.max(1)).collect();
-            out.entry(prefix).or_default().push(i);
+        let key = key(item);
+        let mut mine: BTreeSet<String> = blocking_tokens(key).map(|t| block_of(t, chars)).collect();
+        if let Some(acronym) = acronym(key) {
+            mine.insert(block_of(&acronym, chars));
+        }
+        for block in mine {
+            out.entry(block).or_default().push(i);
         }
     }
     out
@@ -187,17 +220,52 @@ mod tests {
     }
 
     #[test]
-    fn blocks_group_by_the_start_of_the_first_token() {
+    fn siblings_share_a_parent_but_are_not_compatible() {
+        let ontology = ontology();
+        let customer = ontology.class("ex:Customer").unwrap().iri.clone();
+        let organisation = ontology.class("ex:Organisation").unwrap().iri.clone();
+        let supplier = ontology.class("ex:Supplier").unwrap().iri.clone();
+        assert!(siblings(&ontology, &customer, &supplier));
+        assert!(!siblings(&ontology, &customer, &organisation));
+        assert!(!siblings(&ontology, &customer, &customer));
+    }
+
+    #[test]
+    fn strip_words_remove_group_words_and_multi_word_legal_forms() {
+        let strip: Vec<String> = ["Holding", "B.V.", "Nederland", "Sp. z o.o."]
+            .map(String::from)
+            .into();
+        let normaliser = Normaliser::new(&strip);
+        assert_eq!(normaliser.key("Acme Holding B.V."), "acme");
+        assert_eq!(normaliser.key("Acme Nederland"), "acme");
+        assert_eq!(normaliser.key("Pumps Sp. z o.o."), "pumps");
+    }
+
+    #[test]
+    fn names_sharing_any_token_share_a_block() {
         let names = [
-            "acme pumps",
-            "acme pump",
-            "northwind",
+            "northwind fabrikam",
+            "fabrikam",
             "havenstad",
             "havenstadt",
+            "ab cd",
         ];
         let blocks = blocks(&names, |n| n, 4);
-        assert_eq!(blocks["acme"], [0, 1]);
-        assert_eq!(blocks["nort"], [2]);
-        assert_eq!(blocks["have"], [3, 4]);
+        assert_eq!(blocks["fabr"], [0, 1]);
+        assert_eq!(blocks["have"], [2, 3]);
+        assert!(!blocks.contains_key("ab"));
+        assert!(!blocks.contains_key("cd"));
+        assert_eq!(blocks["ac"], [4]);
+    }
+
+    #[test]
+    fn acronyms_take_the_first_letter_of_each_token() {
+        assert_eq!(
+            acronym("northwind harbour services").as_deref(),
+            Some("nhs")
+        );
+        assert_eq!(acronym("nhs"), None);
+        let blocks = blocks(&["nhs", "northwind harbour services"], |n| n, 4);
+        assert_eq!(blocks["nhs"], [0, 1]);
     }
 }

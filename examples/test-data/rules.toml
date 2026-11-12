@@ -1,0 +1,149 @@
+[doc_types]
+correspondence = "acme:Correspondence"
+quotation = "acme:Quotation"
+drawing = "acme:Drawing"
+report = "acme:Report"
+inspection_report = "acme:InspectionReport"
+invoice = "acme:Invoice"
+manual = "acme:Manual"
+work_order = "acme:WorkOrder"
+certificate = "acme:Certificate"
+
+[pages]
+head_chars = 400
+part_property = "acme:partOf"
+
+[[page_types]]
+doc_type = "certificate"
+pattern = 'certificate of conformity|certificaat van overeenstemming'
+starts = true
+
+[[page_types]]
+doc_type = "inspection_report"
+pattern = 'inspection report|inspectierapport'
+
+[ocr_confusions]
+"0" = "Oo"
+"1" = "Il|"
+"5" = "S"
+"8" = "B"
+
+[[path_rules]]
+pattern = '^(?:Projects|Projecten)/(?P<year>\d{4})/(?P<project>P-\d{4}-\d{4}) (?P<customer>[^/]+?) - (?P<site>[^/]+)/'
+props = { year = "{year}" }
+
+[[path_rules.entities]]
+id = "project"
+class = "acme:Project"
+key = "{project}"
+name = "{project} {customer}"
+key_case = "upper"
+
+[[path_rules.entities]]
+id = "customer"
+class = "acme:Customer"
+key = "{customer}"
+name = "{customer}"
+key_case = "lower"
+
+[[path_rules.entities]]
+id = "site"
+class = "acme:Site"
+key = "{site}"
+name = "{site}"
+key_case = "lower"
+
+[[path_rules.relations]]
+from = "document"
+property = "acme:describes"
+to = "project"
+
+[[path_rules.relations]]
+from = "project"
+property = "acme:forCustomer"
+to = "customer"
+
+[[path_rules.relations]]
+from = "project"
+property = "acme:atSite"
+to = "site"
+
+[[path_rules]]
+pattern = '/\d{2} (?:Correspondence|Correspondentie)/'
+doc_type = "correspondence"
+
+[[path_rules]]
+pattern = '/\d{2} (?:Quotations|Offertes)/'
+doc_type = "quotation"
+
+[[path_rules]]
+pattern = '/\d{2} (?:Drawings|Tekeningen)/'
+doc_type = "drawing"
+
+[[path_rules]]
+pattern = '/\d{2} (?:Reports|Rapporten)/'
+doc_type = "report"
+
+[[path_rules]]
+pattern = '/\d{2} (?:Invoices|Facturen)/'
+doc_type = "invoice"
+
+[[path_rules]]
+pattern = '/\d{2} (?:Documentation|Documentatie)/'
+doc_type = "manual"
+
+[[path_rules]]
+pattern = '/(?:Inspection report|Inspectierapport) [^/]*$'
+doc_type = "inspection_report"
+
+[[path_rules]]
+pattern = '^Archief/Scans/(?P<year>\d{4})/(?:Work order|Werkbon) (?P<project>P-\d{4}-\d{4})'
+doc_type = "work_order"
+props = { year = "{year}" }
+
+[[path_rules.entities]]
+id = "project"
+class = "acme:Project"
+key = "{project}"
+key_case = "upper"
+
+[[path_rules.relations]]
+from = "document"
+property = "acme:describes"
+to = "project"
+
+[[id_patterns]]
+class = "acme:Project"
+pattern = '\bP-\d{4}-\d{4}\b'
+key_case = "upper"
+on = "text"
+
+[[id_patterns]]
+class = "acme:Drawing"
+pattern = '\bDWG-\d{3}-[A-Z]\d\b'
+key_case = "upper"
+on = "both"
+
+[[revisions]]
+pattern = '(?P<series>DWG-\d{3}-[A-Z]\d) rev (?P<rev>[A-Z0-9]+)\.'
+order = "natural"
+
+[persons]
+class = "acme:Person"
+sent_by = "acme:sentBy"
+sent_to = "acme:sentTo"
+works_for = "acme:worksFor"
+closings = [
+    "met vriendelijke groet", "met vriendelijke groeten", "vriendelijke groet", "vriendelijke groeten",
+    "mvg", "groet", "groeten", "hartelijke groet", "met hartelijke groet",
+    "kind regards", "best regards", "regards", "with kind regards", "with best regards",
+    "yours sincerely", "sincerely", "yours faithfully", "best wishes", "thanks and regards",
+    "mit freundlichen grüßen", "mit freundlichen grüssen", "freundliche grüße",
+]
+role_addresses = [
+    "info", "sales", "service", "admin", "office", "support", "noreply", "no-reply", "purchase",
+    "purchasing", "inkoop", "verkoop", "orders", "order", "invoice", "invoices", "finance",
+    "accounts", "accounting", "administratie", "boekhouding", "crediteuren", "debiteuren", "hr",
+    "jobs", "marketing", "contact", "mail", "post", "planning", "logistics", "quality", "qa",
+    "engineering", "projects", "project", "receptie", "reception", "webmaster", "postmaster",
+]

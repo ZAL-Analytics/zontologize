@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
     if let Some(limit) = args.limit {
         files.truncate(limit);
     }
-    let settings = ExtractSettings::new(&config.extract, &config.ocr);
+    let settings = ExtractSettings::new(&config.extract, &config.ocr, config.gpu)?;
     let mut documents = Vec::new();
     for path in &files {
         if let Ok(pages) = extract::extract_pages(path, &settings).await {
@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
     let chunk_time = best(args.rounds, || {
         chunks.clear();
         for pages in &documents {
-            chunks.extend(chunk::chunk_pages(pages, &chunking)?);
+            chunks.extend(chunk::chunk_pages(pages, &chunking)?.0);
         }
         Ok(())
     })?;

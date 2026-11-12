@@ -14,6 +14,7 @@ use crate::llm::{Usage, Window, Windows};
 pub struct Call<'a> {
     pub job_id: Option<i64>,
     pub provider: &'a str,
+    pub account: Option<&'a str>,
     pub model: &'a str,
     pub task: &'a str,
     pub cache_key: Option<&'a str>,
@@ -24,6 +25,7 @@ pub struct Call<'a> {
     pub seconds: f64,
     pub status: &'a str,
     pub error: Option<&'a str>,
+    pub resume_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -77,8 +79,9 @@ pub async fn record(
         "insert into llm_calls (job_id, provider, model, task, cache_key, input_chars, \
          input_tokens, cached_input_tokens, output_tokens, cost_usd, subscription, \
          five_hour_use, five_hour_resets_at, seven_day_use, seven_day_resets_at, seconds, \
-         status, error) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
+         status, error, account, resume_at) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
+         $19, $20)",
     )
     .bind(call.job_id)
     .bind(call.provider)
@@ -98,6 +101,8 @@ pub async fn record(
     .bind(call.seconds)
     .bind(call.status)
     .bind(call.error)
+    .bind(call.account)
+    .bind(call.resume_at)
     .execute(&mut *tx)
     .await?;
     if let (Some(response), Some(key)) = (response, call.cache_key) {
@@ -190,11 +195,12 @@ async fn use_per_usd(pool: &PgPool, window: &str, limit: i64) -> Result<Option<f
         _ => ("seven_day_use", "seven_day_resets_at"),
     };
     let sql = format!(
-        "with recent as (select id, cost_usd, {used} as used, {reset} as reset from llm_calls \
-         where provider = 'claude-code' and subscription and status = 'ok' \
+        "with recent as (select id, account, cost_usd, {used} as used, {reset} as reset \
+         from llm_calls where provider = 'claude-code' and subscription and status = 'ok' \
          and {used} is not null order by id desc limit $1), \
-         pairs as (select used - lag(used) over (order by id) as rise, cost_usd, reset, \
-         lag(reset) over (order by id) as previous from recent) \
+         pairs as (select used - lag(used) over (partition by account order by id) as rise, \
+         cost_usd, reset, lag(reset) over (partition by account order by id) as previous \
+         from recent) \
          select case when sum(rise) > 0 then sum(rise) / nullif(sum(cost_usd), 0) end \
          from pairs where reset = previous and rise >= 0"
     );
@@ -212,12 +218,13 @@ type WindowRow = (
     Option<DateTime<Utc>>,
 );
 
-pub async fn last_windows(pool: &PgPool) -> Result<Option<Windows>> {
+pub async fn last_windows(pool: &PgPool, account: Option<&str>) -> Result<Option<Windows>> {
     let row: Option<WindowRow> = sqlx::query_as(
         "select five_hour_use, five_hour_resets_at, seven_day_use, seven_day_resets_at \
          from llm_calls where provider = 'claude-code' and five_hour_use is not null \
-         order by id desc limit 1",
+         and account is not distinct from $1 order by id desc limit 1",
     )
+    .bind(account)
     .fetch_optional(pool)
     .await?;
     let window = |used: Option<f64>, resets_at: Option<DateTime<Utc>>| {
@@ -230,6 +237,29 @@ pub async fn last_windows(pool: &PgPool) -> Result<Option<Windows>> {
         five_hour: window(fu, fr),
         seven_day: window(su, sr),
     }))
+}
+
+#[derive(Debug, FromRow)]
+pub struct AccountState {
+    pub account: String,
+    pub last_used: Option<DateTime<Utc>>,
+    pub paused_until: Option<DateTime<Utc>>,
+}
+
+pub async fn accounts(pool: &PgPool, accounts: &[String]) -> Result<Vec<AccountState>> {
+    let rows = sqlx::query_as(
+        "select a.account, c.created_at as last_used, \
+         case when c.status = 'pause' and c.resume_at > now() then c.resume_at end \
+         as paused_until \
+         from unnest($1::text[]) with ordinality as a(account, n) \
+         left join lateral (select created_at, status, resume_at from llm_calls \
+         where provider = 'claude-code' and account = a.account order by id desc limit 1) c \
+         on true order by a.n",
+    )
+    .bind(accounts)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 const JOB_COLUMNS: &str = "id, task, provider, model, ontology_version_id, params, status, \
@@ -279,10 +309,17 @@ pub async fn create_job(
     Ok(job)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    Chunk,
+    Entity,
+}
+
 pub async fn replace_items(
     pool: &PgPool,
     job: i64,
-    chunk_ids: &[i64],
+    owner: Owner,
+    ids: &[i64],
     keys: &[String],
 ) -> Result<Vec<i32>> {
     let mut tx = pool.begin().await?;
@@ -290,18 +327,28 @@ pub async fn replace_items(
         .bind(job)
         .execute(&mut *tx)
         .await?;
-    let ords = sqlx::query_scalar(
-        "insert into llm_job_items (job_id, ord, chunk_id, cache_key) \
-         select $1, (select coalesce(max(ord), 0) from llm_job_items where job_id = $1) \
-         + t.n::integer, t.chunk_id, t.key \
-         from unnest($2::bigint[], $3::text[]) with ordinality as t(chunk_id, key, n) \
-         order by t.n returning ord",
-    )
-    .bind(job)
-    .bind(chunk_ids)
-    .bind(keys)
-    .fetch_all(&mut *tx)
-    .await?;
+    let sql = match owner {
+        Owner::Chunk => {
+            "insert into llm_job_items (job_id, ord, chunk_id, cache_key) \
+             select $1, (select coalesce(max(ord), 0) from llm_job_items where job_id = $1) \
+             + t.n::integer, t.id, t.key \
+             from unnest($2::bigint[], $3::text[]) with ordinality as t(id, key, n) \
+             order by t.n returning ord"
+        }
+        Owner::Entity => {
+            "insert into llm_job_items (job_id, ord, entity_id, cache_key) \
+             select $1, (select coalesce(max(ord), 0) from llm_job_items where job_id = $1) \
+             + t.n::integer, t.id, t.key \
+             from unnest($2::bigint[], $3::text[]) with ordinality as t(id, key, n) \
+             order by t.n returning ord"
+        }
+    };
+    let ords = sqlx::query_scalar(sql)
+        .bind(job)
+        .bind(ids)
+        .bind(keys)
+        .fetch_all(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(ords)
 }

@@ -1,7 +1,8 @@
 # Embeddings
 
 `zontologize embed` turns chunks, entities and classes into vectors in pgvector. Models run
-locally on the CPU through ONNX Runtime; files are downloaded once from Hugging Face. No API key.
+locally on the CPU, or on the GPU (see `[gpu]` in [configuration.md](configuration.md)), through
+ONNX Runtime; files are downloaded once from Hugging Face. No API key.
 
 Reruns embed only changed texts. `embed --minutes N` stops after N minutes and the next run goes
 on, so a large first load can be spread over several nights. `embed --model local:<name>` adds a

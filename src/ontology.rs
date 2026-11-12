@@ -73,6 +73,7 @@ pub struct Class {
     pub alt_labels: LangMap<Vec<String>>,
     pub definition: LangMap<String>,
     pub privacy_category: Option<String>,
+    pub disjoint: Vec<String>,
     pub selected: bool,
     pub meta: bool,
 }
@@ -228,6 +229,7 @@ struct Node {
     deprecated: bool,
     tolerance: Option<String>,
     privacy_category: Option<String>,
+    disjoint: Vec<String>,
 }
 
 #[derive(Default)]
@@ -311,6 +313,7 @@ pub fn load_sources(sources: &[(String, Vec<u8>)], config: &OntologyConfig) -> L
     build(&mut ontology, nodes, &mut findings);
     check_references(&ontology, &mut findings);
     check_cycles(&ontology, &mut findings);
+    check_disjoint(&ontology, &mut findings);
     check_imports(&ontology, &mut findings);
     if let Err(message) = select(&mut ontology, config) {
         findings.push(Finding::error(message));
@@ -526,6 +529,7 @@ fn add_triple(
     match (local, iri, literal) {
         ((RDF, "type"), Some(iri), _) => node.types.push(iri),
         ((RDFS, "subClassOf"), Some(iri), _) => node.parents.push(iri),
+        ((OWL, "disjointWith"), Some(iri), _) => node.disjoint.push(iri),
         ((RDFS, "domain"), _, _) => node.domain.extend(bound),
         ((RDFS, "range"), _, _) => node.range.extend(bound),
         ((RDFS, "subPropertyOf"), Some(iri), _) => node.super_properties.push(iri),
@@ -616,6 +620,7 @@ fn build(ontology: &mut Ontology, nodes: HashMap<String, Node>, findings: &mut V
                 alt_labels: all_per_language(&node.alt_labels, &languages),
                 definition: first_per_language(definitions, &languages),
                 privacy_category: privacy_category(&iri, node.privacy_category, findings),
+                disjoint: dedup(node.disjoint),
                 selected: false,
                 meta: false,
             };
@@ -791,6 +796,14 @@ fn check_references(ontology: &Ontology, findings: &mut Vec<Finding>) {
                 )));
             }
         }
+        for other in &class.disjoint {
+            if !ontology.classes.contains_key(other) && !is_builtin(other) {
+                findings.push(Finding::warning(format!(
+                    "class {}: unknown disjointWith class {other}",
+                    class.iri
+                )));
+            }
+        }
     }
     for property in ontology.properties.values() {
         for (what, list) in [("domain", &property.domain), ("range", &property.range)] {
@@ -802,6 +815,34 @@ fn check_references(ontology: &Ontology, findings: &mut Vec<Finding>) {
                     )));
                 }
             }
+        }
+    }
+}
+
+fn check_disjoint(ontology: &Ontology, findings: &mut Vec<Finding>) {
+    for class in ontology.classes.values() {
+        let above = ontology.above(&class.iri);
+        let mut pairs = BTreeSet::new();
+        for a in &above {
+            for b in ontology
+                .classes
+                .get(*a)
+                .map_or(&[][..], |c| c.disjoint.as_slice())
+            {
+                if above.contains(b.as_str()) {
+                    pairs.insert(if *a < b.as_str() {
+                        (*a, b.as_str())
+                    } else {
+                        (b.as_str(), *a)
+                    });
+                }
+            }
+        }
+        for (a, b) in pairs {
+            findings.push(Finding::error(format!(
+                "class {} is under disjoint classes {a} and {b}",
+                class.iri
+            )));
         }
     }
 }
@@ -1014,6 +1055,32 @@ impl Ontology {
             )),
             None => Err(format!("property {name} is not in the ontology")),
         }
+    }
+
+    fn above<'a>(&'a self, class: &'a str) -> BTreeSet<&'a str> {
+        let mut stack = vec![class];
+        let mut seen = BTreeSet::new();
+        while let Some(iri) = stack.pop() {
+            if !seen.insert(iri) {
+                continue;
+            }
+            if let Some(class) = self.classes.get(iri) {
+                stack.extend(class.parents.iter().chain(&class.types).map(String::as_str));
+            }
+        }
+        seen
+    }
+
+    pub fn disjoint(&self, a: &str, b: &str) -> bool {
+        let (above_a, above_b) = (self.above(a), self.above(b));
+        let declares = |from: &BTreeSet<&str>, to: &BTreeSet<&str>| {
+            from.iter().any(|iri| {
+                self.classes
+                    .get(*iri)
+                    .is_some_and(|c| c.disjoint.iter().any(|d| to.contains(d.as_str())))
+            })
+        };
+        declares(&above_a, &above_b) || declares(&above_b, &above_a)
     }
 
     pub fn is_a(&self, class: &str, ancestor: &str) -> bool {
@@ -1650,6 +1717,59 @@ mod tests {
             messages(&loaded, Severity::Warning)
                 .iter()
                 .any(|m| m.contains("symbol \"bar\" belongs to 2 units"))
+        );
+    }
+
+    const DISJOINT: &str = "ex:Organisation a owl:Class ; owl:disjointWith ex:Person .\n\
+        ex:Person a owl:Class .\n\
+        ex:Customer a owl:Class ; rdfs:subClassOf ex:Organisation .\n\
+        ex:Equipment a owl:Class ; owl:disjointWith ex:Site .\n\
+        ex:Site a owl:Class .\n\
+        ex:Pump a ex:Equipment, owl:Class .\n\
+        ex:Valve a owl:Class .\n";
+
+    fn iri(local: &str) -> String {
+        format!("http://example.org/onto#{local}")
+    }
+
+    #[test]
+    fn disjoint_is_symmetric_and_inherited() {
+        let loaded = load_text(&[DISJOINT], &config(&[], &[]));
+        let ontology = &loaded.ontology;
+        assert!(ontology.disjoint(&iri("Organisation"), &iri("Person")));
+        assert!(ontology.disjoint(&iri("Person"), &iri("Organisation")));
+        assert!(ontology.disjoint(&iri("Customer"), &iri("Person")));
+        assert!(ontology.disjoint(&iri("Pump"), &iri("Site")));
+        assert!(!ontology.disjoint(&iri("Customer"), &iri("Organisation")));
+        assert!(!ontology.disjoint(&iri("Valve"), &iri("Site")));
+        assert!(!ontology.disjoint(&iri("Valve"), &iri("Valve")));
+    }
+
+    #[test]
+    fn disjoint_with_an_unknown_class_is_a_warning() {
+        let loaded = load_text(
+            &["ex:A a owl:Class ; owl:disjointWith ex:Nope ."],
+            &config(&[], &[]),
+        );
+        let warnings = messages(&loaded, Severity::Warning);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("unknown disjointWith class")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn disjoint_parents_of_one_class_are_an_error() {
+        let text =
+            format!("{DISJOINT}ex:Both a owl:Class ; rdfs:subClassOf ex:Customer, ex:Person .");
+        let loaded = load_text(&[&text], &config(&[], &[]));
+        let errors = messages(&loaded, Severity::Error);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("class http://example.org/onto#Both is under disjoint classes"),
+            "{errors:?}"
         );
     }
 }

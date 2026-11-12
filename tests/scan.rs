@@ -512,3 +512,40 @@ async fn the_current_ontology_follows_the_last_finished_scan() {
     assert_eq!(first, fourth);
     env.finish().await;
 }
+
+type PageRow = (String, Option<f32>, Option<f32>, Option<i64>);
+
+#[tokio::test]
+#[ignore]
+async fn visual_pages_keep_words_and_size() {
+    let env = env_with_folder("words").await;
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extract");
+    std::fs::create_dir_all(env.data().join("a")).unwrap();
+    for name in ["report.pdf", "letter.docx"] {
+        std::fs::copy(fixtures.join(name), env.data().join("a").join(name)).unwrap();
+    }
+    env.scan().await;
+    let rows: Vec<PageRow> = sqlx::query_as(
+        "select d.path, p.width, p.height, jsonb_array_length(p.words)::bigint from pages p \
+         join documents d on d.content_id = p.content_id order by d.path",
+    )
+    .fetch_all(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].0, "a/letter.docx");
+    assert_eq!((rows[0].1, rows[0].2, rows[0].3), (None, None, None));
+    assert_eq!(rows[1].0, "a/report.pdf");
+    assert!(
+        rows[1].1.unwrap() > 500.0 && rows[1].2.unwrap() > 800.0,
+        "{rows:?}"
+    );
+    assert!(rows[1].3.unwrap() > 10, "{rows:?}");
+    let first: Vec<f64> =
+        sqlx::query_scalar("select (w.value)::text::float8 from pages p, jsonb_array_elements(p.words -> 0) w where p.words is not null")
+            .fetch_all(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(first.len(), 6);
+    env.finish().await;
+}

@@ -89,7 +89,7 @@ hashed), `size` and `modified` (timestamp). `ignore` and `[scan.kinds]` apply to
 | `extract.threads` | `0` | Threads per worker |
 | `extract.worker_memory_mb` | `0` | Memory per worker (0: split evenly) |
 | `extract.timeout_secs` | `300` | Per file |
-| `extract.format` | `"markdown"` | `markdown` or `plain` |
+| `extract.format` | `"markdown"` | `markdown` or `plain`. PDFs and images are always plain, and their pages also get the page size and word boxes |
 | `extract.embedded_depth` | `0` | How deep to open attachments |
 | `extract.max_embedded_mb` | `10` | Largest attachment opened |
 | `extract.worker_files` | `500` | Files a worker process handles before it is replaced |
@@ -106,6 +106,7 @@ local only (`local:<name>`, see [embeddings.md](embeddings.md)).
 | `models.extract` | `"claude-code:sonnet"` |
 | `models.classify` | `"claude-code:haiku"` |
 | `models.attributes` | `"claude-code:sonnet"` |
+| `models.curate` | `"claude-code:sonnet"` |
 | `models.embed` | `"local:arctic-embed-m-v2.0"` |
 | `models.chars_per_token` | `2.0` |
 
@@ -115,6 +116,16 @@ recorded.
 Per provider (`[providers.claude-code]`, `[providers.openrouter]`, `[providers.ollama]`):
 `concurrency`, `timeout_secs`; plus `max_window_use` (claude-code), `base_url` (openrouter),
 `think` (ollama), `poll_minutes` (openrouter: how often to check the key when funds run out).
+
+`providers.claude-code.config_dirs` (default `[]`) lists Claude Code config dirs, one per
+logged-in account, e.g. `["~/.claude-a", "~/.claude-b"]` (log each in with
+`CLAUDE_CONFIG_DIR=~/.claude-a claude /login`). Each request runs with one of them as
+`CLAUDE_CONFIG_DIR`; an account that hits its usage limit or `max_window_use` is paused until its
+reset while the job goes on with the others, and the job waits only when every account is
+paused. `concurrency` applies per account. `models check` and `status` name each account. Empty
+means the current `CLAUDE_CONFIG_DIR`, or Claude Code's default when unset. Switching between
+personal Max accounts to get past usage limits may break Anthropic's consumer terms; check
+before relying on it.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -127,24 +138,24 @@ Per provider (`[providers.claude-code]`, `[providers.openrouter]`, `[providers.o
 | `llm.unknown_reset_wait_minutes` | `30` | Wait when a limit gives no reset time |
 | `llm.progress_secs` | `60` | Seconds between progress lines of a model job |
 
-### People (GLiNER)
+### GPU
 
-`zontologize persons` finds people in the chunks with a local GLiNER model (ONNX, CPU). It
-reads only the text around candidate names (two capitalised words close together) and keeps
-names of two or more capitalised words. The class it writes comes from `[persons]` in
-`rules.toml`. Unreadable chunks are skipped with the `embed.min_letter_share` and
-`embed.min_ocr_confidence` thresholds. On CPU the whole archive takes days: `--minutes N`
-stops after N minutes and the next run goes on, `--path PREFIX` (repeatable) reads only documents
-whose path starts with the prefix, for example one project folder.
+The default build runs on the CPU. A build with `cargo build --release --features gpu` can run the
+local embedding model and the OCR of `scan` on an NVIDIA GPU with CUDA 13: set
+`gpu.provider = "cuda"`. The CUDA 13
+runtime, cuBLAS and cuDNN 9 must be on `LD_LIBRARY_PATH`; under WSL also `/usr/lib/wsl/lib`
+(`libcuda.so`). When the device is not available, embed goes on on the CPU and says so, while
+OCR stops with an error; `models check` reports the execution provider and fails when CUDA is set
+but not available. On an RTX A1000 embedding runs about 7 times faster than on the CPU, and
+`embed.batch_size` 8 and 32 give the same rate. Every extract thread loads its own OCR model on
+the GPU (about 1.5 GB each), so keep `extract.workers` × threads per worker at 2 on a card with
+8 GB, for example `workers = 1` and `threads = 2`: more runs out of GPU memory or gets slower.
+CPU and GPU OCR give the same text (CER 2.26% on both for the test data).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `persons.repo` / `file` / `tokenizer` | `"onnx-community/gliner_multi_pii-v1"` / `"onnx/model.onnx"` / `"tokenizer.json"` | Hugging Face model; the int8 files of this repo find nothing, use the full model |
-| `persons.labels` | `["person"]` | GLiNER labels |
-| `persons.threshold` | `0.5` | Lowest span score kept |
-| `persons.max_width` | `12` | Longest span in words |
-| `persons.max_words` / `context_words` | `384` / `20` | Longest window, words read on each side of a candidate |
-| `persons.threads` / `workers` / `batch_size` / `read_batch` | `0` / `4` / `8` / `200` | Threads (0: all cores) shared by the model copies, model copies run side by side (each about 1 GB of memory), windows per model call (sorted by length), contents per round |
+| `gpu.provider` | `"cpu"` | `cpu` or `cuda`; `cuda` needs a build with `--features gpu` |
+| `gpu.device` | `0` | CUDA device number |
 
 ### Stage tuning
 
@@ -169,7 +180,7 @@ The defaults work for most data. Commonly changed:
 | `llm_extract.min_ocr_confidence` / `embed.min_ocr_confidence` | `0.6` | Chunks on OCR pages below this are skipped |
 | `llm_extract.resend_share` | `0.2` | Share of chunks sent again without `--yes` |
 | `llm_extract.out` | `"extract"` | Report folder |
-| `llm_extract.max_known` | `0` | Most known entities offered per chunk (0: `llm_extract.max_shortlist`) |
+| `llm_extract.max_known` | `0` | Most known entities offered per chunk as `rN` (0: `llm_extract.max_shortlist`), in this order: rule hits in the chunk, rule hits on its document (project, customer, site from the path), things one rule relation away from those, rule hits in the other chunks of the content; each cluster once, as its canonical row. Model output never feeds this list |
 | `llm_extract.threads` | `0` | Threads that build requests (0: `scan.hash_threads`) |
 | `attributes.confidence` | `0.7` | Confidence of model values until reviews set it |
 | `attributes.context_chars` | `400` | End of the previous chunk sent as context, for table headers |
@@ -185,9 +196,17 @@ The defaults work for most data. Commonly changed:
 | `classify.head_chars` | `1500` | Text sent per part |
 | `classify.min_chars` | `50` | Parts with less text are not sent |
 | `classify.confidence` | `0.7` | Confidence of a model document type |
+| `curate.confidence` | `0.9` | Curate decisions at or above this are `auto`, below it `proposed` (shown in `review merges`) |
+| `curate.max_members` | `8` | Largest cluster of proposed same-as links sent to the curate model; larger ones, and names held by more entities in disjoint classes, are skipped and counted |
+| `curate.context_chars` | `100` | Characters of text before and after each mention snippet |
+| `curate.max_shortlist` | `30` | Most classes offered per cluster: the members' classes, their parents, siblings and children |
+| `curate.definition_chars` | `200` | Longest class definition in the curate prompt |
+| `curate.out` | `"curate"` | Report folder |
+| `curate.not_in_class` | `{}` | Class name (prefixed or `<IRI>`) to a list of regex patterns a name of that class (or a subclass) cannot match; a hit sends the entity to curate, for example legal forms under a site or person class |
 | `fit.definition_chars` / `llm_extract.definition_chars` / `classify.definition_chars` | `200` | Longest class definition in a prompt |
 | `review.sample` | `50` | Facts shown by `review sample` |
 | `review.min_verdicts` | `30` | Reviews of a class or property before they set its confidence (0: never) |
+| `eval.world` | `""` | World list (`name,variant,class`) for `eval entities`, relative to the config dir; empty: `eval entities` stops |
 | `embed.threads` / `batch_size` | `0` / `8` | Embedding throughput |
 | `embed.min_chars` | `50` | Shorter chunks are skipped |
 | `embed.max_tokens` | `512` | Longest input in tokens for a model that sets no `max_tokens` |
@@ -196,11 +215,11 @@ The defaults work for most data. Commonly changed:
 | `embed.eval_sample` / `eval_max_expected` | `500` / `20` | Questions made by `eval embed`, most expected chunks per question |
 | `embed.cache_dir` | `""` | Model cache (empty: standard HF cache) |
 | `embed.progress_secs` | `30` | Seconds between progress lines |
-| `resolve.strip_words` | `[]` | Words ignored in names, such as legal forms |
+| `resolve.strip_words` | `[]` | Whole words ignored when names are compared and in the keys of extracted entities, such as legal forms; after a change the next `extract` re-keys extracted entities and folds rows that end on one key |
 | `resolve.fuzzy_score` / `embed_score` | `0.92` / `0.9` | Match thresholds |
 | `resolve.classes` | `[]` | Limit to these classes |
 | `resolve.max_candidates` | `5` | Nearest neighbours compared per entity |
-| `resolve.block_chars` / `max_block` | `4` / `1000` | Name prefix that groups candidates, largest group compared |
+| `resolve.block_chars` / `max_block` | `4` / `1000` | Token prefix that groups candidates (every token of 3+ characters, and the acronym of a name); groups larger than `max_block` (common words) are not compared |
 | `resolve.similar.property` | `"urn:zontologize#similarTo"` | IRI of similarity links |
 | `resolve.similar.tolerance` | `0.2` | Relative gap at which a value no longer counts as close |
 | `resolve.similar.min_shared` / `min_score` / `max_links` | `2` / `0.8` / `5` | Values two entities must share, lowest score, links per entity |
@@ -225,6 +244,24 @@ Batch sizes and threads, rarely changed:
 | Key | Default | Meaning |
 |---|---|---|
 | `export.ontology_iri` | `"urn:zontologize:ontology"` | IRI of the `owl:Ontology` that `ontology export` writes |
+
+### Disjoint classes
+
+`owl:disjointWith` between two classes says nothing can be both; it holds for their subclasses
+and for classes typed with them (such as CFIHOS equipment classes). `extract` drops an entity
+that gives a known thing's name a class disjoint with the known thing's class, and `curate` uses
+the same test. A class that sits under two disjoint classes is an error in `ontology check`.
+
+### Entity quality
+
+`zontologize eval entities` compares the entities with the world list in `eval.world`: a CSV
+with `name,variant,class`, one row per spelling of a known thing (the name is also a variant of
+itself). An entity matches a name when its name, key or an alias equals a variant, ignoring case
+and extra spaces. Per class it prints `world` (names in the list), `found` (names with a match),
+`dup rate` (found names whose matches are in more than one cluster, over found), `extra`
+(clusters beyond the first per found name), `wrong merges` (clusters holding two or more names)
+and `class acc` (matches whose class is the listed class or a subclass of it). A cluster is the
+`canonical_id` of `resolve`; before `resolve` every entity is its own cluster.
 
 ## Units and attribute properties
 
@@ -339,9 +376,9 @@ Names and aliases match as whole words, case-insensitive.
 
 ## Prompts
 
-`prompts/<name>.md` replaces a built-in prompt (`fit-*`, `extract-*`, `classify-*`, `attributes-*`, see
+`prompts/<name>.md` replaces a built-in prompt (`fit-*`, `extract-*`, `classify-*`, `attributes-*`, `curate-*`, see
 `prompts/`). Variables are written `{name}`. A user prompt must contain the text variable
-(`{chunk}`, or `{text}` for `classify-user`). A value that contains `<<<` or `>>>` gets a space
+(`{chunk}`, `{text}` for `classify-user`, `{members}` for `curate-user`). A value that contains `<<<` or `>>>` gets a space
 inside the run (`<< <`), so the text cannot close the delimiters.
 
 ## questions.toml

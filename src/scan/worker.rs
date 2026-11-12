@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::extract::{self, ExtractSettings, Page};
-use crate::config::{ExtractConfig, OcrConfig};
+use crate::config::{ExtractConfig, GpuConfig, OcrConfig};
 
 pub const SUBCOMMAND: &str = "extract-worker";
 
@@ -15,6 +15,7 @@ pub const SUBCOMMAND: &str = "extract-worker";
 pub struct Setup {
     pub extract: ExtractConfig,
     pub ocr: OcrConfig,
+    pub gpu: GpuConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -48,7 +49,7 @@ where
     };
     let setup: Setup =
         serde_json::from_str(&first).context("extract worker: invalid setup line")?;
-    let settings = Arc::new(ExtractSettings::new(&setup.extract, &setup.ocr));
+    let settings = Arc::new(ExtractSettings::new(&setup.extract, &setup.ocr, setup.gpu)?);
     while let Some(line) = lines.next_line().await? {
         let answer = match serde_json::from_str::<Request>(&line) {
             Ok(request) => {
@@ -99,15 +100,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::extract::Method;
+    use crate::scan::extract::{Method, Word};
 
     fn setup_line() -> String {
         let config = crate::config::load(None).unwrap();
         let setup = Setup {
             extract: config.extract,
             ocr: config.ocr,
+            gpu: config.gpu,
         };
         serde_json::to_string(&setup).unwrap()
+    }
+
+    #[test]
+    fn setup_with_gpu_round_trips() {
+        let config = crate::config::load(None).unwrap();
+        let setup = Setup {
+            extract: config.extract,
+            ocr: config.ocr,
+            gpu: crate::config::GpuConfig {
+                provider: crate::config::GpuProvider::Cuda,
+                device: 2,
+            },
+        };
+        let back: Setup = serde_json::from_str(&serde_json::to_string(&setup).unwrap()).unwrap();
+        assert_eq!(back.gpu.provider, crate::config::GpuProvider::Cuda);
+        assert_eq!(back.gpu.device, 2);
     }
 
     #[test]
@@ -119,6 +137,9 @@ mod tests {
                 text: "line one\nline two".to_string(),
                 method: Method::Ocr,
                 ocr_confidence: Some(0.9),
+                width: Some(612.0),
+                height: Some(792.0),
+                words: vec![Word(0, 4, 0.1, 0.2, 0.3, 0.25)],
             }]),
         };
         let text = serde_json::to_string(&answer).unwrap();

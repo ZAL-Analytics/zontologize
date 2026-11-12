@@ -47,7 +47,11 @@ pub async fn fingerprint(pool: &PgPool) -> Result<String> {
          name, canonical_id, dataset, document_id)::text, 0)), 0) from entities) || ':' || \
          (select count(*) || '.' || coalesce(sum(hashtextextended(row(id, src_id, property_iri, \
          dst_id, status, confidence, method, document_id, chunk_id, span_start, span_end)::text, \
-         0)), 0) from relations where status <> 'rejected')",
+         0)), 0) from relations where status <> 'rejected') || ':' || \
+         (select count(*) || '.' || coalesce(sum(hashtextextended(row(entity_id, alias)::text, 0)), \
+         0) from aliases) || ':' || \
+         (select count(*) || '.' || coalesce(sum(hashtextextended(row(entity_id, class_iri, name, \
+         status)::text, 0)), 0) from entity_classes)",
     )
     .fetch_one(pool)
     .await?;
@@ -77,7 +81,8 @@ pub async fn classes(pool: &PgPool, language: &str) -> Result<Vec<(String, Optio
     let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select e.class_iri, coalesce(c.labels ->> $1, \
          (select value from jsonb_each_text(c.labels) order by key limit 1)) \
-         from (select distinct class_iri from entities) e \
+         from (select class_iri from entities union select class_iri from entity_classes \
+         where class_iri is not null and status in ('auto', 'confirmed')) e \
          left join classes c on c.iri = e.class_iri and c.ontology_version_id = ({}) \
          order by 1",
         super::ontology::CURRENT
@@ -209,6 +214,7 @@ async fn ensure_labels(conn: &mut PgConnection, graph: &str, labels: &[Label]) -
 pub async fn rebuild(
     conn: &mut PgConnection,
     schema: &str,
+    api: &str,
     graph: &str,
     labels: &[Label],
 ) -> Result<(u64, u64)> {
@@ -216,6 +222,7 @@ pub async fn rebuild(
     check_age(super::extension_version(conn, "age").await?.as_deref())?;
     let g = identifier(graph)?;
     let s = identifier(schema)?;
+    let a = identifier(api)?;
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
     sqlx::query(
         "select set_config('search_path', 'ag_catalog, ' || current_setting('search_path'), true)",
@@ -248,9 +255,9 @@ pub async fn rebuild(
             "insert into {table} (id, properties) \
              select ag_catalog._graphid($1, e.id), jsonb_build_object('id', e.id, \
              'class', e.class_iri, 'key', e.key, 'name', e.name, \
-             'canonical_id', e.canonical_id, 'dataset', e.dataset, \
-             'document_id', e.document_id)::text::ag_catalog.agtype \
-             from {s}.entities e where e.class_iri = $2"
+             'dataset', e.dataset, 'document_id', e.document_id, \
+             'members', e.members, 'aliases', to_jsonb(e.aliases))::text::ag_catalog.agtype \
+             from {a}.canonical_entities e where e.class_iri = $2"
         )))
         .bind(id)
         .bind(&label.iri)
@@ -276,11 +283,11 @@ pub async fn rebuild(
              jsonb_build_object('id', r.id, 'iri', r.property_iri, 'status', r.status, \
              'confidence', r.confidence, 'method', r.method, 'document_id', r.document_id, \
              'chunk_id', r.chunk_id, 'span_start', r.span_start, \
-             'span_end', r.span_end)::text::ag_catalog.agtype \
-             from {s}.relations r \
-             join {s}.entities a on a.id = r.src_id join m ms on ms.iri = a.class_iri \
-             join {s}.entities b on b.id = r.dst_id join m md on md.iri = b.class_iri \
-             where r.property_iri = $2 and r.status <> 'rejected'"
+             'span_end', r.span_end, 'support', r.support)::text::ag_catalog.agtype \
+             from {a}.canonical_relations r \
+             join {a}.canonical_entities a on a.id = r.src_id join m ms on ms.iri = a.class_iri \
+             join {a}.canonical_entities b on b.id = r.dst_id join m md on md.iri = b.class_iri \
+             where r.property_iri = $2"
         )))
         .bind(id)
         .bind(&label.iri)

@@ -28,11 +28,14 @@ pub struct Config {
     pub llm_extract: LlmExtractConfig,
     pub attributes: AttributesConfig,
     pub classify: ClassifyConfig,
+    pub curate: CurateConfig,
     pub review: ReviewConfig,
     pub embed: EmbedConfig,
     pub resolve: ResolveConfig,
-    pub persons: PersonsConfig,
     pub export: ExportConfig,
+    pub eval: EvalConfig,
+
+    pub gpu: GpuConfig,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
 }
@@ -44,17 +47,19 @@ pub struct ModelsConfig {
     pub extract: String,
     pub classify: String,
     pub attributes: String,
+    pub curate: String,
     pub embed: String,
     pub chars_per_token: f64,
 }
 
 impl ModelsConfig {
-    pub fn llm_tasks(&self) -> [(&'static str, &str); 4] {
+    pub fn llm_tasks(&self) -> [(&'static str, &str); 5] {
         [
             ("fit", &self.fit),
             ("extract", &self.extract),
             ("classify", &self.classify),
             ("attributes", &self.attributes),
+            ("curate", &self.curate),
         ]
     }
 }
@@ -76,24 +81,6 @@ pub struct EmbedConfig {
     pub read_batch: i64,
     pub progress_secs: u64,
     pub models: BTreeMap<String, EmbedModelConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PersonsConfig {
-    pub repo: String,
-    pub revision: String,
-    pub file: String,
-    pub tokenizer: String,
-    pub labels: Vec<String>,
-    pub threshold: f32,
-    pub max_width: usize,
-    pub max_words: usize,
-    pub context_words: usize,
-    pub threads: usize,
-    pub workers: usize,
-    pub batch_size: usize,
-    pub read_batch: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -213,6 +200,7 @@ pub struct ClaudeCodeConfig {
     pub concurrency: usize,
     pub timeout_secs: u64,
     pub max_window_use: f64,
+    pub config_dirs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -296,12 +284,53 @@ pub struct LlmExtractConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct CurateConfig {
+    pub confidence: f64,
+    pub max_members: usize,
+    pub context_chars: usize,
+    pub max_shortlist: usize,
+    pub definition_chars: usize,
+    pub out: String,
+    pub not_in_class: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClassifyConfig {
     pub head_chars: usize,
     pub min_chars: usize,
     pub confidence: f64,
     pub read_batch: usize,
     pub definition_chars: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuProvider {
+    Cpu,
+    Cuda,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GpuConfig {
+    pub provider: GpuProvider,
+    pub device: u32,
+}
+
+impl GpuConfig {
+    pub fn usable(&self) -> Result<()> {
+        if self.provider == GpuProvider::Cuda && !cfg!(feature = "gpu") {
+            bail!("gpu.provider = \"cuda\" needs a build with --features gpu");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvalConfig {
+    pub world: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -780,6 +809,17 @@ fn check_models(config: &Config) -> Result<(), String> {
             "providers.claude-code.max_window_use must be greater than 0 and at most 1".to_string(),
         );
     }
+    let dirs = &providers.claude_code.config_dirs;
+    for (n, dir) in dirs.iter().enumerate() {
+        if dir.trim().is_empty() {
+            return Err("providers.claude-code.config_dirs has an empty entry".to_string());
+        }
+        if dirs[..n].contains(dir) {
+            return Err(format!(
+                "providers.claude-code.config_dirs names {dir:?} twice"
+            ));
+        }
+    }
     if !(0.0..=1.0).contains(&config.fit.unmatched_share) {
         return Err("fit.unmatched_share must be between 0 and 1".to_string());
     }
@@ -820,6 +860,7 @@ fn check_models(config: &Config) -> Result<(), String> {
         ("llm_extract.min_ocr_confidence", extract.min_ocr_confidence),
         ("classify.confidence", config.classify.confidence),
         ("attributes.confidence", config.attributes.confidence),
+        ("curate.confidence", config.curate.confidence),
         (
             "attributes.resend_share",
             attributes.resend_share.unwrap_or(extract.resend_share),
@@ -897,6 +938,8 @@ fn check_sizes(config: &Config) -> Result<(), String> {
         ),
         ("llm.progress_secs", config.llm.progress_secs as i64),
         ("embed.progress_secs", config.embed.progress_secs as i64),
+        ("curate.max_members", config.curate.max_members as i64),
+        ("curate.max_shortlist", config.curate.max_shortlist as i64),
     ];
     for (key, value) in sizes {
         if value <= 0 {
@@ -987,6 +1030,35 @@ mod tests {
     }
 
     #[test]
+    fn gpu_section_parses() {
+        let dir = dir_with("[gpu]\nprovider = \"cuda\"\ndevice = 1\n");
+        let config = load_from(Some(dir.path()), vars(&[])).unwrap();
+        assert_eq!(config.gpu.provider, GpuProvider::Cuda);
+        assert_eq!(config.gpu.device, 1);
+        let config = load_from(None, vars(&[])).unwrap();
+        assert_eq!(config.gpu.provider, GpuProvider::Cpu);
+    }
+
+    #[test]
+    fn unknown_gpu_provider_is_rejected() {
+        let dir = dir_with("[gpu]\nprovider = \"rocm\"\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("gpu.provider"), "{message}");
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    #[test]
+    fn cuda_without_the_feature_names_the_key() {
+        let gpu = GpuConfig {
+            provider: GpuProvider::Cuda,
+            device: 0,
+        };
+        let message = gpu.usable().unwrap_err().to_string();
+        assert!(message.contains("gpu.provider = \"cuda\""), "{message}");
+        assert!(message.contains("--features gpu"), "{message}");
+    }
+
+    #[test]
     fn stage_settings_borrow_until_set() {
         let dir = dir_with(
             "[[sources]]\nname = \"a\"\nroot = \"/a\"\n\n[[sources]]\nname = \"b\"\nroot = \"/b\"\n\n\
@@ -1074,6 +1146,14 @@ mod tests {
         let dir = dir_with("[providers.claude-code]\nmax_window_use = 1.5\n");
         let message = error(load_from(Some(dir.path()), vars(&[])));
         assert!(message.contains("max_window_use"), "{message}");
+        let config = load_from(None, vars(&[])).unwrap();
+        assert!(config.providers.claude_code.config_dirs.is_empty());
+        let dir = dir_with("[providers.claude-code]\nconfig_dirs = [\"~/.a\", \"~/.a\"]\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("twice"), "{message}");
+        let dir = dir_with("[providers.claude-code]\nconfig_dirs = [\"~/.a\", \" \"]\n");
+        let message = error(load_from(Some(dir.path()), vars(&[])));
+        assert!(message.contains("empty entry"), "{message}");
         let dir =
             dir_with("[models]\nfit = \"ollama:qwen3.5:4b\"\n[providers.ollama]\nthink = true\n");
         let config = load_from(Some(dir.path()), vars(&[])).unwrap();
@@ -1348,7 +1428,10 @@ mod tests {
     fn llm_tasks_cover_every_model_task() {
         let models = load(None).unwrap().models;
         let tasks: Vec<&str> = models.llm_tasks().iter().map(|(task, _)| *task).collect();
-        assert_eq!(tasks, ["fit", "extract", "classify", "attributes"]);
+        assert_eq!(
+            tasks,
+            ["fit", "extract", "classify", "attributes", "curate"]
+        );
     }
 
     mod tempdir {

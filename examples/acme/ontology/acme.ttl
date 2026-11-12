@@ -21,6 +21,7 @@ acme:Customer a owl:Class ;
     skos:altLabel "client"@en, "opdrachtgever"@nl .
 
 acme:Site a owl:Class ;
+    owl:disjointWith acme:Organisation ;
     skos:prefLabel "site"@en, "locatie"@nl ;
     skos:definition "A place where equipment is installed."@en .
 

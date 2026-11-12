@@ -77,7 +77,8 @@ pub async fn run(config_dir: Option<&Path>, url: Option<&str>, options: &Options
         println!("embed: model {}", model.full_name());
         let files = tokio::task::spawn_blocking(move || super::local::fetch(&fetched, &cache_dir))
             .await??;
-        let local = super::local::Local::new(model.clone(), files, config.embed.threads);
+        let local =
+            super::local::Local::new(model.clone(), files, config.embed.threads, config.gpu);
         let (run_id, _) = db::runs::start(&pool, &crate::config::hash(&config)?).await?;
         let outcome = run_with(&pool, &config, &ontology, &model, Box::new(local), options).await;
         let (status, stats) = match &outcome {
